@@ -1,0 +1,123 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SimulationConfig",
+  "description": "Configuration for an ultraballpit SPH fluid simulation",
+  "type": "object",
+  "required": ["name", "fluid_type", "geometry_file", "domain", "particle_spacing"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Human-readable simulation name"
+    },
+    "fluid_type": {
+      "type": "string",
+      "enum": ["Water", "Air", "Mixed"],
+      "description": "Which fluid(s) to simulate. Mixed = both water and air particles in the same domain."
+    },
+    "geometry_file": {
+      "type": "string",
+      "description": "Path to STL geometry file (relative to configs dir)"
+    },
+    "domain": {
+      "type": "object",
+      "required": ["min", "max"],
+      "properties": {
+        "min": { "$ref": "#/$defs/vec3" },
+        "max": { "$ref": "#/$defs/vec3" }
+      },
+      "description": "Axis-aligned bounding box for simulation domain"
+    },
+    "boundary_conditions": {
+      "type": "object",
+      "properties": {
+        "x_min": { "$ref": "#/$defs/boundary" },
+        "x_max": { "$ref": "#/$defs/boundary" },
+        "y_min": { "$ref": "#/$defs/boundary" },
+        "y_max": { "$ref": "#/$defs/boundary" },
+        "z_min": { "$ref": "#/$defs/boundary" },
+        "z_max": { "$ref": "#/$defs/boundary" }
+      },
+      "default": {
+        "x_min": "Wall", "x_max": "Wall",
+        "y_min": "Wall", "y_max": "Wall",
+        "z_min": "Wall", "z_max": "Wall"
+      },
+      "description": "Boundary condition per domain face. Default: all walls."
+    },
+    "particle_spacing": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "description": "Initial inter-particle distance in meters"
+    },
+    "gravity": {
+      "$ref": "#/$defs/vec3",
+      "default": [0.0, -9.81, 0.0],
+      "description": "Gravity vector in m/s^2"
+    },
+    "speed_of_sound": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 50.0,
+      "description": "WCSPH speed of sound parameter. Higher = less compressible = smaller timestep."
+    },
+    "viscosity": {
+      "type": "number",
+      "minimum": 0,
+      "default": 0.001,
+      "description": "Kinematic viscosity in m^2/s"
+    },
+    "initial_temperature": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 293.15,
+      "description": "Initial fluid temperature in Kelvin (default: 20C)"
+    },
+    "max_timesteps": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Stop after this many timesteps (optional)"
+    },
+    "max_time": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "description": "Stop after this much simulated time in seconds (optional)"
+    },
+    "cfl_number": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 1.0,
+      "default": 0.4,
+      "description": "CFL condition for adaptive timestep"
+    }
+  },
+  "$defs": {
+    "vec3": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 3,
+      "maxItems": 3,
+      "description": "[x, y, z] vector"
+    },
+    "boundary": {
+      "oneOf": [
+        { "const": "Wall" },
+        { "const": "Outflow" },
+        {
+          "type": "object",
+          "required": ["Inflow"],
+          "properties": {
+            "Inflow": {
+              "type": "object",
+              "required": ["velocity", "temperature"],
+              "properties": {
+                "velocity": { "$ref": "#/$defs/vec3" },
+                "temperature": { "type": "number", "exclusiveMinimum": 0 }
+              }
+            }
+          }
+        },
+        { "const": "Periodic" }
+      ]
+    }
+  }
+}
