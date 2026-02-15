@@ -1,0 +1,24 @@
+# Rust
+backend/target/
+
+# Node.js
+frontend/node_modules/
+frontend/dist/
+
+# OS
+.DS_Store
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# Environment
+.env
+.env.local
+
+# Claude Code
+.claude/

@@ -1,0 +1,23 @@
+{
+  "name": "Water in 1cm Closed Box",
+  "fluid_type": "Water",
+  "geometry_file": "box-1cm.stl",
+  "domain": {
+    "min": [0.0, 0.0, 0.0],
+    "max": [0.01, 0.01, 0.01]
+  },
+  "boundary_conditions": {
+    "x_min": "Wall",
+    "x_max": "Wall",
+    "y_min": "Wall",
+    "y_max": "Wall",
+    "z_min": "Wall",
+    "z_max": "Wall"
+  },
+  "particle_spacing": 0.001,
+  "gravity": [0.0, -9.81, 0.0],
+  "speed_of_sound": 50.0,
+  "viscosity": 0.001,
+  "initial_temperature": 293.15,
+  "cfl_number": 0.4
+}

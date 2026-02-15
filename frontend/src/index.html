@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SPH Fluid Simulation Viewer</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #1a1a1a;
+      color: #fff;
+    }
+    #app {
+      display: flex;
+      width: 100vw;
+      height: 100vh;
+    }
+    #sidebar {
+      width: 240px;
+      background: #222;
+      padding: 12px;
+      overflow-y: auto;
+      border-right: 1px solid #333;
+    }
+    #viewer-container {
+      flex: 1;
+      position: relative;
+    }
+    #viewer {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+    #stats {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      background: rgba(0, 0, 0, 0.7);
+      padding: 8px 12px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-family: monospace;
+      color: #aaa;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="sidebar">
+      <div id="config-list"></div>
+      <div id="controls"></div>
+    </div>
+    <div id="viewer-container">
+      <canvas id="viewer"></canvas>
+      <div id="stats">
+        <div id="stats-fps">FPS: --</div>
+        <div id="stats-particles">Particles: --</div>
+        <div id="stats-frame">Frame: --</div>
+        <div id="stats-time">Time: --</div>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="/main.ts"></script>
+</body>
+</html>

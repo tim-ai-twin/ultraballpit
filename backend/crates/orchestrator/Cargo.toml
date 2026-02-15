@@ -1,0 +1,15 @@
+[package]
+name = "orchestrator"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+kernel = { path = "../kernel" }
+nalgebra = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+nom_stl = "0.2"
+mesh_to_sdf = "0.3"
