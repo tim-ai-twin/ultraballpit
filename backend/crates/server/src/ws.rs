@@ -20,11 +20,13 @@ use crate::state::{AppState, SimStatus};
 
 const TAG_SIM_INFO: u8 = 0x01;
 const TAG_FRAME: u8 = 0x02;
-// const TAG_DIAGNOSTICS: u8 = 0x03;
+const TAG_DIAGNOSTICS: u8 = 0x03;
 const TAG_SIM_STATUS: u8 = 0x04;
 
 const CMD_PAUSE: u8 = 0x01;
 const CMD_RESUME: u8 = 0x02;
+const CMD_ENABLE_DIAGNOSTICS: u8 = 0x04;
+const CMD_DISABLE_DIAGNOSTICS: u8 = 0x05;
 
 // ---------------------------------------------------------------------------
 // WebSocket Handler
@@ -51,6 +53,9 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, sim_id: Strin
     use futures_util::stream::SplitStream;
 
     let (mut sender, mut receiver): (SplitSink<WebSocket, Message>, SplitStream<WebSocket>) = socket.split();
+
+    // Per-connection diagnostics state
+    let mut diagnostics_enabled = false;
 
     // Verify simulation exists
     {
@@ -107,14 +112,20 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, sim_id: Strin
 
             // Frame generation and sending
             _ = frame_timer.tick() => {
-                // Build frame (scoped lock)
-                let frame_data = {
+                // Build frame and diagnostics (scoped lock)
+                let (frame_data, diagnostics_data) = {
                     let sims = state.simulations.lock().unwrap();
                     let runner = match sims.get(&sim_id) {
                         Some(r) => r,
                         None => break,
                     };
-                    build_frame(runner)
+                    let frame = build_frame(runner);
+                    let diag = if diagnostics_enabled {
+                        Some(build_diagnostics(runner))
+                    } else {
+                        None
+                    };
+                    (frame, diag)
                     // Lock is dropped here
                 };
 
@@ -130,6 +141,14 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, sim_id: Strin
                     if let Err(e) = sender.send(Message::Binary(frame_data)).await {
                         tracing::error!("Failed to send frame: {}", e);
                         break;
+                    }
+
+                    // Send diagnostics if enabled
+                    if let Some(diag) = diagnostics_data {
+                        if let Err(e) = sender.send(Message::Binary(diag)).await {
+                            tracing::error!("Failed to send diagnostics: {}", e);
+                            break;
+                        }
                     }
                 } else {
                     pending_frames.push(frame_data);
@@ -149,7 +168,7 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, sim_id: Strin
             msg = receiver.next() => {
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
-                        if let Err(e) = handle_client_command(&state, &sim_id, &data, &mut sender).await {
+                        if let Err(e) = handle_client_command(&state, &sim_id, &data, &mut sender, &mut diagnostics_enabled).await {
                             tracing::error!("Error handling command: {}", e);
                         }
                     }
@@ -300,6 +319,46 @@ fn build_sim_status(status: SimStatus, message: &str) -> Vec<u8> {
     buf
 }
 
+/// Build Diagnostics message (tag 0x03)
+/// Format: tag(u8) + frame_number(u64) + frame_time_ms(f32) + max_density_var(f32) +
+///         energy_conservation(f32) + mass_conservation(f32) + dt(f32) + particle_count(u32)
+fn build_diagnostics(runner: &crate::runner::SimulationRunner) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(33);
+
+    // Tag
+    buf.push(TAG_DIAGNOSTICS);
+
+    // Frame number
+    let frame_number = runner.timestep_count();
+    buf.extend_from_slice(&frame_number.to_le_bytes());
+
+    // Frame time (measured as 0 for now; could be enhanced with actual timing)
+    let frame_time_ms = 0.0_f32;
+    buf.extend_from_slice(&frame_time_ms.to_le_bytes());
+
+    // Get error metrics
+    let metrics = runner.error_metrics();
+
+    // Max density variation
+    buf.extend_from_slice(&metrics.max_density_variation.to_le_bytes());
+
+    // Energy conservation error
+    buf.extend_from_slice(&metrics.energy_conservation.to_le_bytes());
+
+    // Mass conservation error
+    buf.extend_from_slice(&metrics.mass_conservation.to_le_bytes());
+
+    // Timestep dt
+    let dt = runner.dt();
+    buf.extend_from_slice(&dt.to_le_bytes());
+
+    // Particle count
+    let particle_count = runner.particle_count() as u32;
+    buf.extend_from_slice(&particle_count.to_le_bytes());
+
+    buf
+}
+
 // ---------------------------------------------------------------------------
 // Client Command Handling
 // ---------------------------------------------------------------------------
@@ -310,6 +369,7 @@ async fn handle_client_command(
     sim_id: &str,
     data: &[u8],
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    diagnostics_enabled: &mut bool,
 ) -> Result<(), String> {
 
     if data.len() < 2 {
@@ -323,7 +383,22 @@ async fn handle_client_command(
 
     let command = data[1];
 
-    // Handle command and build response (scoped lock)
+    // Handle diagnostics commands locally (no status message needed)
+    match command {
+        CMD_ENABLE_DIAGNOSTICS => {
+            *diagnostics_enabled = true;
+            tracing::info!("Diagnostics enabled for simulation {}", sim_id);
+            return Ok(());
+        }
+        CMD_DISABLE_DIAGNOSTICS => {
+            *diagnostics_enabled = false;
+            tracing::info!("Diagnostics disabled for simulation {}", sim_id);
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Handle simulation control commands and build response (scoped lock)
     let status_msg = {
         let sims = state.simulations.lock().unwrap();
         let runner = sims.get(sim_id)

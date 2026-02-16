@@ -12,6 +12,7 @@ pub mod config;
 pub mod geometry;
 pub mod domain;
 pub mod runner;
+pub mod force;
 
 pub use config::SimulationConfig;
 pub use runner::SimulationRunner;

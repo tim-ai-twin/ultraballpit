@@ -69,7 +69,9 @@ async fn main() {
         .route("/simulations", post(api::create_simulation))
         .route("/simulations/:id", get(api::get_simulation))
         .route("/simulations/:id/pause", post(api::pause_simulation))
-        .route("/simulations/:id/resume", post(api::resume_simulation));
+        .route("/simulations/:id/resume", post(api::resume_simulation))
+        .route("/simulations/:id/forces", get(api::get_forces))
+        .route("/simulations/:id/report", get(api::get_report));
 
     // Build main application router
     let app = Router::new()

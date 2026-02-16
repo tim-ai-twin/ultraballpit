@@ -29,6 +29,7 @@ pub use sph::{wendland_c2, wendland_c2_gradient};
 // ---------------------------------------------------------------------------
 
 /// Aggregate error / conservation metrics for a simulation snapshot.
+#[derive(Debug, Clone, Copy)]
 pub struct ErrorMetrics {
     /// Maximum relative density deviation from rest density across all particles.
     pub max_density_variation: f32,

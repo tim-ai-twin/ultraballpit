@@ -4,9 +4,10 @@ import { createScene } from './viewer/scene.js';
 import { SimulationClient } from './transport/client.js';
 import { ParticleRenderer } from './viewer/particles.js';
 import { GeometryRenderer } from './viewer/geometry.js';
+import { DiagnosticsOverlay } from './viewer/overlays.js';
 import { ConfigList } from './ui/config-list.js';
 import { SimControls } from './ui/controls.js';
-import { CMD_PAUSE, CMD_RESUME, STATUS_RUNNING, STATUS_PAUSED } from './types/protocol.js';
+import { CMD_PAUSE, CMD_RESUME, CMD_ENABLE_DIAGNOSTICS, CMD_DISABLE_DIAGNOSTICS, STATUS_RUNNING, STATUS_PAUSED } from './types/protocol.js';
 
 console.log('SPH Fluid Simulation Viewer initializing...');
 
@@ -17,6 +18,7 @@ const API_BASE = '';
 let currentSimulationId: string | null = null;
 let simulationClient: SimulationClient | null = null;
 let particleRenderer: ParticleRenderer | null = null;
+let diagnosticsOverlay: DiagnosticsOverlay | null = null;
 
 // Stats tracking
 let frameCount = 0;
@@ -87,6 +89,9 @@ simControls.onStart(async (configName) => {
     // Connect to WebSocket
     simulationClient = new SimulationClient();
 
+    // Initialize diagnostics overlay
+    diagnosticsOverlay = new DiagnosticsOverlay();
+
     // Handle SimInfo (sent once on connect)
     simulationClient.onSimInfo((simInfo) => {
       console.log('SimInfo received:', simInfo);
@@ -127,6 +132,13 @@ simControls.onStart(async (configName) => {
         frameCount = 0;
         lastFrameTime = now;
         updateStats({ fps });
+      }
+    });
+
+    // Handle diagnostics updates
+    simulationClient.onDiagnostics((diagnostics) => {
+      if (diagnosticsOverlay && diagnosticsOverlay.isVisible()) {
+        diagnosticsOverlay.update(diagnostics);
       }
     });
 
@@ -193,6 +205,24 @@ simControls.onResume(() => {
     }).catch((error) => {
       console.error('Failed to resume via REST API:', error);
     });
+  }
+});
+
+// Handle diagnostics toggle
+simControls.onDiagnosticsToggle((enabled) => {
+  console.log('Diagnostics toggled:', enabled);
+
+  if (diagnosticsOverlay) {
+    if (enabled) {
+      diagnosticsOverlay.show();
+    } else {
+      diagnosticsOverlay.hide();
+    }
+  }
+
+  if (simulationClient) {
+    const command = enabled ? CMD_ENABLE_DIAGNOSTICS : CMD_DISABLE_DIAGNOSTICS;
+    simulationClient.sendCommand(command);
   }
 });
 

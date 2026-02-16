@@ -1,7 +1,7 @@
 //! REST API endpoints for simulation management
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::state::{AppState, SimStatus};
+use crate::runner::ForceRecord;
 
 // ---------------------------------------------------------------------------
 // Request/Response Types
@@ -91,6 +92,56 @@ pub struct ErrorMetricsResponse {
 pub struct StatusResponse {
     /// Status string
     pub status: String,
+}
+
+/// Query parameters for force data requests
+#[derive(Debug, Deserialize)]
+pub struct ForceQueryParams {
+    /// Start timestep (inclusive, optional)
+    pub from_timestep: Option<u64>,
+    /// End timestep (inclusive, optional)
+    pub to_timestep: Option<u64>,
+    /// Aggregation mode: raw, mean, peak
+    #[serde(default = "default_aggregation")]
+    pub aggregation: String,
+}
+
+fn default_aggregation() -> String {
+    "raw".to_string()
+}
+
+/// Force data response
+#[derive(Debug, Serialize)]
+pub struct ForceDataResponse {
+    /// Simulation ID
+    pub simulation_id: String,
+    /// Force records (if raw)
+    pub records: Vec<ForceRecord>,
+    /// Mean force vector (if aggregation=mean or peak)
+    pub mean_force: Option<[f32; 3]>,
+    /// Peak force magnitude (if aggregation=peak)
+    pub peak_force_magnitude: Option<f32>,
+}
+
+/// Simulation report response
+#[derive(Debug, Serialize)]
+pub struct SimulationReportResponse {
+    /// Simulation ID
+    pub simulation_id: String,
+    /// Current timestep
+    pub timestep: u64,
+    /// Simulation time (seconds)
+    pub sim_time: f64,
+    /// Particle count
+    pub particle_count: usize,
+    /// Error metrics summary
+    pub error_metrics: ErrorMetricsResponse,
+    /// Peak force magnitude
+    pub peak_force_magnitude: Option<f32>,
+    /// Mean force vector
+    pub mean_force: Option<[f32; 3]>,
+    /// Number of force records
+    pub force_record_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -287,5 +338,101 @@ pub async fn resume_simulation(
 
     Ok(Json(StatusResponse {
         status: "running".to_string(),
+    }))
+}
+
+/// GET /api/simulations/{id}/forces - Get force data
+pub async fn get_forces(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<ForceQueryParams>,
+) -> Result<Json<ForceDataResponse>, (StatusCode, String)> {
+    let simulations = state.simulations.lock().unwrap();
+    let runner = simulations.get(&id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Simulation '{}' not found", id)))?;
+
+    match params.aggregation.as_str() {
+        "raw" => {
+            let records = runner.get_forces(params.from_timestep, params.to_timestep);
+            Ok(Json(ForceDataResponse {
+                simulation_id: id,
+                records,
+                mean_force: None,
+                peak_force_magnitude: None,
+            }))
+        }
+        "mean" => {
+            let records = runner.get_forces(params.from_timestep, params.to_timestep);
+            let mean_force = if !records.is_empty() {
+                let mut sum = [0.0, 0.0, 0.0];
+                for record in &records {
+                    sum[0] += record.net_force[0];
+                    sum[1] += record.net_force[1];
+                    sum[2] += record.net_force[2];
+                }
+                let count = records.len() as f32;
+                Some([sum[0] / count, sum[1] / count, sum[2] / count])
+            } else {
+                None
+            };
+
+            Ok(Json(ForceDataResponse {
+                simulation_id: id,
+                records: Vec::new(),
+                mean_force,
+                peak_force_magnitude: None,
+            }))
+        }
+        "peak" => {
+            let records = runner.get_forces(params.from_timestep, params.to_timestep);
+            let peak = records
+                .iter()
+                .map(|r| {
+                    let fx = r.net_force[0];
+                    let fy = r.net_force[1];
+                    let fz = r.net_force[2];
+                    (fx * fx + fy * fy + fz * fz).sqrt()
+                })
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+            Ok(Json(ForceDataResponse {
+                simulation_id: id,
+                records: Vec::new(),
+                mean_force: None,
+                peak_force_magnitude: peak,
+            }))
+        }
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            format!("Invalid aggregation mode: '{}'. Use 'raw', 'mean', or 'peak'", params.aggregation),
+        )),
+    }
+}
+
+/// GET /api/simulations/{id}/report - Get simulation summary report
+pub async fn get_report(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<SimulationReportResponse>, (StatusCode, String)> {
+    let simulations = state.simulations.lock().unwrap();
+    let runner = simulations.get(&id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Simulation '{}' not found", id)))?;
+
+    let metrics = runner.error_metrics();
+    let force_history = runner.force_history();
+
+    Ok(Json(SimulationReportResponse {
+        simulation_id: id,
+        timestep: runner.timestep_count(),
+        sim_time: runner.sim_time(),
+        particle_count: runner.particle_count(),
+        error_metrics: ErrorMetricsResponse {
+            max_density_variation: metrics.max_density_variation,
+            energy_conservation: metrics.energy_conservation,
+            mass_conservation: metrics.mass_conservation,
+        },
+        peak_force_magnitude: runner.peak_force(),
+        mean_force: runner.mean_force(),
+        force_record_count: force_history.len(),
     }))
 }

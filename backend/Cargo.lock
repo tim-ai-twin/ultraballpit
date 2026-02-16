@@ -986,6 +986,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "reference-tests"
+version = "0.1.0"
+dependencies = [
+ "kernel",
+ "orchestrator",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "regex-automata"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

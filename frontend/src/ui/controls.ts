@@ -3,6 +3,8 @@
 type StartCallback = (configName: string) => void;
 type PauseCallback = () => void;
 type ResumeCallback = () => void;
+type DiagnosticsToggleCallback = (enabled: boolean) => void;
+type ForceOverlayToggleCallback = (enabled: boolean) => void;
 
 /**
  * Simulation control UI component
@@ -15,9 +17,13 @@ export class SimControls {
   private startCallbacks: StartCallback[] = [];
   private pauseCallbacks: PauseCallback[] = [];
   private resumeCallbacks: ResumeCallback[] = [];
+  private diagnosticsToggleCallbacks: DiagnosticsToggleCallback[] = [];
+  private forceOverlayToggleCallbacks: ForceOverlayToggleCallback[] = [];
 
   private configName: string = '';
   private status: string = 'idle';
+  private diagnosticsEnabled: boolean = false;
+  private forceOverlayEnabled: boolean = false;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -46,6 +52,20 @@ export class SimControls {
   }
 
   /**
+   * Register callback for diagnostics toggle
+   */
+  onDiagnosticsToggle(cb: DiagnosticsToggleCallback): void {
+    this.diagnosticsToggleCallbacks.push(cb);
+  }
+
+  /**
+   * Register callback for force overlay toggle
+   */
+  onForceOverlayToggle(cb: ForceOverlayToggleCallback): void {
+    this.forceOverlayToggleCallbacks.push(cb);
+  }
+
+  /**
    * Set current simulation status
    */
   setStatus(status: string): void {
@@ -68,6 +88,7 @@ export class SimControls {
     const canStart = this.configName !== '' && this.status === 'idle';
     const canPause = this.status === 'running';
     const canResume = this.status === 'paused';
+    const canToggleDiagnostics = this.status === 'running' || this.status === 'paused';
 
     this.container.innerHTML = `
       <div style="padding: 12px; background: #2a2a2a; border-radius: 4px; margin-top: 12px;">
@@ -154,6 +175,54 @@ export class SimControls {
             Resume
           </button>
         </div>
+
+        <button
+          id="btn-diagnostics"
+          ${canToggleDiagnostics ? '' : 'disabled'}
+          style="
+            display: block;
+            width: 100%;
+            padding: 8px;
+            margin-top: 6px;
+            background: ${canToggleDiagnostics ? (this.diagnosticsEnabled ? '#9C27B0' : '#555') : '#333'};
+            color: ${canToggleDiagnostics ? '#fff' : '#666'};
+            border: none;
+            border-radius: 3px;
+            cursor: ${canToggleDiagnostics ? 'pointer' : 'not-allowed'};
+            font-size: 12px;
+            transition: background 0.2s;
+          "
+          ${canToggleDiagnostics ? `
+            onmouseover="this.style.background='${this.diagnosticsEnabled ? '#7B1FA2' : '#666'}'"
+            onmouseout="this.style.background='${this.diagnosticsEnabled ? '#9C27B0' : '#555'}'"
+          ` : ''}
+        >
+          ${this.diagnosticsEnabled ? '✓ ' : ''}Diagnostics
+        </button>
+
+        <button
+          id="btn-force-overlay"
+          ${canToggleDiagnostics ? '' : 'disabled'}
+          style="
+            display: block;
+            width: 100%;
+            padding: 8px;
+            margin-top: 6px;
+            background: ${canToggleDiagnostics ? (this.forceOverlayEnabled ? '#00BCD4' : '#555') : '#333'};
+            color: ${canToggleDiagnostics ? '#fff' : '#666'};
+            border: none;
+            border-radius: 3px;
+            cursor: ${canToggleDiagnostics ? 'pointer' : 'not-allowed'};
+            font-size: 12px;
+            transition: background 0.2s;
+          "
+          ${canToggleDiagnostics ? `
+            onmouseover="this.style.background='${this.forceOverlayEnabled ? '#0097A7' : '#666'}'"
+            onmouseout="this.style.background='${this.forceOverlayEnabled ? '#00BCD4' : '#555'}'"
+          ` : ''}
+        >
+          ${this.forceOverlayEnabled ? '✓ ' : ''}Force Overlay
+        </button>
       </div>
     `;
 
@@ -161,6 +230,8 @@ export class SimControls {
     const startBtn = document.getElementById('btn-start');
     const pauseBtn = document.getElementById('btn-pause');
     const resumeBtn = document.getElementById('btn-resume');
+    const diagnosticsBtn = document.getElementById('btn-diagnostics');
+    const forceOverlayBtn = document.getElementById('btn-force-overlay');
 
     if (startBtn && canStart) {
       startBtn.addEventListener('click', () => {
@@ -177,6 +248,22 @@ export class SimControls {
     if (resumeBtn && canResume) {
       resumeBtn.addEventListener('click', () => {
         this.resumeCallbacks.forEach((cb) => cb());
+      });
+    }
+
+    if (diagnosticsBtn && canToggleDiagnostics) {
+      diagnosticsBtn.addEventListener('click', () => {
+        this.diagnosticsEnabled = !this.diagnosticsEnabled;
+        this.diagnosticsToggleCallbacks.forEach((cb) => cb(this.diagnosticsEnabled));
+        this.render();
+      });
+    }
+
+    if (forceOverlayBtn && canToggleDiagnostics) {
+      forceOverlayBtn.addEventListener('click', () => {
+        this.forceOverlayEnabled = !this.forceOverlayEnabled;
+        this.forceOverlayToggleCallbacks.forEach((cb) => cb(this.forceOverlayEnabled));
+        this.render();
       });
     }
   }

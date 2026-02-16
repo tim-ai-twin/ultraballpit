@@ -3,6 +3,7 @@ members = [
     "crates/kernel",
     "crates/orchestrator",
     "crates/server",
+    "reference-tests",
 ]
 
 resolver = "2"
