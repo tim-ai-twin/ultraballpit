@@ -33,7 +33,11 @@ pub const AIR_R_SPECIFIC: f32 = 287.058;
 pub fn tait_eos(density: f32, rest_density: f32, speed_of_sound: f32, gamma: f32) -> f32 {
     let b = rest_density * speed_of_sound * speed_of_sound / gamma;
     let ratio = density / rest_density;
-    b * (ratio.powf(gamma) - 1.0)
+    let p = b * (ratio.powf(gamma) - 1.0);
+    // Clamp negative pressure (tension) to zero. Negative Tait pressure
+    // when density < rest_density causes particles to attract each other,
+    // leading to clumping instabilities.
+    p.max(0.0)
 }
 
 /// Ideal gas equation of state for air.
@@ -74,10 +78,13 @@ mod tests {
     }
 
     #[test]
-    fn tait_negative_when_expanded() {
+    fn tait_clamped_to_zero_when_expanded() {
         let rho = 990.0; // slightly expanded
         let p = tait_eos(rho, WATER_REST_DENSITY, 20.0, WATER_GAMMA);
-        assert!(p < 0.0, "expanded water should have negative pressure, got {p}");
+        assert!(
+            p == 0.0,
+            "expanded water should have clamped-to-zero pressure, got {p}"
+        );
     }
 
     #[test]

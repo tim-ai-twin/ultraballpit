@@ -143,14 +143,10 @@ impl ReferenceTest {
         // Calculate smoothing length
         let h = config.smoothing_length();
 
-        // Calculate timestep
-        let dt = config.cfl_number * h / config.speed_of_sound;
-
         tracing::info!(
-            "Initialized: {} particles, h={}, dt={}",
+            "Initialized: {} particles, h={}",
             fluid_particles.len(),
             h,
-            dt
         );
 
         // Create kernel
@@ -166,10 +162,19 @@ impl ReferenceTest {
             config.domain.max,
         );
 
-        // Run simulation
+        // Run simulation with adaptive timestep
         tracing::info!("Running {} timesteps...", self.timesteps);
+        let mut sim_time = 0.0_f64;
         for step in 0..self.timesteps {
+            // Compute adaptive timestep from current state
+            let dt = kernel::sph::compute_timestep(
+                kernel.particles(),
+                h,
+                config.speed_of_sound,
+                config.cfl_number,
+            );
             kernel.step(dt);
+            sim_time += dt as f64;
 
             // Log progress every 10% of steps
             if (step + 1) % (self.timesteps / 10).max(1) == 0 {
@@ -177,8 +182,6 @@ impl ReferenceTest {
                 tracing::info!("Progress: {:.0}% ({}/{})", progress, step + 1, self.timesteps);
             }
         }
-
-        let sim_time = (self.timesteps as f64) * (dt as f64);
         tracing::info!("Simulation complete: {} steps, {:.6}s simulated", self.timesteps, sim_time);
 
         // Get final state

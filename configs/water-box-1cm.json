@@ -16,7 +16,7 @@
   },
   "particle_spacing": 0.001,
   "gravity": [0.0, -9.81, 0.0],
-  "speed_of_sound": 50.0,
+  "speed_of_sound": 10.0,
   "viscosity": 0.001,
   "initial_temperature": 293.15,
   "cfl_number": 0.4

@@ -370,11 +370,12 @@ const MIN_DT: f32 = 1.0e-8;
 /// Maximum allowed timestep (seconds).
 const MAX_DT: f32 = 0.01;
 
-/// Compute an adaptive timestep using the CFL condition.
+/// Compute an adaptive timestep using the CFL condition and force-based criterion.
 ///
-/// ```text
-/// dt = cfl_number * h / max_i(|v_i| + c_s)
-/// ```
+/// Three criteria are combined (minimum is used):
+/// 1. CFL (velocity): `dt_cfl = cfl * h / max(|v_i| + c_s)`
+/// 2. Force-based:    `dt_force = 0.25 * sqrt(h / max_accel)`
+/// 3. Viscous:        `dt_visc = 0.125 * h^2 / nu` (if viscosity > 0)
 ///
 /// The result is clamped to `[1e-8, 0.01]`.
 pub fn compute_timestep(
@@ -383,7 +384,9 @@ pub fn compute_timestep(
     speed_of_sound: f32,
     cfl_number: f32,
 ) -> f32 {
+    // 1. CFL condition based on velocity + speed of sound
     let mut max_signal = speed_of_sound; // at minimum, c_s
+    let mut max_accel = 0.0_f32;
     for i in 0..particles.len() {
         let v = (particles.vx[i] * particles.vx[i]
             + particles.vy[i] * particles.vy[i]
@@ -393,8 +396,24 @@ pub fn compute_timestep(
         if signal > max_signal {
             max_signal = signal;
         }
+        let a = (particles.ax[i] * particles.ax[i]
+            + particles.ay[i] * particles.ay[i]
+            + particles.az[i] * particles.az[i])
+            .sqrt();
+        if a > max_accel {
+            max_accel = a;
+        }
     }
-    let dt = cfl_number * h / max_signal;
+    let dt_cfl = cfl_number * h / max_signal;
+
+    // 2. Force-based CFL: dt_force = 0.25 * sqrt(h / max_accel)
+    let dt_force = if max_accel > 1.0e-12 {
+        0.25 * (h / max_accel).sqrt()
+    } else {
+        MAX_DT
+    };
+
+    let dt = dt_cfl.min(dt_force);
     dt.clamp(MIN_DT, MAX_DT)
 }
 

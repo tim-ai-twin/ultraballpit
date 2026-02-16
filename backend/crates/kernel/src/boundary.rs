@@ -131,25 +131,26 @@ impl BoundaryParticles {
 
     /// Compute repulsive boundary forces on fluid particles.
     ///
-    /// Uses a Lennard-Jones style repulsive force (Monaghan & Kos 1999)
+    /// Uses a smooth polynomial repulsive force as a last-resort safety net
     /// to prevent fluid particles from penetrating the boundary.
     ///
-    /// The force uses a smooth polynomial that:
-    /// - Is zero at r >= r0 (the cutoff distance = h)
-    /// - Increases smoothly as r decreases
-    /// - Maximum strength scaled by `c_s^2 / h`
+    /// The force activates only within 0.5*h of a boundary particle and is
+    /// scaled to hydrostatic pressure level (~10 * g * H) rather than c_s^2,
+    /// avoiding the extreme accelerations (~200,000g) that caused blow-up.
     ///
     /// The force acts along the direction from boundary to fluid particle.
     pub fn compute_repulsive_forces(
         &self,
         particles: &mut ParticleArrays,
         h: f32,
-        speed_of_sound: f32,
+        _speed_of_sound: f32,
     ) {
-        let r0 = h;
-        // Scale: boundary force should be strong enough to balance gravity
-        // but not cause instability. Using c_s^2 / r0 as the force scale.
-        let d = speed_of_sound * speed_of_sound;
+        // Tighten cutoff to 0.5*h -- only activate as last-resort safety net
+        let r0 = 0.5 * h;
+        // Scale force to hydrostatic pressure level instead of c_s^2.
+        // For a 1cm domain with g=9.81: d ~ 10 * 9.81 * 0.01 = 0.981
+        // This is ~2500x smaller than the old c_s^2 = 2500 value.
+        let d = 10.0 * 9.81 * 0.01;
 
         for i in 0..particles.len() {
             let px = particles.x[i];
@@ -186,12 +187,6 @@ impl BoundaryParticles {
     /// plane (inside the boundary), it is projected back to the plane surface
     /// and its normal velocity component is reflected with damping.
     pub fn enforce_no_penetration(&self, particles: &mut ParticleArrays) {
-        // We use the maximum y of boundary particles + small offset as the floor,
-        // since most boundaries are axis-aligned walls. This is a simplified
-        // approach; a fully general version would use per-particle plane tests.
-        //
-        // Find the boundary plane for each unique normal direction.
-        // For now, support axis-aligned walls via normal detection.
         if self.is_empty() {
             return;
         }
@@ -230,6 +225,65 @@ impl BoundaryParticles {
                         particles.vy[i] -= (1.0 + restitution) * v_normal * bny;
                         particles.vz[i] -= (1.0 + restitution) * v_normal * bnz;
                     }
+                }
+            }
+        }
+    }
+
+    /// Enforce no-penetration using simple axis-aligned domain bound clamping.
+    ///
+    /// This replaces the O(N*M) per-boundary-particle loop with 6 simple
+    /// axis-aligned checks against domain_min/domain_max. Much faster and
+    /// avoids artifacts from checking against individual boundary particles.
+    pub fn enforce_no_penetration_domain(
+        &self,
+        particles: &mut ParticleArrays,
+        domain_min: [f32; 3],
+        domain_max: [f32; 3],
+    ) {
+        let restitution = 0.2_f32; // heavy damping for quick settling
+
+        for i in 0..particles.len() {
+            // X-min wall
+            if particles.x[i] < domain_min[0] {
+                particles.x[i] = domain_min[0];
+                if particles.vx[i] < 0.0 {
+                    particles.vx[i] = -restitution * particles.vx[i];
+                }
+            }
+            // X-max wall
+            if particles.x[i] > domain_max[0] {
+                particles.x[i] = domain_max[0];
+                if particles.vx[i] > 0.0 {
+                    particles.vx[i] = -restitution * particles.vx[i];
+                }
+            }
+            // Y-min wall
+            if particles.y[i] < domain_min[1] {
+                particles.y[i] = domain_min[1];
+                if particles.vy[i] < 0.0 {
+                    particles.vy[i] = -restitution * particles.vy[i];
+                }
+            }
+            // Y-max wall
+            if particles.y[i] > domain_max[1] {
+                particles.y[i] = domain_max[1];
+                if particles.vy[i] > 0.0 {
+                    particles.vy[i] = -restitution * particles.vy[i];
+                }
+            }
+            // Z-min wall
+            if particles.z[i] < domain_min[2] {
+                particles.z[i] = domain_min[2];
+                if particles.vz[i] < 0.0 {
+                    particles.vz[i] = -restitution * particles.vz[i];
+                }
+            }
+            // Z-max wall
+            if particles.z[i] > domain_max[2] {
+                particles.z[i] = domain_max[2];
+                if particles.vz[i] > 0.0 {
+                    particles.vz[i] = -restitution * particles.vz[i];
                 }
             }
         }

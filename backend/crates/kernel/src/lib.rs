@@ -96,6 +96,12 @@ pub struct CpuKernel {
     initial_energy: f64,
     /// Initial total mass for conservation tracking.
     initial_mass: f64,
+    /// Domain minimum bounds for no-penetration clamping.
+    domain_min: [f32; 3],
+    /// Domain maximum bounds for no-penetration clamping.
+    domain_max: [f32; 3],
+    /// Whether the initial force computation has been performed.
+    needs_init: bool,
 }
 
 impl CpuKernel {
@@ -143,6 +149,9 @@ impl CpuKernel {
             viscosity,
             initial_energy,
             initial_mass,
+            domain_min,
+            domain_max,
+            needs_init: true,
         }
     }
 
@@ -167,38 +176,21 @@ impl CpuKernel {
     }
 }
 
-impl SimulationKernel for CpuKernel {
-    fn step(&mut self, dt: f32) {
+impl CpuKernel {
+    /// Run the full force computation pipeline (density, pressure, boundary
+    /// pressures, forces) without integration. Used for bootstrapping
+    /// initial accelerations for Velocity Verlet.
+    fn compute_forces(&mut self) {
         let n = self.particles.len();
-        let half_dt = 0.5 * dt;
 
-        // --- 1. Half-kick: v(t + dt/2) = v(t) + a(t) * dt/2 ---
-        for i in 0..n {
-            self.particles.vx[i] += self.particles.ax[i] * half_dt;
-            self.particles.vy[i] += self.particles.ay[i] * half_dt;
-            self.particles.vz[i] += self.particles.az[i] * half_dt;
-        }
-
-        // --- 2. Drift: x(t + dt) = x(t) + v(t + dt/2) * dt ---
-        for i in 0..n {
-            self.particles.x[i] += self.particles.vx[i] * dt;
-            self.particles.y[i] += self.particles.vy[i] * dt;
-            self.particles.z[i] += self.particles.vz[i] * dt;
-        }
-
-        // --- 2b. Boundary collision: prevent particles from penetrating ---
-        // For each boundary particle, check if any fluid particle has crossed
-        // the boundary plane. If so, project it back and damp the normal velocity.
-        self.boundary.enforce_no_penetration(&mut self.particles);
-
-        // --- 3. Update neighbor grid ---
+        // Update neighbor grid
         self.grid.update(
             &self.particles.x,
             &self.particles.y,
             &self.particles.z,
         );
 
-        // --- 4. Compute density (T017) ---
+        // Compute density (T017)
         sph::compute_density(
             &mut self.particles,
             &self.boundary.x,
@@ -209,10 +201,10 @@ impl SimulationKernel for CpuKernel {
             self.h,
         );
 
-        // --- 5. Compute pressure from EOS ---
+        // Compute pressure from EOS
         sph::compute_pressure(&mut self.particles, self.speed_of_sound);
 
-        // --- 6. Update boundary pressures (T021) ---
+        // Update boundary pressures (T021)
         self.boundary.update_pressures(
             &self.particles,
             &self.grid,
@@ -220,7 +212,7 @@ impl SimulationKernel for CpuKernel {
             self.h,
         );
 
-        // --- 7. Zero accelerations and compute forces ---
+        // Zero accelerations and compute forces
         for i in 0..n {
             self.particles.ax[i] = 0.0;
             self.particles.ay[i] = 0.0;
@@ -256,6 +248,46 @@ impl SimulationKernel for CpuKernel {
             self.h,
             self.speed_of_sound,
         );
+    }
+}
+
+impl SimulationKernel for CpuKernel {
+    fn step(&mut self, dt: f32) {
+        let n = self.particles.len();
+        let half_dt = 0.5 * dt;
+
+        // --- 0. Bootstrap: compute initial forces on first step ---
+        // On the very first timestep, all accelerations are zero because no
+        // forces have been computed yet. The first half-kick would do nothing,
+        // producing incorrect results. So we run the force pipeline once first.
+        if self.needs_init {
+            self.compute_forces();
+            self.needs_init = false;
+        }
+
+        // --- 1. Half-kick: v(t + dt/2) = v(t) + a(t) * dt/2 ---
+        for i in 0..n {
+            self.particles.vx[i] += self.particles.ax[i] * half_dt;
+            self.particles.vy[i] += self.particles.ay[i] * half_dt;
+            self.particles.vz[i] += self.particles.az[i] * half_dt;
+        }
+
+        // --- 2. Drift: x(t + dt) = x(t) + v(t + dt/2) * dt ---
+        for i in 0..n {
+            self.particles.x[i] += self.particles.vx[i] * dt;
+            self.particles.y[i] += self.particles.vy[i] * dt;
+            self.particles.z[i] += self.particles.vz[i] * dt;
+        }
+
+        // --- 2b. Boundary collision: clamp positions to domain bounds ---
+        self.boundary.enforce_no_penetration_domain(
+            &mut self.particles,
+            self.domain_min,
+            self.domain_max,
+        );
+
+        // --- 3-7. Compute all forces ---
+        self.compute_forces();
 
         // --- 8. Second half-kick: v(t + dt) = v(t + dt/2) + a(t + dt) * dt/2 ---
         for i in 0..n {

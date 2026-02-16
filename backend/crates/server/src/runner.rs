@@ -33,8 +33,14 @@ pub struct SimulationRunner {
     timestep: Arc<Mutex<u64>>,
     /// Simulation time
     sim_time: Arc<Mutex<f64>>,
-    /// Fixed timestep (seconds)
-    dt: f32,
+    /// Current adaptive timestep (seconds), updated each step
+    dt: Arc<Mutex<f32>>,
+    /// Smoothing length for adaptive timestep computation
+    h: f32,
+    /// Speed of sound for adaptive timestep computation
+    speed_of_sound: f32,
+    /// CFL number for adaptive timestep computation
+    cfl_number: f32,
     /// Subsample count (~5% of particles)
     subsample_count: usize,
     /// Domain minimum bounds
@@ -45,8 +51,6 @@ pub struct SimulationRunner {
     fluid_type: u8,
     /// Signed distance field for force computation
     sdf: Arc<GridSDF>,
-    /// Smoothing length
-    h: f32,
     /// Force history (timestep -> force)
     force_history: Arc<Mutex<Vec<ForceRecord>>>,
 }
@@ -90,8 +94,8 @@ impl SimulationRunner {
         let particle_count = kernel.particle_count();
         let subsample_count = (particle_count as f32 * 0.05).max(1.0) as usize;
 
-        // Calculate timestep (CFL condition)
-        let dt = config.cfl_number * h / config.speed_of_sound;
+        // Initial timestep estimate via CFL condition (will be adaptively updated)
+        let initial_dt = config.cfl_number * h / config.speed_of_sound;
 
         let fluid_type = match config.fluid_type {
             orchestrator::config::ConfigFluidType::Water => 0,
@@ -104,13 +108,15 @@ impl SimulationRunner {
             status: Arc::new(Mutex::new(SimStatus::Created)),
             timestep: Arc::new(Mutex::new(0)),
             sim_time: Arc::new(Mutex::new(0.0)),
-            dt,
+            dt: Arc::new(Mutex::new(initial_dt)),
+            h,
+            speed_of_sound: config.speed_of_sound,
+            cfl_number: config.cfl_number,
             subsample_count,
             domain_min: config.domain.min,
             domain_max: config.domain.max,
             fluid_type,
             sdf: Arc::new(sdf),
-            h,
             force_history: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -147,8 +153,22 @@ impl SimulationRunner {
             return;
         }
 
-        // Execute kernel step
-        self.kernel.lock().unwrap().step(self.dt);
+        // Compute adaptive timestep from current kernel state
+        let dt = {
+            let kernel = self.kernel.lock().unwrap();
+            kernel::sph::compute_timestep(
+                kernel.particles(),
+                self.h,
+                self.speed_of_sound,
+                self.cfl_number,
+            )
+        };
+
+        // Store the current dt for external queries
+        *self.dt.lock().unwrap() = dt;
+
+        // Execute kernel step with adaptive dt
+        self.kernel.lock().unwrap().step(dt);
 
         // Check for instabilities (clone to avoid holding lock)
         let (metrics, particles) = {
@@ -193,7 +213,7 @@ impl SimulationRunner {
         };
         let new_sim_time = {
             let mut st = self.sim_time.lock().unwrap();
-            *st += self.dt as f64;
+            *st += dt as f64;
             *st
         };
 
@@ -241,9 +261,9 @@ impl SimulationRunner {
         self.subsample_count
     }
 
-    /// Get timestep duration
+    /// Get current timestep duration
     pub fn dt(&self) -> f32 {
-        self.dt
+        *self.dt.lock().unwrap()
     }
 
     /// Get domain minimum bounds

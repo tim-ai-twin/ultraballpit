@@ -157,152 +157,167 @@ fn generate_wall_boundary_particles(
     let domain_min = config.domain.min;
     let domain_max = config.domain.max;
 
-    // X-min face (yz plane)
+    // Number of boundary particle layers per wall (Adami et al. 2012 needs >= 3)
+    let n_layers: usize = 3;
+
+    // X-min face (yz plane), outward normal = (-1, 0, 0), inward = (+1, 0, 0)
     if matches!(config.boundary_conditions.x_min,
         BoundaryType::Simple(SimpleBoundary::Wall))
     {
         let ny = ((domain_max[1] - domain_min[1]) / spacing).ceil() as usize;
         let nz = ((domain_max[2] - domain_min[2]) / spacing).ceil() as usize;
 
-        for j in 0..ny {
-            for k in 0..nz {
-                let y = domain_min[1] + (j as f32 + 0.5) * spacing;
-                let z = domain_min[2] + (k as f32 + 0.5) * spacing;
+        for layer in 0..n_layers {
+            for j in 0..ny {
+                for k in 0..nz {
+                    let y = domain_min[1] + (j as f32 + 0.5) * spacing;
+                    let z = domain_min[2] + (k as f32 + 0.5) * spacing;
 
-                boundary_particles.push(BoundaryParticleData {
-                    x: domain_min[0],
-                    y,
-                    z,
-                    mass,
-                    nx: 1.0, // Outward normal (pointing into domain)
-                    ny: 0.0,
-                    nz: 0.0,
-                });
+                    boundary_particles.push(BoundaryParticleData {
+                        x: domain_min[0] - layer as f32 * spacing,
+                        y,
+                        z,
+                        mass,
+                        nx: 1.0, // Outward normal (pointing into domain)
+                        ny: 0.0,
+                        nz: 0.0,
+                    });
+                }
             }
         }
     }
 
-    // X-max face
+    // X-max face, outward normal = (+1, 0, 0), layers go outward (+x)
     if matches!(config.boundary_conditions.x_max,
         BoundaryType::Simple(SimpleBoundary::Wall))
     {
         let ny = ((domain_max[1] - domain_min[1]) / spacing).ceil() as usize;
         let nz = ((domain_max[2] - domain_min[2]) / spacing).ceil() as usize;
 
-        for j in 0..ny {
-            for k in 0..nz {
-                let y = domain_min[1] + (j as f32 + 0.5) * spacing;
-                let z = domain_min[2] + (k as f32 + 0.5) * spacing;
+        for layer in 0..n_layers {
+            for j in 0..ny {
+                for k in 0..nz {
+                    let y = domain_min[1] + (j as f32 + 0.5) * spacing;
+                    let z = domain_min[2] + (k as f32 + 0.5) * spacing;
 
-                boundary_particles.push(BoundaryParticleData {
-                    x: domain_max[0],
-                    y,
-                    z,
-                    mass,
-                    nx: -1.0, // Outward normal
-                    ny: 0.0,
-                    nz: 0.0,
-                });
+                    boundary_particles.push(BoundaryParticleData {
+                        x: domain_max[0] + layer as f32 * spacing,
+                        y,
+                        z,
+                        mass,
+                        nx: -1.0, // Outward normal
+                        ny: 0.0,
+                        nz: 0.0,
+                    });
+                }
             }
         }
     }
 
-    // Y-min face (xz plane)
+    // Y-min face (xz plane), outward normal = (0, -1, 0), layers go outward (-y)
     if matches!(config.boundary_conditions.y_min,
         BoundaryType::Simple(SimpleBoundary::Wall))
     {
         let nx = ((domain_max[0] - domain_min[0]) / spacing).ceil() as usize;
         let nz = ((domain_max[2] - domain_min[2]) / spacing).ceil() as usize;
 
-        for i in 0..nx {
-            for k in 0..nz {
-                let x = domain_min[0] + (i as f32 + 0.5) * spacing;
-                let z = domain_min[2] + (k as f32 + 0.5) * spacing;
+        for layer in 0..n_layers {
+            for i in 0..nx {
+                for k in 0..nz {
+                    let x = domain_min[0] + (i as f32 + 0.5) * spacing;
+                    let z = domain_min[2] + (k as f32 + 0.5) * spacing;
 
-                boundary_particles.push(BoundaryParticleData {
-                    x,
-                    y: domain_min[1],
-                    z,
-                    mass,
-                    nx: 0.0,
-                    ny: 1.0, // Outward normal
-                    nz: 0.0,
-                });
+                    boundary_particles.push(BoundaryParticleData {
+                        x,
+                        y: domain_min[1] - layer as f32 * spacing,
+                        z,
+                        mass,
+                        nx: 0.0,
+                        ny: 1.0, // Outward normal (pointing into domain)
+                        nz: 0.0,
+                    });
+                }
             }
         }
     }
 
-    // Y-max face
+    // Y-max face, outward normal = (0, +1, 0), layers go outward (+y)
     if matches!(config.boundary_conditions.y_max,
         BoundaryType::Simple(SimpleBoundary::Wall))
     {
         let nx = ((domain_max[0] - domain_min[0]) / spacing).ceil() as usize;
         let nz = ((domain_max[2] - domain_min[2]) / spacing).ceil() as usize;
 
-        for i in 0..nx {
-            for k in 0..nz {
-                let x = domain_min[0] + (i as f32 + 0.5) * spacing;
-                let z = domain_min[2] + (k as f32 + 0.5) * spacing;
+        for layer in 0..n_layers {
+            for i in 0..nx {
+                for k in 0..nz {
+                    let x = domain_min[0] + (i as f32 + 0.5) * spacing;
+                    let z = domain_min[2] + (k as f32 + 0.5) * spacing;
 
-                boundary_particles.push(BoundaryParticleData {
-                    x,
-                    y: domain_max[1],
-                    z,
-                    mass,
-                    nx: 0.0,
-                    ny: -1.0, // Outward normal
-                    nz: 0.0,
-                });
+                    boundary_particles.push(BoundaryParticleData {
+                        x,
+                        y: domain_max[1] + layer as f32 * spacing,
+                        z,
+                        mass,
+                        nx: 0.0,
+                        ny: -1.0, // Outward normal
+                        nz: 0.0,
+                    });
+                }
             }
         }
     }
 
-    // Z-min face (xy plane)
+    // Z-min face (xy plane), outward normal = (0, 0, -1), layers go outward (-z)
     if matches!(config.boundary_conditions.z_min,
         BoundaryType::Simple(SimpleBoundary::Wall))
     {
         let nx = ((domain_max[0] - domain_min[0]) / spacing).ceil() as usize;
         let ny = ((domain_max[1] - domain_min[1]) / spacing).ceil() as usize;
 
-        for i in 0..nx {
-            for j in 0..ny {
-                let x = domain_min[0] + (i as f32 + 0.5) * spacing;
-                let y = domain_min[1] + (j as f32 + 0.5) * spacing;
+        for layer in 0..n_layers {
+            for i in 0..nx {
+                for j in 0..ny {
+                    let x = domain_min[0] + (i as f32 + 0.5) * spacing;
+                    let y = domain_min[1] + (j as f32 + 0.5) * spacing;
 
-                boundary_particles.push(BoundaryParticleData {
-                    x,
-                    y,
-                    z: domain_min[2],
-                    mass,
-                    nx: 0.0,
-                    ny: 0.0,
-                    nz: 1.0, // Outward normal
-                });
+                    boundary_particles.push(BoundaryParticleData {
+                        x,
+                        y,
+                        z: domain_min[2] - layer as f32 * spacing,
+                        mass,
+                        nx: 0.0,
+                        ny: 0.0,
+                        nz: 1.0, // Outward normal (pointing into domain)
+                    });
+                }
             }
         }
     }
 
-    // Z-max face
+    // Z-max face, outward normal = (0, 0, +1), layers go outward (+z)
     if matches!(config.boundary_conditions.z_max,
         BoundaryType::Simple(SimpleBoundary::Wall))
     {
         let nx = ((domain_max[0] - domain_min[0]) / spacing).ceil() as usize;
         let ny = ((domain_max[1] - domain_min[1]) / spacing).ceil() as usize;
 
-        for i in 0..nx {
-            for j in 0..ny {
-                let x = domain_min[0] + (i as f32 + 0.5) * spacing;
-                let y = domain_min[1] + (j as f32 + 0.5) * spacing;
+        for layer in 0..n_layers {
+            for i in 0..nx {
+                for j in 0..ny {
+                    let x = domain_min[0] + (i as f32 + 0.5) * spacing;
+                    let y = domain_min[1] + (j as f32 + 0.5) * spacing;
 
-                boundary_particles.push(BoundaryParticleData {
-                    x,
-                    y,
-                    z: domain_max[2],
-                    mass,
-                    nx: 0.0,
-                    ny: 0.0,
-                    nz: -1.0, // Outward normal
-                });
+                    boundary_particles.push(BoundaryParticleData {
+                        x,
+                        y,
+                        z: domain_max[2] + layer as f32 * spacing,
+                        mass,
+                        nx: 0.0,
+                        ny: 0.0,
+                        nz: -1.0, // Outward normal
+                    });
+                }
             }
         }
     }
@@ -326,6 +341,7 @@ fn generate_geometry_boundary_particles(
     let nz = ((domain_max[2] - domain_min[2]) / spacing).ceil() as usize;
 
     let surface_threshold = spacing * 0.5; // Within half a particle spacing of surface
+    let n_layers: usize = 3;
 
     for i in 0..nx {
         for j in 0..ny {
@@ -336,19 +352,24 @@ fn generate_geometry_boundary_particles(
 
                 let dist = sdf.sample([x, y, z]);
 
-                // If near the surface (small positive distance), place a boundary particle
+                // If near the surface (small positive distance), place boundary particles
+                // in 3 layers along the inward normal (into the solid)
                 if dist > 0.0 && dist < surface_threshold {
                     let normal = sdf.gradient([x, y, z]);
 
-                    boundary_particles.push(BoundaryParticleData {
-                        x,
-                        y,
-                        z,
-                        mass,
-                        nx: normal[0],
-                        ny: normal[1],
-                        nz: normal[2],
-                    });
+                    for layer in 0..n_layers {
+                        // Offset each layer along the inward normal (opposite to gradient)
+                        let offset = layer as f32 * spacing;
+                        boundary_particles.push(BoundaryParticleData {
+                            x: x - normal[0] * offset,
+                            y: y - normal[1] * offset,
+                            z: z - normal[2] * offset,
+                            mass,
+                            nx: normal[0],
+                            ny: normal[1],
+                            nz: normal[2],
+                        });
+                    }
                 }
             }
         }
