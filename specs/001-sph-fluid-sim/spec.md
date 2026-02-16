@@ -173,6 +173,49 @@ locally and on 2+ instances, comparing results for consistency.
 
 ---
 
+### User Story 6 - Standard SPH Validation Benchmarks (Priority: P6)
+
+The development team runs a suite of standard SPH validation benchmarks
+that are widely used in the literature to verify SPH code correctness.
+These benchmarks use larger domains and higher particle counts than the
+fast smoke tests (US2), and compare against published experimental or
+analytical data. They serve as the definitive proof that the simulation
+produces physically meaningful results.
+
+Standard benchmarks to implement:
+- **2D Dam Break** (Martin & Moyce 1952): Water column collapses under
+  gravity. Compare water front position over time against published
+  experimental measurements. This is the canonical "does your SPH code
+  work?" test.
+- **High-Resolution Hydrostatic Pressure**: Water column with 50+
+  particle layers. Verify pressure profile matches rho * g * h within
+  1% across the full column height.
+- **Poiseuille Flow** (Morris et al. 1997): Pressure-driven flow
+  between parallel plates. Compare velocity profile against analytical
+  parabolic solution. Validates viscous force implementation.
+- **Standing Wave**: Small-amplitude wave in a periodic domain. Compare
+  wave period and amplitude decay against linear wave theory. Validates
+  pressure-velocity coupling accuracy.
+
+**Why this priority**: These benchmarks require the full simulation
+stack to be working (US1), ideally with force extraction (US3) for
+drag validation. They are computationally expensive (~50k-500k
+particles, minutes to run) so they run after the fast smoke tests.
+They are the standard of proof for any SPH implementation.
+
+**Independent Test**: Each benchmark has published reference data
+(experimental measurements or analytical solutions) and quantitative
+pass/fail criteria.
+
+**Acceptance Scenarios**:
+
+1. **Given** the 2D dam break setup (Martin & Moyce 1952), **When** the simulation runs to completion with 50k+ particles, **Then** the water front position over time agrees with published experimental data within 10%.
+2. **Given** a hydrostatic column with 50+ particle layers, **When** the simulation reaches steady state, **Then** pressure at every depth matches rho * g * h within 1%.
+3. **Given** Poiseuille flow between parallel plates, **When** the simulation reaches steady state, **Then** the velocity profile matches the analytical parabolic solution within 5%.
+4. **Given** a standing wave in a periodic domain, **When** the simulation runs for 10+ wave periods, **Then** wave period matches linear theory within 5% and amplitude decay is physically consistent.
+
+---
+
 ### Edge Cases
 
 - What happens when the STL file has non-manifold geometry or holes? The system should warn the user and attempt to generate an SDF anyway, or reject with a clear error if the geometry is too broken.
@@ -223,6 +266,7 @@ locally and on 2+ instances, comparing results for consistency.
 - **FR-019**: System MUST support manual checkpointing -- the user can save full simulation state to disk at any point and resume from that checkpoint later. Auto-checkpointing is out of scope for initial release.
 - **FR-020**: System MUST use boundary particles (frozen particles on domain walls and geometry surfaces) for wall boundary enforcement, rather than SDF penalty forces. The SDF is retained for computing surface normals and for force extraction.
 - **FR-021**: The simulation kernel step function MUST be structured as distinct sequential phases (neighbor search, density, forces, integration) to enable future GPU porting.
+- **FR-022**: System MUST include a suite of standard SPH validation benchmarks (dam break, high-resolution hydrostatic, Poiseuille flow, standing wave) with published experimental or analytical reference data and quantitative pass/fail criteria.
 
 ### Key Entities
 
@@ -252,6 +296,9 @@ locally and on 2+ instances, comparing results for consistency.
 - **SC-010**: Force API response time is under 500ms for queries spanning up to 10,000 timesteps.
 - **SC-011**: Distributed simulation across 2+ instances produces force results within 2% of equivalent single-instance results. (P5 priority -- deferred until US5.)
 - **SC-012**: 90% of engineer/artist users can configure and run a basic simulation without consulting documentation beyond the in-app interface.
+- **SC-013**: 2D dam break water front position matches Martin & Moyce (1952) experimental data within 10%. (P6 priority -- deferred until US6.)
+- **SC-014**: High-resolution hydrostatic pressure profile matches rho * g * h within 1% at 50+ particle layers. (P6 priority -- deferred until US6.)
+- **SC-015**: Poiseuille flow velocity profile matches analytical parabolic solution within 5%. (P6 priority -- deferred until US6.)
 
 ### Assumptions
 

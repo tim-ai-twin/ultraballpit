@@ -215,18 +215,60 @@
 
 ---
 
-## Phase 8: Polish & Cross-Cutting Concerns
+## Phase 8: US6 -- Standard SPH Validation Benchmarks (Priority: P6)
+
+**Goal**: Run industry-standard SPH validation benchmarks with published experimental or analytical reference data at higher resolution than the fast smoke tests. These benchmarks prove the simulation is physically correct, not just stable.
+
+**Independent Test**: Each benchmark has quantitative pass/fail criteria based on published data. `just test-benchmarks` runs the full suite.
+
+**Dependencies**: Requires US1 complete. Benefits from US2 framework (reference test infrastructure), US3 (force extraction for drag), and accuracy fixes. These benchmarks use 50k-500k particles and take minutes to run, so they are scheduled after all other development work.
+
+**References**:
+- SPHERIC SPH benchmark suite (spheric-sph.org)
+- Martin & Moyce 1952 (dam break experimental data)
+- Morris et al. 1997 (Poiseuille flow analytical solution)
+- Adami et al. 2012 (boundary handling validation)
+
+### Benchmark Configs & Geometry
+
+- [ ] T080 [P] [US6] Create dam break geometry: 2D slab domain (5cm × 10cm × 1-particle-thick, spacing 0.5mm) with water column occupying left quarter, open right side in configs/dam-break-2d.json and geometries/dam-break-slab.stl
+- [ ] T081 [P] [US6] Create high-resolution hydrostatic config: water column (2cm × 10cm × 2cm, spacing 0.2mm, 50+ layers, all-wall boundaries) in configs/hydrostatic-hires.json
+- [ ] T082 [P] [US6] Create Poiseuille flow config: channel flow between parallel plates (10cm × 1cm × 1-particle-thick, spacing 0.2mm, periodic in flow direction, pressure gradient body force, wall top/bottom) in configs/poiseuille-2d.json
+- [ ] T083 [P] [US6] Create standing wave config: periodic domain (10cm × 5cm × 1-particle-thick, spacing 0.5mm, periodic x boundaries, wall bottom, open top) with small-amplitude initial surface displacement in configs/standing-wave.json
+
+### Benchmark Reference Data
+
+- [ ] T084 [P] [US6] Encode Martin & Moyce 1952 dam break experimental data (water front position vs dimensionless time) as reference data file in backend/reference-tests/data/martin-moyce-1952.json
+- [ ] T085 [P] [US6] Implement analytical Poiseuille flow solution (parabolic velocity profile u(y) = G/(2*mu) * y * (H-y)) as reference comparator in backend/reference-tests/src/lib.rs
+
+### Benchmark Test Cases
+
+- [ ] T086 [US6] Create dam break benchmark test: run simulation to t=0.5s, extract water front position at each frame, compare against Martin & Moyce data, pass if within 10% in backend/reference-tests/src/benchmarks.rs
+- [ ] T087 [US6] Create high-resolution hydrostatic benchmark: run to steady state, extract pressure at 10 depth levels, compare each against rho*g*h, pass if all within 1% in backend/reference-tests/src/benchmarks.rs
+- [ ] T088 [US6] Create Poiseuille flow benchmark: run to steady state, extract velocity profile across channel, compare against analytical parabolic solution, pass if RMS error <5% in backend/reference-tests/src/benchmarks.rs
+- [ ] T089 [US6] Create standing wave benchmark: run for 10+ wave periods, extract surface displacement over time, compare period against linear theory (T=2*pi/omega), pass if within 5% in backend/reference-tests/src/benchmarks.rs
+
+### Integration
+
+- [ ] T090 [US6] Add `just test-benchmarks` recipe to justfile; verify all benchmarks pass in release mode
+- [ ] T091 [US6] Document benchmark results (particle count, runtime, accuracy vs reference) in specs/001-sph-fluid-sim/benchmark-results.md
+
+**Checkpoint**: All standard SPH benchmarks pass against published data. The simulation is validated for water flows, viscous forces, pressure-velocity coupling, and transient dynamics. Results documented with accuracy metrics.
+
+---
+
+## Phase 9: Polish & Cross-Cutting Concerns
 
 **Purpose**: Features and improvements that span multiple user stories or are quality-of-life enhancements.
 
-- [ ] T072 [P] Implement manual checkpointing: save SimulationState to disk (binary serialization) and resume from checkpoint in backend/crates/orchestrator/src/runner.rs
-- [ ] T073 [P] Implement checkpoint REST endpoints: POST /api/simulations/{id}/checkpoint and POST /api/simulations/resume in backend/crates/server/src/api.rs
-- [ ] T074 Implement inflow/outflow boundary conditions (spawn particles at inflow face with configured velocity, remove particles exiting at outflow face) in backend/crates/kernel/src/boundary.rs -- deferred from MVP
-- [ ] T075 [P] Set up Playwright e2e test infrastructure in frontend/e2e/ per constitution principle III
-- [ ] T076 [P] Write Playwright e2e test: load page, select config, start simulation, verify particles render, verify camera controls in frontend/e2e/basic-sim.spec.ts
-- [ ] T077 Performance profiling of CPU kernel with cargo bench: identify hot paths, optimize neighbor search and force computation in backend/crates/kernel/benches/
-- [ ] T078 Run quickstart.md validation end-to-end: follow every step in quickstart.md and verify it works
-- [ ] T079 Code cleanup: ensure all public APIs have doc comments, remove dead code, verify cargo clippy clean
+- [ ] T092 [P] Implement manual checkpointing: save SimulationState to disk (binary serialization) and resume from checkpoint in backend/crates/orchestrator/src/runner.rs
+- [ ] T093 [P] Implement checkpoint REST endpoints: POST /api/simulations/{id}/checkpoint and POST /api/simulations/resume in backend/crates/server/src/api.rs
+- [ ] T094 Implement inflow/outflow boundary conditions (spawn particles at inflow face with configured velocity, remove particles exiting at outflow face) in backend/crates/kernel/src/boundary.rs -- deferred from MVP
+- [ ] T095 [P] Set up Playwright e2e test infrastructure in frontend/e2e/ per constitution principle III
+- [ ] T096 [P] Write Playwright e2e test: load page, select config, start simulation, verify particles render, verify camera controls in frontend/e2e/basic-sim.spec.ts
+- [ ] T097 Performance profiling of CPU kernel with cargo bench: identify hot paths, optimize neighbor search and force computation in backend/crates/kernel/benches/
+- [ ] T098 Run quickstart.md validation end-to-end: follow every step in quickstart.md and verify it works
+- [ ] T099 Code cleanup: ensure all public APIs have doc comments, remove dead code, verify cargo clippy clean
 
 ---
 
@@ -241,7 +283,8 @@
 - **US3 (Phase 5)**: Depends on US1 -- force extraction on running simulation; Stokes drag test uses US2 framework
 - **US4 (Phase 6)**: Depends on US1 -- diagnostics on running simulation
 - **US5 (Phase 7)**: Depends on US1 -- distributed execution; validation benefits from US2 + US3
-- **Polish (Phase 8)**: Can start after US1; some tasks independent
+- **US6 (Phase 8)**: Depends on US1+US2+US3 -- standard benchmarks require working sim, test framework, and force extraction. Runs AFTER all other development work.
+- **Polish (Phase 9)**: Can start after US1; some tasks independent
 
 ### Dependency Graph
 
@@ -257,13 +300,20 @@ Phase 3 (US1 - MVP) <----------------------+
     +------+----------+-----------+---------+
     |      |          |           |         |
     v      v          v           v         v
-  Ph 4   Ph 5      Ph 6        Ph 7      Ph 8
+  Ph 4   Ph 5      Ph 6        Ph 7      Ph 9
  (US2)  (US3)     (US4)       (US5)    (Polish)
   Ref   Force     Diag       Distrib
  Tests  Extract
     |      |
     v      v
   Ph 5: Stokes drag test uses US2 framework + US3 forces
+    |      |
+    +------+
+    |
+    v
+  Ph 8 (US6 - Standard SPH Benchmarks)
+  Dam break, Poiseuille, hydrostatic hires, standing wave
+  Runs AFTER all other development phases
 ```
 
 ### Within Each User Story
@@ -354,11 +404,12 @@ Task: "T026 - Hydrostatic column test" (after T023)
 
 1. Setup + Foundational -> Foundation ready
 2. **US1** -> Basic fluid sim in browser (MVP!) with boundary particles, Velocity Verlet, ~10K particles on CPU
-3. **US2** -> Reference tests and validation -- builds trust in correctness
+3. **US2** -> Reference tests and validation (fast smoke tests) -- builds trust in correctness
 4. **US3** -> Force extraction + reporting -- engineering payoff
 5. **US4** -> Diagnostics overlay -- quality assurance
 6. **US5** -> Distributed execution -- scale (last priority)
-7. Polish -> Checkpointing, inflow/outflow, e2e tests, performance tuning
+7. **US6** -> Standard SPH benchmarks (dam break, Poiseuille, etc.) -- definitive accuracy proof
+8. Polish -> Checkpointing, inflow/outflow, e2e tests, performance tuning
 
 ### Key Simplifications from Original Plan
 
@@ -384,12 +435,13 @@ Per user guidance: start with very small simulations (~1cm geometry, <1K particl
 | 1 | Setup | 5 | 4 of 5 parallelizable |
 | 2 | Foundational | 11 | 7 of 11 parallelizable |
 | 3 | US1 - Basic Fluid Sim (MVP) | 26 | Frontend + configs + tests parallel with backend |
-| 4 | US2 - Reference Tests | 8 | Test cases parallelizable |
+| 4 | US2 - Reference Tests (smoke) | 8 | Test cases parallelizable |
 | 5 | US3 - Force Extraction | 8 | Limited (sequential dependency) |
 | 6 | US4 - Diagnostics | 7 | Some parallel (backend/frontend split) |
 | 7 | US5 - Distributed | 6 | Limited (sequential dependency) |
-| 8 | Polish | 8 | 4 of 8 parallelizable |
-| **Total** | | **79** | |
+| 8 | US6 - Standard SPH Benchmarks | 12 | Configs + reference data parallelizable |
+| 9 | Polish | 8 | 4 of 8 parallelizable |
+| **Total** | | **91** | |
 
 ## Notes
 

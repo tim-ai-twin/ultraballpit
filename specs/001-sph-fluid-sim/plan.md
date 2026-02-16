@@ -160,3 +160,4 @@ transport bridge).
 | 3 Rust crates instead of 1 | Kernel must be separable per FR-011 (swap CPU/GPU/distributed). Orchestrator handles lifecycle. Server handles transport. | Single crate would couple kernel interface to HTTP/WS concerns, preventing clean kernel replacement. |
 | Removed phase transitions | Simplifies kernel (no steam tables, no EOS switching, no latent heat) | Phase change was identified as 5-8x complexity risk by review team |
 | Boundary particles instead of SDF penalty | Better density accuracy near walls; standard SPH approach | SDF penalty requires stiffness tuning and causes density deficiency |
+| Standard validation benchmarks (Phase 9) | Proves correctness against published experimental/analytical data | Fast smoke tests (~1cm) catch regressions but can't validate accuracy at scale |
