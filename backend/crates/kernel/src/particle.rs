@@ -18,7 +18,7 @@ pub enum FluidType {
 /// All arrays are parallel: index `i` across every array refers to the same particle.
 /// Separate x/y/z arrays (rather than Vec3) are used deliberately for SIMD lane
 /// utilization and straightforward GPU buffer mapping.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ParticleArrays {
     // ---- Positions ----
     /// X positions (meters)

@@ -1,0 +1,23 @@
+{
+  "name": "Hydrostatic High-Resolution (50+ layers)",
+  "fluid_type": "Water",
+  "geometry_file": "../geometries/null-obstacle.stl",
+  "domain": {
+    "min": [0.0, 0.0, 0.0],
+    "max": [0.005, 0.05, 0.005]
+  },
+  "boundary_conditions": {
+    "x_min": "Wall",
+    "x_max": "Wall",
+    "y_min": "Wall",
+    "y_max": "Wall",
+    "z_min": "Wall",
+    "z_max": "Wall"
+  },
+  "particle_spacing": 0.001,
+  "gravity": [0.0, -9.81, 0.0],
+  "speed_of_sound": 20.0,
+  "viscosity": 0.001,
+  "initial_temperature": 293.15,
+  "cfl_number": 0.4
+}

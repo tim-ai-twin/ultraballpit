@@ -2,9 +2,17 @@
 //!
 //! This crate provides a comprehensive testing framework for validating
 //! the physical accuracy of SPH fluid simulations through reference tests.
+//!
+//! # Modules
+//! - [`analytical`] -- Analytical reference solutions for benchmark comparisons.
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod benchmarks;
+
+pub mod analytical;
 
 use kernel::{CpuKernel, ErrorMetrics, FluidType, ParticleArrays, SimulationKernel};
 use orchestrator::config::SimulationConfig;
@@ -468,6 +476,139 @@ fn validate_settling(particles: &ParticleArrays, check: &SettlingCheck) -> Check
                 max_height,
                 max_allowed_height
             )),
+        }
+    }
+}
+
+/// Run a simulation to a specified time and collect particle snapshots at intervals.
+///
+/// Returns the final CpuKernel and the list of time-stamped snapshots.
+/// Each snapshot contains a copy of particle positions at that time.
+pub fn run_simulation_to_time(
+    config_path: &str,
+    target_time: f64,
+    snapshot_interval: f64,
+) -> Result<(SimulationConfig, kernel::CpuKernel, Vec<SimulationSnapshot>), String> {
+    kernel::simulation::init();
+
+    let config = SimulationConfig::load(config_path)?;
+    let config_file = Path::new(config_path);
+    let config_dir = config_file.parent().ok_or("Invalid config path")?;
+    let geometry_path = config_dir.join(&config.geometry_file);
+    let mesh = geometry::load_stl(
+        geometry_path.to_str().ok_or("Invalid geometry path")?,
+    )?;
+    let sdf = geometry::mesh_to_sdf(&mesh, &config.domain, 0.5 * config.particle_spacing);
+
+    let (fluid_particles, boundary_data) = domain::setup_domain(&config, &sdf);
+    let mut boundary_particles = kernel::BoundaryParticles::new();
+    for b in boundary_data {
+        boundary_particles.push(b.x, b.y, b.z, b.mass, b.nx, b.ny, b.nz);
+    }
+
+    let h = config.smoothing_length();
+    tracing::info!(
+        "Benchmark init: {} particles, h={}, target_time={}s",
+        fluid_particles.len(), h, target_time
+    );
+
+    let mut kernel = CpuKernel::new(
+        fluid_particles,
+        boundary_particles,
+        h,
+        config.gravity,
+        config.speed_of_sound,
+        config.cfl_number,
+        config.viscosity,
+        config.domain.min,
+        config.domain.max,
+    );
+
+    let mut snapshots = Vec::new();
+    let mut sim_time = 0.0_f64;
+    let mut next_snapshot_time = 0.0_f64;
+    let mut step = 0_usize;
+
+    // Take initial snapshot
+    snapshots.push(SimulationSnapshot::from_particles(kernel.particles(), sim_time));
+    next_snapshot_time += snapshot_interval;
+
+    while sim_time < target_time {
+        let dt = kernel::sph::compute_timestep(
+            kernel.particles(),
+            h,
+            config.speed_of_sound,
+            config.cfl_number,
+        );
+        // Clamp dt so we do not overshoot the target time
+        let dt = dt.min((target_time - sim_time) as f32);
+        if dt <= 0.0 {
+            break;
+        }
+        kernel.step(dt);
+        sim_time += dt as f64;
+        step += 1;
+
+        // Collect snapshots at the specified interval
+        if sim_time >= next_snapshot_time {
+            snapshots.push(SimulationSnapshot::from_particles(kernel.particles(), sim_time));
+            next_snapshot_time += snapshot_interval;
+        }
+
+        if step % 5000 == 0 {
+            tracing::info!(
+                "Benchmark step {}, t={:.6}s / {:.6}s ({:.1}%)",
+                step, sim_time, target_time,
+                (sim_time / target_time) * 100.0
+            );
+        }
+    }
+
+    // Final snapshot
+    if snapshots.last().map_or(true, |s| (s.time - sim_time).abs() > 1e-10) {
+        snapshots.push(SimulationSnapshot::from_particles(kernel.particles(), sim_time));
+    }
+
+    tracing::info!("Benchmark complete: {} steps, {:.6}s, {} snapshots", step, sim_time, snapshots.len());
+    Ok((config, kernel, snapshots))
+}
+
+/// A snapshot of simulation particle state at a given time.
+#[derive(Debug, Clone)]
+pub struct SimulationSnapshot {
+    /// Simulation time (seconds)
+    pub time: f64,
+    /// X positions
+    pub x: Vec<f32>,
+    /// Y positions
+    pub y: Vec<f32>,
+    /// Z positions
+    pub z: Vec<f32>,
+    /// X velocities
+    pub vx: Vec<f32>,
+    /// Y velocities
+    pub vy: Vec<f32>,
+    /// Z velocities
+    pub vz: Vec<f32>,
+    /// Pressures
+    pub pressure: Vec<f32>,
+    /// Densities
+    pub density: Vec<f32>,
+}
+
+impl SimulationSnapshot {
+    /// Create a snapshot from the current particle state.
+    pub fn from_particles(particles: &ParticleArrays, time: f64) -> Self {
+        Self {
+            time,
+            x: particles.x.clone(),
+            y: particles.y.clone(),
+            z: particles.z.clone(),
+            vx: particles.vx.clone(),
+            vy: particles.vy.clone(),
+            vz: particles.vz.clone(),
+            pressure: particles.pressure.clone(),
+            density: particles.density.clone(),
         }
     }
 }

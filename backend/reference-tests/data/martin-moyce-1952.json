@@ -1,0 +1,21 @@
+{
+  "title": "Martin & Moyce (1952) Dam Break Experimental Data",
+  "reference": "Martin, J. C., & Moyce, W. J. (1952). Part IV. An experimental study of the collapse of liquid columns on a rigid horizontal plane. Phil. Trans. Roy. Soc. A, 244(882), 312-324.",
+  "description": "Dimensionless water front position vs dimensionless time for a dam break on a horizontal surface. Initial water column of width 'a' and height 2a collapses under gravity.",
+  "nondimensionalization": {
+    "time": "T* = t * sqrt(2 * g / a)",
+    "position": "Z* = z / a",
+    "a": "initial column width (m)",
+    "g": "gravitational acceleration (m/s^2)"
+  },
+  "data": {
+    "dimensionless_time": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5],
+    "dimensionless_front_position": [1.0, 1.0, 1.15, 1.5, 2.0, 2.5, 3.1, 3.7]
+  },
+  "notes": [
+    "Data points are approximate readings from the published graph in Figure 4.",
+    "The initial column aspect ratio is 2:1 (height = 2 * width).",
+    "Front position is measured from the original back wall of the column.",
+    "Experimental uncertainty is approximately +/- 5% on front position."
+  ]
+}

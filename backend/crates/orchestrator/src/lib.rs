@@ -5,6 +5,7 @@
 //! - SDF (Signed Distance Field) generation
 //! - Simulation state management
 //! - Simulation runner with lifecycle management
+//! - Domain decomposition and distributed parallel execution (T066-T069)
 
 #![warn(missing_docs)]
 
@@ -13,6 +14,7 @@ pub mod geometry;
 pub mod domain;
 pub mod runner;
 pub mod force;
+pub mod distributed;
 
 pub use config::SimulationConfig;
 pub use runner::SimulationRunner;
@@ -125,4 +127,108 @@ pub fn create_simulation(config_path: &str) -> Result<SimulationRunner, Box<dyn 
 
     tracing::info!("Simulation ready to start");
     Ok(runner)
+}
+
+// ===========================================================================
+// T069: Result Aggregation Utilities
+// ===========================================================================
+
+/// Aggregate force records from multiple subdomains by summing the net force
+/// and net moment vectors at each timestep.
+///
+/// This is used when combining force results from distributed subdomains into
+/// a single total force on the geometry.
+///
+/// # Arguments
+/// * `force_records` - A slice of per-subdomain force record vectors. Each
+///   inner vector contains force records from one subdomain.
+///
+/// # Returns
+/// A combined vector of force records where forces from all subdomains at the
+/// same timestep are summed. If subdomains have different numbers of records,
+/// the result length equals the minimum across all subdomains.
+pub fn aggregate_force_records(
+    force_records: &[Vec<force::SurfaceForce>],
+) -> Vec<force::SurfaceForce> {
+    if force_records.is_empty() {
+        return Vec::new();
+    }
+
+    // Find minimum record count
+    let min_len = force_records.iter().map(|r| r.len()).min().unwrap_or(0);
+    let mut combined = Vec::with_capacity(min_len);
+
+    for t in 0..min_len {
+        let mut total = force::SurfaceForce::default();
+        for sub_records in force_records {
+            total.net_force[0] += sub_records[t].net_force[0];
+            total.net_force[1] += sub_records[t].net_force[1];
+            total.net_force[2] += sub_records[t].net_force[2];
+            total.net_moment[0] += sub_records[t].net_moment[0];
+            total.net_moment[1] += sub_records[t].net_moment[1];
+            total.net_moment[2] += sub_records[t].net_moment[2];
+        }
+        combined.push(total);
+    }
+
+    combined
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_aggregate_force_records_empty() {
+        let result = aggregate_force_records(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_aggregate_force_records_single() {
+        let records = vec![vec![
+            force::SurfaceForce {
+                net_force: [1.0, 2.0, 3.0],
+                net_moment: [0.1, 0.2, 0.3],
+            },
+        ]];
+        let result = aggregate_force_records(&records);
+        assert_eq!(result.len(), 1);
+        assert!((result[0].net_force[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_aggregate_force_records_two_subdomains() {
+        let records = vec![
+            vec![
+                force::SurfaceForce {
+                    net_force: [1.0, 0.0, 0.0],
+                    net_moment: [0.0, 0.0, 0.1],
+                },
+                force::SurfaceForce {
+                    net_force: [2.0, 0.0, 0.0],
+                    net_moment: [0.0, 0.0, 0.2],
+                },
+            ],
+            vec![
+                force::SurfaceForce {
+                    net_force: [0.5, 1.0, 0.0],
+                    net_moment: [0.0, 0.0, 0.05],
+                },
+                force::SurfaceForce {
+                    net_force: [1.0, 2.0, 0.0],
+                    net_moment: [0.0, 0.0, 0.1],
+                },
+            ],
+        ];
+
+        let result = aggregate_force_records(&records);
+        assert_eq!(result.len(), 2);
+        // First timestep: [1.0+0.5, 0.0+1.0, 0.0] = [1.5, 1.0, 0.0]
+        assert!((result[0].net_force[0] - 1.5).abs() < 1e-6);
+        assert!((result[0].net_force[1] - 1.0).abs() < 1e-6);
+        // Second timestep: [2.0+1.0, 0.0+2.0, 0.0] = [3.0, 2.0, 0.0]
+        assert!((result[1].net_force[0] - 3.0).abs() < 1e-6);
+        assert!((result[1].net_force[1] - 2.0).abs() < 1e-6);
+    }
 }

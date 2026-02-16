@@ -1,0 +1,23 @@
+{
+  "name": "Poiseuille Flow 2D (channel flow benchmark)",
+  "fluid_type": "Water",
+  "geometry_file": "../geometries/null-obstacle.stl",
+  "domain": {
+    "min": [0.0, 0.0, 0.0],
+    "max": [0.10, 0.01, 0.0002]
+  },
+  "boundary_conditions": {
+    "x_min": "Periodic",
+    "x_max": "Periodic",
+    "y_min": "Wall",
+    "y_max": "Wall",
+    "z_min": "Wall",
+    "z_max": "Wall"
+  },
+  "particle_spacing": 0.0002,
+  "gravity": [0.001, 0.0, 0.0],
+  "speed_of_sound": 10.0,
+  "viscosity": 0.001,
+  "initial_temperature": 293.15,
+  "cfl_number": 0.4
+}

@@ -257,18 +257,64 @@
 
 ---
 
-## Phase 9: Polish & Cross-Cutting Concerns
+## Phase 9: US7 -- Metal GPU Acceleration (Priority: P7)
+
+**Goal**: Implement a Metal GPU kernel backend (via wgpu) that runs the full SPH simulation on Apple Silicon GPU, achieving 5x+ throughput over the CPU kernel for 50K+ particles. The GPU kernel implements the same `SimulationKernel` trait as `CpuKernel`, so orchestration, visualization, and force extraction work unchanged.
+
+**Independent Test**: Run the same simulation on CPU and GPU backends. Compare final particle positions (within 1e-4 relative error) and force results (within 2%). Benchmark throughput at 50K particles.
+
+**Dependencies**: Requires US1 complete (working CPU kernel). Benefits from US2+US6 (benchmarks to validate GPU matches CPU). Should be implemented after CPU kernel is fully validated.
+
+**References**:
+- wgpu documentation (wgpu.rs)
+- Metal Best Practices Guide (Apple)
+- "Parallel SPH on GPU" (various papers on GPU-based neighbor search + force computation)
+
+### Setup & Infrastructure
+
+- [ ] T092 [US7] Add `wgpu` and `bytemuck` dependencies to backend/crates/kernel/Cargo.toml. Gate GPU code behind a `gpu` cargo feature flag so CPU-only builds remain lightweight.
+- [ ] T093 [US7] Create backend/crates/kernel/src/gpu/ module directory with mod.rs. Define `GpuKernel` struct implementing `SimulationKernel` trait. Include Metal device initialization, pipeline creation, and auto-detection (fall back to CPU if Metal unavailable).
+
+### Compute Shaders (WGSL)
+
+- [ ] T094 [P] [US7] Write WGSL compute shader for neighbor grid construction: hash particles into uniform grid cells, build cell start/end index arrays in backend/crates/kernel/src/gpu/shaders/neighbor_grid.wgsl
+- [ ] T095 [P] [US7] Write WGSL compute shader for SPH density summation: iterate neighbors, compute Wendland C2 kernel contributions, accumulate density per particle in backend/crates/kernel/src/gpu/shaders/density.wgsl
+- [ ] T096 [P] [US7] Write WGSL compute shader for pressure + viscous force computation: compute Tait EOS pressure, pressure gradient forces, viscous forces per particle in backend/crates/kernel/src/gpu/shaders/forces.wgsl
+- [ ] T097 [P] [US7] Write WGSL compute shader for Velocity Verlet time integration: kick-drift-kick update of positions and velocities, domain clamping in backend/crates/kernel/src/gpu/shaders/integrate.wgsl
+
+### GPU Kernel Implementation
+
+- [ ] T098 [US7] Implement GPU buffer management in backend/crates/kernel/src/gpu/buffers.rs: create GPU storage buffers for particle arrays (position, velocity, density, pressure, force), boundary particles, and neighbor grid. Handle CPU↔GPU data transfer for initialization and result readback.
+- [ ] T099 [US7] Implement `GpuKernel::step()` in backend/crates/kernel/src/gpu/mod.rs: dispatch compute shaders in sequence (neighbor grid → density → forces → integrate), synchronize between passes, handle boundary particle pressure mirroring on GPU.
+- [ ] T100 [US7] Implement `GpuKernel::compute_error_metrics()`: readback density array from GPU, compute max density variation, energy conservation, mass conservation on CPU (metrics are infrequent, no need for GPU compute).
+
+### Backend Selection & Config
+
+- [ ] T101 [US7] Add `backend: "cpu" | "gpu" | "auto"` field to SimulationConfig in backend/crates/orchestrator/src/config.rs. Default to "auto" (use GPU if available, fall back to CPU). Update configs/water-box-1cm.json and configs/air-obstacle-1cm.json with default "auto".
+- [ ] T102 [US7] Update runner.rs to instantiate `GpuKernel` or `CpuKernel` based on config backend selection and Metal availability in backend/crates/orchestrator/src/runner.rs
+
+### Validation & Benchmarks
+
+- [ ] T103 [US7] Create GPU vs CPU comparison test: run water-box-1cm on both backends for 1000 timesteps, compare final particle positions (max relative error < 1e-4) and density (< 0.1% difference) in backend/crates/kernel/tests/gpu_cpu_parity.rs
+- [ ] T104 [US7] Create GPU throughput benchmark: measure timesteps/second for 10K, 50K, 100K particles on GPU vs CPU, verify GPU achieves 5x+ speedup at 50K+ in backend/crates/kernel/benches/gpu_throughput.rs
+- [ ] T105 [US7] Run existing reference tests (Phase 4) and standard benchmarks (Phase 8) with GPU backend to verify physics match CPU results
+
+**Checkpoint**: Metal GPU kernel runs the full SPH simulation on Apple Silicon. GPU matches CPU physics within floating-point tolerance. GPU achieves 5x+ throughput for 50K+ particles. Auto-detection falls back to CPU gracefully.
+
+---
+
+## Phase 10: Polish & Cross-Cutting Concerns
 
 **Purpose**: Features and improvements that span multiple user stories or are quality-of-life enhancements.
 
-- [ ] T092 [P] Implement manual checkpointing: save SimulationState to disk (binary serialization) and resume from checkpoint in backend/crates/orchestrator/src/runner.rs
-- [ ] T093 [P] Implement checkpoint REST endpoints: POST /api/simulations/{id}/checkpoint and POST /api/simulations/resume in backend/crates/server/src/api.rs
-- [ ] T094 Implement inflow/outflow boundary conditions (spawn particles at inflow face with configured velocity, remove particles exiting at outflow face) in backend/crates/kernel/src/boundary.rs -- deferred from MVP
-- [ ] T095 [P] Set up Playwright e2e test infrastructure in frontend/e2e/ per constitution principle III
-- [ ] T096 [P] Write Playwright e2e test: load page, select config, start simulation, verify particles render, verify camera controls in frontend/e2e/basic-sim.spec.ts
-- [ ] T097 Performance profiling of CPU kernel with cargo bench: identify hot paths, optimize neighbor search and force computation in backend/crates/kernel/benches/
-- [ ] T098 Run quickstart.md validation end-to-end: follow every step in quickstart.md and verify it works
-- [ ] T099 Code cleanup: ensure all public APIs have doc comments, remove dead code, verify cargo clippy clean
+- [ ] T106 [P] Implement manual checkpointing: save SimulationState to disk (binary serialization) and resume from checkpoint in backend/crates/orchestrator/src/runner.rs
+- [ ] T107 [P] Implement checkpoint REST endpoints: POST /api/simulations/{id}/checkpoint and POST /api/simulations/resume in backend/crates/server/src/api.rs
+- [ ] T108 Implement inflow/outflow boundary conditions (spawn particles at inflow face with configured velocity, remove particles exiting at outflow face) in backend/crates/kernel/src/boundary.rs -- deferred from MVP
+- [ ] T109 [P] Set up Playwright e2e test infrastructure in frontend/e2e/ per constitution principle III
+- [ ] T110 [P] Write Playwright e2e test: load page, select config, start simulation, verify particles render, verify camera controls in frontend/e2e/basic-sim.spec.ts
+- [ ] T111 Performance profiling of CPU kernel with cargo bench: identify hot paths, optimize neighbor search and force computation in backend/crates/kernel/benches/
+- [ ] T112 Run quickstart.md validation end-to-end: follow every step in quickstart.md and verify it works
+- [ ] T113 Code cleanup: ensure all public APIs have doc comments, remove dead code, verify cargo clippy clean
 
 ---
 
@@ -284,7 +330,8 @@
 - **US4 (Phase 6)**: Depends on US1 -- diagnostics on running simulation
 - **US5 (Phase 7)**: Depends on US1 -- distributed execution; validation benefits from US2 + US3
 - **US6 (Phase 8)**: Depends on US1+US2+US3 -- standard benchmarks require working sim, test framework, and force extraction. Runs AFTER all other development work.
-- **Polish (Phase 9)**: Can start after US1; some tasks independent
+- **US7 (Phase 9)**: Depends on US1 -- GPU kernel implements same trait as CPU. Benefits from US6 benchmarks for validation. Should run after CPU kernel is fully validated.
+- **Polish (Phase 10)**: Can start after US1; some tasks independent
 
 ### Dependency Graph
 
@@ -300,7 +347,7 @@ Phase 3 (US1 - MVP) <----------------------+
     +------+----------+-----------+---------+
     |      |          |           |         |
     v      v          v           v         v
-  Ph 4   Ph 5      Ph 6        Ph 7      Ph 9
+  Ph 4   Ph 5      Ph 6        Ph 7      Ph 10
  (US2)  (US3)     (US4)       (US5)    (Polish)
   Ref   Force     Diag       Distrib
  Tests  Extract
@@ -313,7 +360,11 @@ Phase 3 (US1 - MVP) <----------------------+
     v
   Ph 8 (US6 - Standard SPH Benchmarks)
   Dam break, Poiseuille, hydrostatic hires, standing wave
-  Runs AFTER all other development phases
+    |
+    v
+  Ph 9 (US7 - Metal GPU Acceleration)
+  wgpu/Metal compute shaders, GPU kernel, auto-detection
+  Validated against CPU results + existing benchmarks
 ```
 
 ### Within Each User Story
@@ -407,9 +458,10 @@ Task: "T026 - Hydrostatic column test" (after T023)
 3. **US2** -> Reference tests and validation (fast smoke tests) -- builds trust in correctness
 4. **US3** -> Force extraction + reporting -- engineering payoff
 5. **US4** -> Diagnostics overlay -- quality assurance
-6. **US5** -> Distributed execution -- scale (last priority)
+6. **US5** -> Distributed execution -- scale
 7. **US6** -> Standard SPH benchmarks (dam break, Poiseuille, etc.) -- definitive accuracy proof
-8. Polish -> Checkpointing, inflow/outflow, e2e tests, performance tuning
+8. **US7** -> Metal GPU acceleration -- 5x+ throughput for 50K+ particles
+9. Polish -> Checkpointing, inflow/outflow, e2e tests, performance tuning
 
 ### Key Simplifications from Original Plan
 
@@ -440,8 +492,9 @@ Per user guidance: start with very small simulations (~1cm geometry, <1K particl
 | 6 | US4 - Diagnostics | 7 | Some parallel (backend/frontend split) |
 | 7 | US5 - Distributed | 6 | Limited (sequential dependency) |
 | 8 | US6 - Standard SPH Benchmarks | 12 | Configs + reference data parallelizable |
-| 9 | Polish | 8 | 4 of 8 parallelizable |
-| **Total** | | **91** | |
+| 9 | US7 - Metal GPU Acceleration | 14 | Compute shaders parallelizable |
+| 10 | Polish | 8 | 4 of 8 parallelizable |
+| **Total** | | **105** | |
 
 ## Notes
 
@@ -450,8 +503,9 @@ Per user guidance: start with very small simulations (~1cm geometry, <1K particl
 - Each user story should be independently completable and testable
 - Commit after each task or logical group
 - Stop at any checkpoint to validate story independently
-- All development uses ~1cm geometry and <1K particles until Metal GPU acceleration is ready
-- Constitution principle III requires Playwright e2e tests (covered in Phase 8)
+- All development uses ~1cm geometry and <1K particles on CPU until Metal GPU acceleration (Phase 9) is ready
+- Metal GPU kernel (Phase 9) uses wgpu which compiles to Metal on macOS and Vulkan on Linux
+- Constitution principle III requires Playwright e2e tests (covered in Phase 10)
 - Constitution principle V requires structured logging (covered in Phase 2, T015)
 - phase.rs has been REMOVED from the kernel crate -- no phase transition logic anywhere
 - Water and air coexist as separate FluidType values but never convert between each other

@@ -39,6 +39,12 @@ test-reference:
 bench:
     cd backend && cargo bench
 
+# Run SPH validation benchmarks (dam break, hydrostatic, Poiseuille, standing wave)
+# These are long-running tests that compare against analytical/experimental reference data.
+# Uses release mode for performance.
+test-benchmarks:
+    cd backend && cargo test --release -p reference-tests -- --ignored --nocapture
+
 # Watch mode (auto-rebuild backend on changes)
 watch:
     cd backend && cargo watch -x 'run --bin server'

@@ -216,6 +216,37 @@ pass/fail criteria.
 
 ---
 
+### User Story 7 - Metal GPU Acceleration (Priority: P7)
+
+The user runs simulations with Metal GPU acceleration on Apple Silicon,
+achieving significantly higher particle counts and faster throughput
+than the CPU kernel. The GPU kernel implements the same
+`SimulationKernel` trait as the CPU kernel (FR-011), so the
+orchestration, visualization, and force extraction layers work
+unchanged. The user selects between CPU and GPU backends via a config
+flag or auto-detection.
+
+**Why this priority**: GPU acceleration is a performance optimization.
+The CPU kernel must be validated and correct first. The kernel crate is
+already structured with a separable trait (FR-011) and phased step
+function (FR-021) specifically to enable this swap. Metal is chosen
+because Apple Silicon is the primary platform, and wgpu compiles to
+Metal on macOS.
+
+**Independent Test**: Run the same simulation on both CPU and GPU
+backends. Compare final particle positions and force results -- they
+must agree within floating-point tolerance (rounding differences from
+f32 GPU math are expected, but physics must match).
+
+**Acceptance Scenarios**:
+
+1. **Given** an Apple Silicon Mac with Metal support, **When** the user starts a simulation with GPU backend selected, **Then** the simulation runs on the Metal GPU and streams results to the web viewer identically to CPU mode.
+2. **Given** a simulation with ~50K particles, **When** run on GPU vs CPU, **Then** GPU throughput is at least 5x faster than CPU (measured in timesteps per second).
+3. **Given** the same simulation config, **When** run on both CPU and GPU backends, **Then** final particle positions agree within 1e-4 relative error and force results agree within 2%.
+4. **Given** a machine without Metal support, **When** the user starts a simulation, **Then** the system automatically falls back to the CPU kernel with a log message.
+
+---
+
 ### Edge Cases
 
 - What happens when the STL file has non-manifold geometry or holes? The system should warn the user and attempt to generate an SDF anyway, or reject with a clear error if the geometry is too broken.
@@ -267,6 +298,7 @@ pass/fail criteria.
 - **FR-020**: System MUST use boundary particles (frozen particles on domain walls and geometry surfaces) for wall boundary enforcement, rather than SDF penalty forces. The SDF is retained for computing surface normals and for force extraction.
 - **FR-021**: The simulation kernel step function MUST be structured as distinct sequential phases (neighbor search, density, forces, integration) to enable future GPU porting.
 - **FR-022**: System MUST include a suite of standard SPH validation benchmarks (dam break, high-resolution hydrostatic, Poiseuille flow, standing wave) with published experimental or analytical reference data and quantitative pass/fail criteria.
+- **FR-023**: System MUST support a Metal GPU kernel backend (via wgpu) that implements the same `SimulationKernel` trait as the CPU kernel. The GPU backend MUST handle neighbor search, density computation, force computation, and time integration entirely on-GPU with minimal CPU-GPU data transfer. The system MUST auto-detect Metal availability and fall back to CPU if unavailable.
 
 ### Key Entities
 
@@ -299,6 +331,8 @@ pass/fail criteria.
 - **SC-013**: 2D dam break water front position matches Martin & Moyce (1952) experimental data within 10%. (P6 priority -- deferred until US6.)
 - **SC-014**: High-resolution hydrostatic pressure profile matches rho * g * h within 1% at 50+ particle layers. (P6 priority -- deferred until US6.)
 - **SC-015**: Poiseuille flow velocity profile matches analytical parabolic solution within 5%. (P6 priority -- deferred until US6.)
+- **SC-016**: Metal GPU kernel achieves at least 5x throughput improvement over CPU kernel for 50K+ particles. (P7 priority -- deferred until US7.)
+- **SC-017**: GPU and CPU kernels produce matching results within 1e-4 relative position error for the same simulation configuration. (P7 priority -- deferred until US7.)
 
 ### Assumptions
 

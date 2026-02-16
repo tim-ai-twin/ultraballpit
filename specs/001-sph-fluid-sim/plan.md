@@ -161,3 +161,4 @@ transport bridge).
 | Removed phase transitions | Simplifies kernel (no steam tables, no EOS switching, no latent heat) | Phase change was identified as 5-8x complexity risk by review team |
 | Boundary particles instead of SDF penalty | Better density accuracy near walls; standard SPH approach | SDF penalty requires stiffness tuning and causes density deficiency |
 | Standard validation benchmarks (Phase 9) | Proves correctness against published experimental/analytical data | Fast smoke tests (~1cm) catch regressions but can't validate accuracy at scale |
+| wgpu/Metal GPU kernel (Phase 10) | 5-50x throughput for 50K+ particles; enables real interactive exploration | CPU kernel is correct but too slow for large domains. Metal chosen because Apple Silicon is primary platform; wgpu abstracts to Vulkan on Linux. |
