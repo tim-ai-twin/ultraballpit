@@ -38,40 +38,39 @@ struct SimParams {
     cell_size: f32,
     viscosity_alpha: f32,
     viscosity_beta: f32,
-    pass: u32,
+    pass_index: u32,
     _pad1: u32,
 };
 
+// Group 0: SimParams + positions + mass
 @group(0) @binding(0) var<uniform> params: SimParams;
-
-// Fluid particle data
 @group(0) @binding(1) var<storage, read> pos_x: array<f32>;
 @group(0) @binding(2) var<storage, read> pos_y: array<f32>;
 @group(0) @binding(3) var<storage, read> pos_z: array<f32>;
-@group(0) @binding(4) var<storage, read> vel_x: array<f32>;
-@group(0) @binding(5) var<storage, read> vel_y: array<f32>;
-@group(0) @binding(6) var<storage, read> vel_z: array<f32>;
-@group(0) @binding(7) var<storage, read> mass: array<f32>;
-@group(0) @binding(8) var<storage, read> density: array<f32>;
-@group(0) @binding(9) var<storage, read> pressure: array<f32>;
-@group(0) @binding(10) var<storage, read> fluid_type: array<u32>;
+@group(0) @binding(4) var<storage, read> mass: array<f32>;
 
-// Accelerations (output)
-@group(0) @binding(11) var<storage, read_write> acc_x: array<f32>;
-@group(0) @binding(12) var<storage, read_write> acc_y: array<f32>;
-@group(0) @binding(13) var<storage, read_write> acc_z: array<f32>;
+// Group 1: Velocity + acceleration
+@group(1) @binding(0) var<storage, read> vel_x: array<f32>;
+@group(1) @binding(1) var<storage, read> vel_y: array<f32>;
+@group(1) @binding(2) var<storage, read> vel_z: array<f32>;
+@group(1) @binding(3) var<storage, read_write> acc_x: array<f32>;
+@group(1) @binding(4) var<storage, read_write> acc_y: array<f32>;
+@group(1) @binding(5) var<storage, read_write> acc_z: array<f32>;
 
-// Boundary particle data
-@group(0) @binding(14) var<storage, read> bnd_x: array<f32>;
-@group(0) @binding(15) var<storage, read> bnd_y: array<f32>;
-@group(0) @binding(16) var<storage, read> bnd_z: array<f32>;
-@group(0) @binding(17) var<storage, read> bnd_mass: array<f32>;
-@group(0) @binding(18) var<storage, read_write> bnd_pressure: array<f32>;
+// Group 2: SPH state + boundary
+@group(2) @binding(0) var<storage, read> density: array<f32>;
+@group(2) @binding(1) var<storage, read> pressure: array<f32>;
+@group(2) @binding(2) var<storage, read> fluid_type: array<u32>;
+@group(2) @binding(3) var<storage, read> bnd_x: array<f32>;
+@group(2) @binding(4) var<storage, read> bnd_y: array<f32>;
+@group(2) @binding(5) var<storage, read> bnd_z: array<f32>;
+@group(2) @binding(6) var<storage, read> bnd_mass: array<f32>;
+@group(2) @binding(7) var<storage, read_write> bnd_pressure: array<f32>;
 
-// Neighbor grid data
-@group(0) @binding(19) var<storage, read> cell_offsets: array<u32>;
-@group(0) @binding(20) var<storage, read> cell_counts: array<u32>;
-@group(0) @binding(21) var<storage, read> sorted_indices: array<u32>;
+// Group 3: Grid data (read-only for forces)
+@group(3) @binding(2) var<storage, read> cell_offsets: array<u32>;
+@group(3) @binding(1) var<storage, read> cell_counts: array<u32>;
+@group(3) @binding(3) var<storage, read> sorted_indices: array<u32>;
 
 fn wendland_c2(r: f32, h: f32) -> f32 {
     let q = r / h;
@@ -249,7 +248,9 @@ fn compute_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let mu_ij = h * vr_dot / (r_sq + eta_sq);
                         let rho_avg = 0.5 * (rho_i + density[j]);
                         let pi_ij = (-alpha * params.speed_of_sound * mu_ij + beta * mu_ij * mu_ij) / rho_avg;
-                        let v_factor = -mass[j] * pi_ij;
+                        // Multiply by m_i so that the final `fx / m_i` conversion
+                        // to acceleration correctly cancels to -m_j * pi_ij * grad_W.
+                        let v_factor = -m_i * mass[j] * pi_ij;
                         fx = fx + v_factor * grad.x;
                         fy = fy + v_factor * grad.y;
                         fz = fz + v_factor * grad.z;

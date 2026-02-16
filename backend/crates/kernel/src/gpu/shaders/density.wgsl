@@ -36,31 +36,30 @@ struct SimParams {
     cell_size: f32,
     viscosity_alpha: f32,
     viscosity_beta: f32,
-    pass: u32,
+    pass_index: u32,
     _pad1: u32,
 };
 
+// Group 0: SimParams + positions + mass
 @group(0) @binding(0) var<uniform> params: SimParams;
-
-// Fluid particle data
 @group(0) @binding(1) var<storage, read> pos_x: array<f32>;
 @group(0) @binding(2) var<storage, read> pos_y: array<f32>;
 @group(0) @binding(3) var<storage, read> pos_z: array<f32>;
 @group(0) @binding(4) var<storage, read> mass: array<f32>;
-@group(0) @binding(5) var<storage, read_write> density: array<f32>;
-@group(0) @binding(6) var<storage, read_write> pressure: array<f32>;
-@group(0) @binding(7) var<storage, read> fluid_type: array<u32>;
 
-// Boundary particle data
-@group(0) @binding(8) var<storage, read> bnd_x: array<f32>;
-@group(0) @binding(9) var<storage, read> bnd_y: array<f32>;
-@group(0) @binding(10) var<storage, read> bnd_z: array<f32>;
-@group(0) @binding(11) var<storage, read> bnd_mass: array<f32>;
+// Group 2: SPH state + boundary
+@group(2) @binding(0) var<storage, read_write> density: array<f32>;
+@group(2) @binding(1) var<storage, read_write> pressure: array<f32>;
+@group(2) @binding(2) var<storage, read> fluid_type: array<u32>;
+@group(2) @binding(3) var<storage, read> bnd_x: array<f32>;
+@group(2) @binding(4) var<storage, read> bnd_y: array<f32>;
+@group(2) @binding(5) var<storage, read> bnd_z: array<f32>;
+@group(2) @binding(6) var<storage, read> bnd_mass: array<f32>;
 
-// Neighbor grid data
-@group(0) @binding(12) var<storage, read> cell_offsets: array<u32>;
-@group(0) @binding(13) var<storage, read> cell_counts: array<u32>;
-@group(0) @binding(14) var<storage, read> sorted_indices: array<u32>;
+// Group 3: Grid data (read-only for density)
+@group(3) @binding(2) var<storage, read> cell_offsets: array<u32>;
+@group(3) @binding(1) var<storage, read> cell_counts: array<u32>;
+@group(3) @binding(3) var<storage, read> sorted_indices: array<u32>;
 
 fn wendland_c2(r: f32, h: f32) -> f32 {
     let q = r / h;

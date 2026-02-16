@@ -35,7 +35,7 @@ pub struct GpuSimParams {
     pub cell_size: f32,
     pub viscosity_alpha: f32,
     pub viscosity_beta: f32,
-    pub pass: u32,
+    pub pass_index: u32,
     pub _pad1: u32,
 }
 

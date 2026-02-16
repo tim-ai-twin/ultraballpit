@@ -10,6 +10,15 @@
 //!   3. Force computation (pressure + viscous + gravity + boundary)
 //!   4. Time integration (Velocity Verlet kick-drift-kick)
 //! - Particle data lives on the GPU between steps; readback only on demand.
+//!
+//! # Bind group layout
+//! Bindings are split across 4 bind groups to stay within Metal's 8-storage-buffer
+//! per shader stage limit:
+//!
+//! - Group 0: SimParams (uniform) + particle positions + mass
+//! - Group 1: Velocity + acceleration
+//! - Group 2: SPH state (density, pressure, fluid_type) + boundary particle data
+//! - Group 3: Neighbor grid data
 
 pub mod buffers;
 
@@ -36,11 +45,25 @@ pub struct GpuKernel {
     pipeline_half_kick: wgpu::ComputePipeline,
     pipeline_drift: wgpu::ComputePipeline,
 
-    // Bind group layouts
-    bg_layout_grid: wgpu::BindGroupLayout,
-    bg_layout_density: wgpu::BindGroupLayout,
-    bg_layout_forces: wgpu::BindGroupLayout,
-    bg_layout_integrate: wgpu::BindGroupLayout,
+    // Bind group layouts -- per-group, per-shader-family
+    // Grid shader: groups 0, 3
+    bgl_grid_g0: wgpu::BindGroupLayout,
+    bgl_grid_g3: wgpu::BindGroupLayout,
+    // Density shader: groups 0, 2, 3
+    bgl_density_g0: wgpu::BindGroupLayout,
+    bgl_density_g2: wgpu::BindGroupLayout,
+    bgl_density_g3: wgpu::BindGroupLayout,
+    // Forces shader: groups 0, 1, 2, 3
+    bgl_forces_g0: wgpu::BindGroupLayout,
+    bgl_forces_g1: wgpu::BindGroupLayout,
+    bgl_forces_g2: wgpu::BindGroupLayout,
+    bgl_forces_g3: wgpu::BindGroupLayout,
+    // Integrate shader: groups 0, 1
+    bgl_integrate_g0: wgpu::BindGroupLayout,
+    bgl_integrate_g1: wgpu::BindGroupLayout,
+
+    // Empty bind group layout for unused group slots in pipeline layouts
+    bgl_empty: wgpu::BindGroupLayout,
 
     // GPU buffers
     bufs: GpuBuffers,
@@ -126,11 +149,28 @@ impl GpuKernel {
 
         tracing::info!("GPU adapter: {:?}", adapter.get_info().name);
 
+        // Request higher storage buffer limit.  The forces shader uses up to 21
+        // storage buffers (split across 4 bind groups).  Metal on Apple Silicon
+        // supports 31, but wgpu defaults to 8.  Ask for the adapter's actual
+        // limit so compute shaders are not artificially constrained.
+        let adapter_limits = adapter.limits();
+        let mut required_limits = wgpu::Limits::default();
+        required_limits.max_storage_buffers_per_shader_stage =
+            adapter_limits.max_storage_buffers_per_shader_stage;
+        // Also raise bind-group count to 4 (default is already 4, but be explicit).
+        required_limits.max_bind_groups = adapter_limits.max_bind_groups.max(4);
+
+        tracing::info!(
+            "Requesting max_storage_buffers_per_shader_stage = {} (adapter supports {})",
+            required_limits.max_storage_buffers_per_shader_stage,
+            adapter_limits.max_storage_buffers_per_shader_stage,
+        );
+
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("sph_gpu_device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
             },
             None,
@@ -167,7 +207,7 @@ impl GpuKernel {
             cell_size,
             viscosity_alpha: 1.0,
             viscosity_beta: 2.0,
-            pass: 0,
+            pass_index: 0,
             _pad1: 0,
         };
 
@@ -211,30 +251,165 @@ impl GpuKernel {
         });
 
         // --- Bind group layouts ---
-        let bg_layout_grid = create_grid_bind_group_layout(&device);
-        let bg_layout_density = create_density_bind_group_layout(&device);
-        let bg_layout_forces = create_forces_bind_group_layout(&device);
-        let bg_layout_integrate = create_integrate_bind_group_layout(&device);
+        // Empty layout for unused group slots
+        let bgl_empty = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("empty_bgl"),
+            entries: &[],
+        });
+
+        // -- Grid shader layouts (group 0, group 3) --
+        // Group 0: params(uniform), pos_x/y/z(read) -- no mass
+        let bgl_grid_g0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("grid_g0_bgl"),
+            entries: &[
+                bgl_uniform(0),    // params
+                bgl_storage_ro(1), // pos_x
+                bgl_storage_ro(2), // pos_y
+                bgl_storage_ro(3), // pos_z
+            ],
+        });
+        // Group 3: cell_indices(rw), cell_counts(rw), cell_offsets(rw), sorted_indices(rw), write_heads(rw)
+        let bgl_grid_g3 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("grid_g3_bgl"),
+            entries: &[
+                bgl_storage_rw(0), // cell_indices
+                bgl_storage_rw(1), // cell_counts
+                bgl_storage_rw(2), // cell_offsets
+                bgl_storage_rw(3), // sorted_indices
+                bgl_storage_rw(4), // write_heads
+            ],
+        });
+
+        // -- Density shader layouts (group 0, group 2, group 3) --
+        // Group 0: params(uniform), pos_x/y/z(read), mass(read)
+        let bgl_density_g0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("density_g0_bgl"),
+            entries: &[
+                bgl_uniform(0),    // params
+                bgl_storage_ro(1), // pos_x
+                bgl_storage_ro(2), // pos_y
+                bgl_storage_ro(3), // pos_z
+                bgl_storage_ro(4), // mass
+            ],
+        });
+        // Group 2: density(rw), pressure(rw), fluid_type(read), bnd_x/y/z(read), bnd_mass(read) -- no bnd_pressure
+        let bgl_density_g2 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("density_g2_bgl"),
+            entries: &[
+                bgl_storage_rw(0), // density
+                bgl_storage_rw(1), // pressure
+                bgl_storage_ro(2), // fluid_type
+                bgl_storage_ro(3), // bnd_x
+                bgl_storage_ro(4), // bnd_y
+                bgl_storage_ro(5), // bnd_z
+                bgl_storage_ro(6), // bnd_mass
+            ],
+        });
+        // Group 3: cell_counts(read), cell_offsets(read), sorted_indices(read) -- bindings 1,2,3
+        let bgl_density_g3 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("density_g3_bgl"),
+            entries: &[
+                bgl_storage_ro(1), // cell_counts
+                bgl_storage_ro(2), // cell_offsets
+                bgl_storage_ro(3), // sorted_indices
+            ],
+        });
+
+        // -- Forces shader layouts (group 0, group 1, group 2, group 3) --
+        // Group 0: same as density (params + pos + mass, all read)
+        let bgl_forces_g0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("forces_g0_bgl"),
+            entries: &[
+                bgl_uniform(0),    // params
+                bgl_storage_ro(1), // pos_x
+                bgl_storage_ro(2), // pos_y
+                bgl_storage_ro(3), // pos_z
+                bgl_storage_ro(4), // mass
+            ],
+        });
+        // Group 1: vel(read), acc(rw)
+        let bgl_forces_g1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("forces_g1_bgl"),
+            entries: &[
+                bgl_storage_ro(0), // vel_x
+                bgl_storage_ro(1), // vel_y
+                bgl_storage_ro(2), // vel_z
+                bgl_storage_rw(3), // acc_x
+                bgl_storage_rw(4), // acc_y
+                bgl_storage_rw(5), // acc_z
+            ],
+        });
+        // Group 2: density(read), pressure(read), fluid_type(read), bnd(read), bnd_mass(read), bnd_pressure(rw)
+        let bgl_forces_g2 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("forces_g2_bgl"),
+            entries: &[
+                bgl_storage_ro(0), // density
+                bgl_storage_ro(1), // pressure
+                bgl_storage_ro(2), // fluid_type
+                bgl_storage_ro(3), // bnd_x
+                bgl_storage_ro(4), // bnd_y
+                bgl_storage_ro(5), // bnd_z
+                bgl_storage_ro(6), // bnd_mass
+                bgl_storage_rw(7), // bnd_pressure
+            ],
+        });
+        // Group 3: same as density group 3 (cell_counts, cell_offsets, sorted_indices read)
+        let bgl_forces_g3 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("forces_g3_bgl"),
+            entries: &[
+                bgl_storage_ro(1), // cell_counts
+                bgl_storage_ro(2), // cell_offsets
+                bgl_storage_ro(3), // sorted_indices
+            ],
+        });
+
+        // -- Integrate shader layouts (group 0, group 1) --
+        // Group 0: params(uniform), pos_x/y/z(rw) -- no mass
+        let bgl_integrate_g0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("integrate_g0_bgl"),
+            entries: &[
+                bgl_uniform(0),    // params
+                bgl_storage_rw(1), // pos_x
+                bgl_storage_rw(2), // pos_y
+                bgl_storage_rw(3), // pos_z
+            ],
+        });
+        // Group 1: vel(rw), acc(read)
+        let bgl_integrate_g1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("integrate_g1_bgl"),
+            entries: &[
+                bgl_storage_rw(0), // vel_x
+                bgl_storage_rw(1), // vel_y
+                bgl_storage_rw(2), // vel_z
+                bgl_storage_ro(3), // acc_x
+                bgl_storage_ro(4), // acc_y
+                bgl_storage_ro(5), // acc_z
+            ],
+        });
 
         // --- Pipeline layouts ---
+        // Grid: uses groups 0 and 3; empty groups at 1 and 2
         let pl_layout_grid = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("grid_pl"),
-            bind_group_layouts: &[&bg_layout_grid],
+            bind_group_layouts: &[&bgl_grid_g0, &bgl_empty, &bgl_empty, &bgl_grid_g3],
             push_constant_ranges: &[],
         });
+        // Density: uses groups 0, 2, 3; empty group at 1
         let pl_layout_density = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("density_pl"),
-            bind_group_layouts: &[&bg_layout_density],
+            bind_group_layouts: &[&bgl_density_g0, &bgl_empty, &bgl_density_g2, &bgl_density_g3],
             push_constant_ranges: &[],
         });
+        // Forces: uses all 4 groups
         let pl_layout_forces = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("forces_pl"),
-            bind_group_layouts: &[&bg_layout_forces],
+            bind_group_layouts: &[&bgl_forces_g0, &bgl_forces_g1, &bgl_forces_g2, &bgl_forces_g3],
             push_constant_ranges: &[],
         });
+        // Integrate: uses groups 0, 1; empty groups at 2, 3 not needed (just list 2)
         let pl_layout_integrate = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("integrate_pl"),
-            bind_group_layouts: &[&bg_layout_integrate],
+            bind_group_layouts: &[&bgl_integrate_g0, &bgl_integrate_g1],
             push_constant_ranges: &[],
         });
 
@@ -329,10 +504,18 @@ impl GpuKernel {
             pipeline_forces,
             pipeline_half_kick,
             pipeline_drift,
-            bg_layout_grid,
-            bg_layout_density,
-            bg_layout_forces,
-            bg_layout_integrate,
+            bgl_grid_g0,
+            bgl_grid_g3,
+            bgl_density_g0,
+            bgl_density_g2,
+            bgl_density_g3,
+            bgl_forces_g0,
+            bgl_forces_g1,
+            bgl_forces_g2,
+            bgl_forces_g3,
+            bgl_integrate_g0,
+            bgl_integrate_g1,
+            bgl_empty,
             bufs,
             h,
             gravity,
@@ -363,10 +546,21 @@ impl GpuKernel {
         // Update params
         self.bufs.update_params(&self.queue, params);
 
-        // Create bind groups
-        let bg_grid = self.create_grid_bind_group();
-        let bg_density = self.create_density_bind_group();
-        let bg_forces = self.create_forces_bind_group();
+        // Create bind groups for grid shader (groups 0 and 3)
+        let grid_bg0 = self.create_grid_bg0();
+        let grid_bg3 = self.create_grid_bg3();
+        let empty_bg = self.create_empty_bind_group();
+
+        // Create bind groups for density shader (groups 0, 2, 3)
+        let density_bg0 = self.create_density_bg0();
+        let density_bg2 = self.create_density_bg2();
+        let density_bg3 = self.create_density_forces_bg3();
+
+        // Create bind groups for forces shader (groups 0, 1, 2, 3)
+        let forces_bg0 = self.create_forces_bg0();
+        let forces_bg1 = self.create_forces_bg1();
+        let forces_bg2 = self.create_forces_bg2();
+        let forces_bg3 = self.create_forces_bg3();
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("force_pipeline"),
@@ -379,7 +573,10 @@ impl GpuKernel {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline_grid_clear);
-            pass.set_bind_group(0, &bg_grid, &[]);
+            pass.set_bind_group(0, &grid_bg0, &[]);
+            pass.set_bind_group(1, &empty_bg, &[]);
+            pass.set_bind_group(2, &empty_bg, &[]);
+            pass.set_bind_group(3, &grid_bg3, &[]);
             pass.dispatch_workgroups(wg_cells, 1, 1);
         }
 
@@ -390,7 +587,10 @@ impl GpuKernel {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline_grid_count);
-            pass.set_bind_group(0, &bg_grid, &[]);
+            pass.set_bind_group(0, &grid_bg0, &[]);
+            pass.set_bind_group(1, &empty_bg, &[]);
+            pass.set_bind_group(2, &empty_bg, &[]);
+            pass.set_bind_group(3, &grid_bg3, &[]);
             pass.dispatch_workgroups(wg_particles, 1, 1);
         }
 
@@ -401,7 +601,10 @@ impl GpuKernel {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline_grid_prefix);
-            pass.set_bind_group(0, &bg_grid, &[]);
+            pass.set_bind_group(0, &grid_bg0, &[]);
+            pass.set_bind_group(1, &empty_bg, &[]);
+            pass.set_bind_group(2, &empty_bg, &[]);
+            pass.set_bind_group(3, &grid_bg3, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
 
@@ -412,7 +615,10 @@ impl GpuKernel {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline_grid_scatter);
-            pass.set_bind_group(0, &bg_grid, &[]);
+            pass.set_bind_group(0, &grid_bg0, &[]);
+            pass.set_bind_group(1, &empty_bg, &[]);
+            pass.set_bind_group(2, &empty_bg, &[]);
+            pass.set_bind_group(3, &grid_bg3, &[]);
             pass.dispatch_workgroups(wg_particles, 1, 1);
         }
 
@@ -423,7 +629,10 @@ impl GpuKernel {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline_density);
-            pass.set_bind_group(0, &bg_density, &[]);
+            pass.set_bind_group(0, &density_bg0, &[]);
+            pass.set_bind_group(1, &empty_bg, &[]);
+            pass.set_bind_group(2, &density_bg2, &[]);
+            pass.set_bind_group(3, &density_bg3, &[]);
             pass.dispatch_workgroups(wg_particles, 1, 1);
         }
 
@@ -434,7 +643,10 @@ impl GpuKernel {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline_boundary_pressure);
-            pass.set_bind_group(0, &bg_forces, &[]);
+            pass.set_bind_group(0, &forces_bg0, &[]);
+            pass.set_bind_group(1, &forces_bg1, &[]);
+            pass.set_bind_group(2, &forces_bg2, &[]);
+            pass.set_bind_group(3, &forces_bg3, &[]);
             pass.dispatch_workgroups(wg_boundary, 1, 1);
         }
 
@@ -445,7 +657,10 @@ impl GpuKernel {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline_forces);
-            pass.set_bind_group(0, &bg_forces, &[]);
+            pass.set_bind_group(0, &forces_bg0, &[]);
+            pass.set_bind_group(1, &forces_bg1, &[]);
+            pass.set_bind_group(2, &forces_bg2, &[]);
+            pass.set_bind_group(3, &forces_bg3, &[]);
             pass.dispatch_workgroups(wg_particles, 1, 1);
         }
 
@@ -458,98 +673,188 @@ impl GpuKernel {
         self.cached_particles = self.bufs.readback_particles(&self.device, &self.queue);
     }
 
-    /// Create bind group for the neighbor grid shader.
-    fn create_grid_bind_group(&self) -> wgpu::BindGroup {
+    // ---- Bind group creation helpers ----
+
+    /// Create an empty bind group for unused group slots.
+    fn create_empty_bind_group(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("grid_bg"),
-            layout: &self.bg_layout_grid,
+            label: Some("empty_bg"),
+            layout: &self.bgl_empty,
+            entries: &[],
+        })
+    }
+
+    // -- Grid shader bind groups --
+
+    /// Grid group 0: params + pos_x/y/z (read)
+    fn create_grid_bg0(&self) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("grid_bg0"),
+            layout: &self.bgl_grid_g0,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: self.bufs.params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: self.bufs.pos_x.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.bufs.pos_y.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: self.bufs.pos_z.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.bufs.cell_indices.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: self.bufs.cell_counts.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: self.bufs.cell_offsets.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: self.bufs.sorted_indices.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: self.bufs.write_heads.as_entire_binding() },
             ],
         })
     }
 
-    /// Create bind group for the density shader.
-    fn create_density_bind_group(&self) -> wgpu::BindGroup {
+    /// Grid group 3: cell_indices, cell_counts, cell_offsets, sorted_indices, write_heads (all rw)
+    fn create_grid_bg3(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("density_bg"),
-            layout: &self.bg_layout_density,
+            label: Some("grid_bg3"),
+            layout: &self.bgl_grid_g3,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.bufs.cell_indices.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.bufs.cell_counts.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.bufs.cell_offsets.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.bufs.sorted_indices.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.bufs.write_heads.as_entire_binding() },
+            ],
+        })
+    }
+
+    // -- Density shader bind groups --
+
+    /// Density group 0: params + pos_x/y/z (read) + mass (read)
+    fn create_density_bg0(&self) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("density_bg0"),
+            layout: &self.bgl_density_g0,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: self.bufs.params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: self.bufs.pos_x.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.bufs.pos_y.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: self.bufs.pos_z.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: self.bufs.mass.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: self.bufs.density.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: self.bufs.pressure.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: self.bufs.fluid_type.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: self.bufs.bnd_x.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: self.bufs.bnd_y.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: self.bufs.bnd_z.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 11, resource: self.bufs.bnd_mass.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 12, resource: self.bufs.cell_offsets.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 13, resource: self.bufs.cell_counts.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 14, resource: self.bufs.sorted_indices.as_entire_binding() },
             ],
         })
     }
 
-    /// Create bind group for the forces shader.
-    fn create_forces_bind_group(&self) -> wgpu::BindGroup {
+    /// Density group 2: density(rw), pressure(rw), fluid_type(read), bnd_x/y/z(read), bnd_mass(read)
+    fn create_density_bg2(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("forces_bg"),
-            layout: &self.bg_layout_forces,
+            label: Some("density_bg2"),
+            layout: &self.bgl_density_g2,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.bufs.density.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.bufs.pressure.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.bufs.fluid_type.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.bufs.bnd_x.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.bufs.bnd_y.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: self.bufs.bnd_z.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: self.bufs.bnd_mass.as_entire_binding() },
+            ],
+        })
+    }
+
+    /// Density/Forces group 3 (read-only): cell_counts, cell_offsets, sorted_indices
+    /// Used by density shader. Bindings at 1, 2, 3 (matching the shader declarations).
+    fn create_density_forces_bg3(&self) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("density_forces_bg3"),
+            layout: &self.bgl_density_g3,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 1, resource: self.bufs.cell_counts.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.bufs.cell_offsets.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.bufs.sorted_indices.as_entire_binding() },
+            ],
+        })
+    }
+
+    // -- Forces shader bind groups --
+
+    /// Forces group 0: params + pos_x/y/z (read) + mass (read)
+    fn create_forces_bg0(&self) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("forces_bg0"),
+            layout: &self.bgl_forces_g0,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: self.bufs.params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: self.bufs.pos_x.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.bufs.pos_y.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: self.bufs.pos_z.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.bufs.vel_x.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: self.bufs.vel_y.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: self.bufs.vel_z.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: self.bufs.mass.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: self.bufs.density.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: self.bufs.pressure.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: self.bufs.fluid_type.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 11, resource: self.bufs.acc_x.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 12, resource: self.bufs.acc_y.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 13, resource: self.bufs.acc_z.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 14, resource: self.bufs.bnd_x.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 15, resource: self.bufs.bnd_y.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 16, resource: self.bufs.bnd_z.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 17, resource: self.bufs.bnd_mass.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 18, resource: self.bufs.bnd_pressure.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 19, resource: self.bufs.cell_offsets.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 20, resource: self.bufs.cell_counts.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 21, resource: self.bufs.sorted_indices.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.bufs.mass.as_entire_binding() },
             ],
         })
     }
 
-    /// Create bind group for the integrate shader.
-    fn create_integrate_bind_group(&self) -> wgpu::BindGroup {
+    /// Forces group 1: vel_x/y/z (read), acc_x/y/z (rw)
+    fn create_forces_bg1(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("integrate_bg"),
-            layout: &self.bg_layout_integrate,
+            label: Some("forces_bg1"),
+            layout: &self.bgl_forces_g1,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.bufs.vel_x.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.bufs.vel_y.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.bufs.vel_z.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.bufs.acc_x.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.bufs.acc_y.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: self.bufs.acc_z.as_entire_binding() },
+            ],
+        })
+    }
+
+    /// Forces group 2: density(read), pressure(read), fluid_type(read), bnd(read), bnd_pressure(rw)
+    fn create_forces_bg2(&self) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("forces_bg2"),
+            layout: &self.bgl_forces_g2,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.bufs.density.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.bufs.pressure.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.bufs.fluid_type.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.bufs.bnd_x.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.bufs.bnd_y.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: self.bufs.bnd_z.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: self.bufs.bnd_mass.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: self.bufs.bnd_pressure.as_entire_binding() },
+            ],
+        })
+    }
+
+    /// Forces group 3: cell_counts(read), cell_offsets(read), sorted_indices(read) -- bindings 1,2,3
+    fn create_forces_bg3(&self) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("forces_bg3"),
+            layout: &self.bgl_forces_g3,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 1, resource: self.bufs.cell_counts.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.bufs.cell_offsets.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.bufs.sorted_indices.as_entire_binding() },
+            ],
+        })
+    }
+
+    // -- Integrate shader bind groups --
+
+    /// Integrate group 0: params + pos_x/y/z (rw)
+    fn create_integrate_bg0(&self) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("integrate_bg0"),
+            layout: &self.bgl_integrate_g0,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: self.bufs.params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: self.bufs.pos_x.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.bufs.pos_y.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: self.bufs.pos_z.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.bufs.vel_x.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: self.bufs.vel_y.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: self.bufs.vel_z.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: self.bufs.acc_x.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: self.bufs.acc_y.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: self.bufs.acc_z.as_entire_binding() },
+            ],
+        })
+    }
+
+    /// Integrate group 1: vel_x/y/z (rw), acc_x/y/z (read)
+    fn create_integrate_bg1(&self) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("integrate_bg1"),
+            layout: &self.bgl_integrate_g1,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.bufs.vel_x.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.bufs.vel_y.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.bufs.vel_z.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.bufs.acc_x.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.bufs.acc_y.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: self.bufs.acc_z.as_entire_binding() },
             ],
         })
     }
@@ -577,7 +882,7 @@ impl GpuKernel {
             cell_size,
             viscosity_alpha: 1.0,
             viscosity_beta: 2.0,
-            pass: 0,
+            pass_index: 0,
             _pad1: 0,
         }
     }
@@ -604,7 +909,8 @@ impl SimulationKernel for GpuKernel {
 
         // --- 1. Half-kick: v += a * dt/2 ---
         {
-            let bg = self.create_integrate_bind_group();
+            let bg0 = self.create_integrate_bg0();
+            let bg1 = self.create_integrate_bg1();
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("half_kick"),
             });
@@ -614,7 +920,8 @@ impl SimulationKernel for GpuKernel {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.pipeline_half_kick);
-                pass.set_bind_group(0, &bg, &[]);
+                pass.set_bind_group(0, &bg0, &[]);
+                pass.set_bind_group(1, &bg1, &[]);
                 pass.dispatch_workgroups(wg_particles, 1, 1);
             }
             self.queue.submit(std::iter::once(encoder.finish()));
@@ -623,7 +930,8 @@ impl SimulationKernel for GpuKernel {
 
         // --- 2. Drift: x += v * dt + domain clamping ---
         {
-            let bg = self.create_integrate_bind_group();
+            let bg0 = self.create_integrate_bg0();
+            let bg1 = self.create_integrate_bg1();
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("drift"),
             });
@@ -633,7 +941,8 @@ impl SimulationKernel for GpuKernel {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.pipeline_drift);
-                pass.set_bind_group(0, &bg, &[]);
+                pass.set_bind_group(0, &bg0, &[]);
+                pass.set_bind_group(1, &bg1, &[]);
                 pass.dispatch_workgroups(wg_particles, 1, 1);
             }
             self.queue.submit(std::iter::once(encoder.finish()));
@@ -645,7 +954,8 @@ impl SimulationKernel for GpuKernel {
 
         // --- 8. Second half-kick: v += a * dt/2 ---
         {
-            let bg = self.create_integrate_bind_group();
+            let bg0 = self.create_integrate_bg0();
+            let bg1 = self.create_integrate_bg1();
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("half_kick_2"),
             });
@@ -655,7 +965,8 @@ impl SimulationKernel for GpuKernel {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.pipeline_half_kick);
-                pass.set_bind_group(0, &bg, &[]);
+                pass.set_bind_group(0, &bg0, &[]);
+                pass.set_bind_group(1, &bg1, &[]);
                 pass.dispatch_workgroups(wg_particles, 1, 1);
             }
             self.queue.submit(std::iter::once(encoder.finish()));
@@ -737,102 +1048,7 @@ fn dispatch_size(total: u32, workgroup_size: u32) -> u32 {
     (total + workgroup_size - 1) / workgroup_size
 }
 
-// ---- Bind group layout creation helpers ----
-
-fn create_grid_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("grid_bgl"),
-        entries: &[
-            // 0: params (uniform)
-            bgl_uniform(0),
-            // 1-3: pos_x, pos_y, pos_z (read-only storage)
-            bgl_storage_ro(1),
-            bgl_storage_ro(2),
-            bgl_storage_ro(3),
-            // 4: cell_indices (read-write, atomic)
-            bgl_storage_rw(4),
-            // 5: cell_counts (read-write, atomic)
-            bgl_storage_rw(5),
-            // 6: cell_offsets (read-write)
-            bgl_storage_rw(6),
-            // 7: sorted_indices (read-write)
-            bgl_storage_rw(7),
-            // 8: write_heads (read-write, atomic)
-            bgl_storage_rw(8),
-        ],
-    })
-}
-
-fn create_density_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("density_bgl"),
-        entries: &[
-            bgl_uniform(0),       // params
-            bgl_storage_ro(1),    // pos_x
-            bgl_storage_ro(2),    // pos_y
-            bgl_storage_ro(3),    // pos_z
-            bgl_storage_ro(4),    // mass
-            bgl_storage_rw(5),    // density
-            bgl_storage_rw(6),    // pressure
-            bgl_storage_ro(7),    // fluid_type
-            bgl_storage_ro(8),    // bnd_x
-            bgl_storage_ro(9),    // bnd_y
-            bgl_storage_ro(10),   // bnd_z
-            bgl_storage_ro(11),   // bnd_mass
-            bgl_storage_ro(12),   // cell_offsets
-            bgl_storage_ro(13),   // cell_counts
-            bgl_storage_ro(14),   // sorted_indices
-        ],
-    })
-}
-
-fn create_forces_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("forces_bgl"),
-        entries: &[
-            bgl_uniform(0),       // params
-            bgl_storage_ro(1),    // pos_x
-            bgl_storage_ro(2),    // pos_y
-            bgl_storage_ro(3),    // pos_z
-            bgl_storage_ro(4),    // vel_x
-            bgl_storage_ro(5),    // vel_y
-            bgl_storage_ro(6),    // vel_z
-            bgl_storage_ro(7),    // mass
-            bgl_storage_ro(8),    // density
-            bgl_storage_ro(9),    // pressure
-            bgl_storage_ro(10),   // fluid_type
-            bgl_storage_rw(11),   // acc_x
-            bgl_storage_rw(12),   // acc_y
-            bgl_storage_rw(13),   // acc_z
-            bgl_storage_ro(14),   // bnd_x
-            bgl_storage_ro(15),   // bnd_y
-            bgl_storage_ro(16),   // bnd_z
-            bgl_storage_ro(17),   // bnd_mass
-            bgl_storage_rw(18),   // bnd_pressure
-            bgl_storage_ro(19),   // cell_offsets
-            bgl_storage_ro(20),   // cell_counts
-            bgl_storage_ro(21),   // sorted_indices
-        ],
-    })
-}
-
-fn create_integrate_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("integrate_bgl"),
-        entries: &[
-            bgl_uniform(0),       // params
-            bgl_storage_rw(1),    // pos_x
-            bgl_storage_rw(2),    // pos_y
-            bgl_storage_rw(3),    // pos_z
-            bgl_storage_rw(4),    // vel_x
-            bgl_storage_rw(5),    // vel_y
-            bgl_storage_rw(6),    // vel_z
-            bgl_storage_ro(7),    // acc_x
-            bgl_storage_ro(8),    // acc_y
-            bgl_storage_ro(9),    // acc_z
-        ],
-    })
-}
+// ---- Bind group layout entry helpers ----
 
 fn bgl_uniform(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {

@@ -110,11 +110,9 @@ fn gpu_cpu_parity_100_steps() {
         }
     };
 
-    // Run both for 100 steps with fixed dt
+    // Run 100 steps on both kernels
     let dt = 1.0e-5_f32;
-    let n_steps = 100;
-
-    for _ in 0..n_steps {
+    for _ in 0..100 {
         cpu_kernel.step(dt);
         gpu_kernel.step(dt);
     }

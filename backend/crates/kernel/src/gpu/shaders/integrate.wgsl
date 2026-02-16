@@ -28,26 +28,23 @@ struct SimParams {
     cell_size: f32,
     viscosity_alpha: f32,
     viscosity_beta: f32,
-    pass: u32,
+    pass_index: u32,
     _pad1: u32,
 };
 
+// Group 0: SimParams + positions (read-write for integrate)
 @group(0) @binding(0) var<uniform> params: SimParams;
-
-// Positions (read-write)
 @group(0) @binding(1) var<storage, read_write> pos_x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> pos_y: array<f32>;
 @group(0) @binding(3) var<storage, read_write> pos_z: array<f32>;
 
-// Velocities (read-write)
-@group(0) @binding(4) var<storage, read_write> vel_x: array<f32>;
-@group(0) @binding(5) var<storage, read_write> vel_y: array<f32>;
-@group(0) @binding(6) var<storage, read_write> vel_z: array<f32>;
-
-// Accelerations (read-only for integration)
-@group(0) @binding(7) var<storage, read> acc_x: array<f32>;
-@group(0) @binding(8) var<storage, read> acc_y: array<f32>;
-@group(0) @binding(9) var<storage, read> acc_z: array<f32>;
+// Group 1: Velocity + acceleration
+@group(1) @binding(0) var<storage, read_write> vel_x: array<f32>;
+@group(1) @binding(1) var<storage, read_write> vel_y: array<f32>;
+@group(1) @binding(2) var<storage, read_write> vel_z: array<f32>;
+@group(1) @binding(3) var<storage, read> acc_x: array<f32>;
+@group(1) @binding(4) var<storage, read> acc_y: array<f32>;
+@group(1) @binding(5) var<storage, read> acc_z: array<f32>;
 
 const RESTITUTION: f32 = 0.2;
 

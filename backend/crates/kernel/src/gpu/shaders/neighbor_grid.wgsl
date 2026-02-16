@@ -29,24 +29,22 @@ struct SimParams {
     viscosity_alpha: f32,
     viscosity_beta: f32,
     // Pass selector for multi-pass shaders
-    pass: u32,
+    pass_index: u32,
     _pad1: u32,
 };
 
+// Group 0: SimParams + positions + mass
 @group(0) @binding(0) var<uniform> params: SimParams;
-
-// Particle positions (read-only for grid building)
 @group(0) @binding(1) var<storage, read> pos_x: array<f32>;
 @group(0) @binding(2) var<storage, read> pos_y: array<f32>;
 @group(0) @binding(3) var<storage, read> pos_z: array<f32>;
 
-// Grid data (read-write)
-@group(0) @binding(4) var<storage, read_write> cell_indices: array<atomic<u32>>;
-@group(0) @binding(5) var<storage, read_write> cell_counts: array<atomic<u32>>;
-@group(0) @binding(6) var<storage, read_write> cell_offsets: array<u32>;
-@group(0) @binding(7) var<storage, read_write> sorted_indices: array<u32>;
-// write_heads: temporary per-cell write pointer for scatter pass
-@group(0) @binding(8) var<storage, read_write> write_heads: array<atomic<u32>>;
+// Group 3: Grid data
+@group(3) @binding(0) var<storage, read_write> cell_indices: array<atomic<u32>>;
+@group(3) @binding(1) var<storage, read_write> cell_counts: array<atomic<u32>>;
+@group(3) @binding(2) var<storage, read_write> cell_offsets: array<u32>;
+@group(3) @binding(3) var<storage, read_write> sorted_indices: array<u32>;
+@group(3) @binding(4) var<storage, read_write> write_heads: array<atomic<u32>>;
 
 fn pos_to_cell(px: f32, py: f32, pz: f32) -> u32 {
     let cx = clamp(
