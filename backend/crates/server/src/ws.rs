@@ -192,18 +192,16 @@ fn build_sim_info(runner: &crate::runner::SimulationRunner) -> Vec<u8> {
     buf.extend_from_slice(&particle_count.to_le_bytes());
     buf.extend_from_slice(&subsample_count.to_le_bytes());
 
-    // Domain bounds (placeholder - we'd need to add these to the runner)
-    let domain_min = [0.0_f32, 0.0, 0.0];
-    let domain_max = [1.0_f32, 1.0, 1.0];
-    for &v in &domain_min {
+    // Domain bounds
+    for &v in &runner.domain_min() {
         buf.extend_from_slice(&v.to_le_bytes());
     }
-    for &v in &domain_max {
+    for &v in &runner.domain_max() {
         buf.extend_from_slice(&v.to_le_bytes());
     }
 
     // Fluid type (0 = Water, 1 = Air, 2 = Mixed)
-    buf.push(0); // Placeholder
+    buf.push(runner.fluid_type());
 
     // Subsample rate (~5% = 20:1)
     let subsample_rate = (particle_count / subsample_count).max(1) as u8;
@@ -279,25 +277,24 @@ fn build_frame(runner: &crate::runner::SimulationRunner) -> Vec<u8> {
 }
 
 /// Build SimStatus message (tag 0x04)
-/// Format: tag(u8) + status(u8) + message_length(u32) + message(utf8)
+/// Format: tag(u8) + status(u8) + message_length(u16) + message(utf8)
 fn build_sim_status(status: SimStatus, message: &str) -> Vec<u8> {
     let mut buf = Vec::new();
 
     // Tag
     buf.push(TAG_SIM_STATUS);
 
-    // Status byte
+    // Status byte (matches frontend: 0=Running, 1=Paused, 2=Finished, 3=Error)
     let status_byte = match status {
-        SimStatus::Created => 0u8,
-        SimStatus::Running => 1u8,
-        SimStatus::Paused => 2u8,
-        SimStatus::Stopped => 3u8,
+        SimStatus::Running | SimStatus::Created => 0u8,
+        SimStatus::Paused => 1u8,
+        SimStatus::Stopped => 2u8,
     };
     buf.push(status_byte);
 
-    // Message length and content
+    // Message length (u16) and content
     let msg_bytes = message.as_bytes();
-    buf.extend_from_slice(&(msg_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(msg_bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(msg_bytes);
 
     buf

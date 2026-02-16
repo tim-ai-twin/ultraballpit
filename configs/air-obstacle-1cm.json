@@ -1,7 +1,7 @@
 {
   "name": "Air in 1cm Box with Sphere Obstacle",
   "fluid_type": "Air",
-  "geometry_file": "sphere-1cm.stl",
+  "geometry_file": "../geometries/sphere-1cm.stl",
   "domain": {
     "min": [-0.005, -0.005, -0.005],
     "max": [0.005, 0.005, 0.005]

@@ -46,7 +46,7 @@ async fn main() {
     // Set up paths
     let configs_dir = PathBuf::from("configs");
     let geometries_dir = PathBuf::from("geometries");
-    let frontend_dist = PathBuf::from("../frontend/dist");
+    let frontend_dist = PathBuf::from("frontend/dist");
 
     // Create configs directory if it doesn't exist
     if !configs_dir.exists() {
@@ -73,7 +73,6 @@ async fn main() {
 
     // Build main application router
     let app = Router::new()
-        .route("/", get(root_handler))
         .route("/health", get(health_handler))
         .nest("/api", api_router)
         .route("/ws/simulation/:id", get(ws::ws_simulation_handler))
@@ -98,10 +97,6 @@ async fn main() {
     tracing::info!("Server listening on {}", listener.local_addr().unwrap());
 
     axum::serve(listener, app).await.unwrap();
-}
-
-async fn root_handler() -> &'static str {
-    "SPH Fluid Simulation Server"
 }
 
 async fn health_handler() -> &'static str {

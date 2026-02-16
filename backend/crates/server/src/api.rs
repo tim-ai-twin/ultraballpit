@@ -194,8 +194,9 @@ pub async fn create_simulation(
     // Create simulation ID
     let sim_id = uuid::Uuid::new_v4().to_string();
 
-    // Create simulation runner
-    let runner = crate::runner::SimulationRunner::new(config)
+    // Create simulation runner (resolve geometry paths relative to config directory)
+    let config_dir = config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let runner = crate::runner::SimulationRunner::new(config, config_dir)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create simulation: {}", e)))?;
 
     let particle_count = runner.particle_count();

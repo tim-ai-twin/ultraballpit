@@ -1,7 +1,7 @@
 {
   "name": "Water in 1cm Closed Box",
   "fluid_type": "Water",
-  "geometry_file": "box-1cm.stl",
+  "geometry_file": "../geometries/box-1cm.stl",
   "domain": {
     "min": [0.0, 0.0, 0.0],
     "max": [0.01, 0.01, 0.01]

@@ -10,8 +10,8 @@ import { CMD_PAUSE, CMD_RESUME, STATUS_RUNNING, STATUS_PAUSED } from './types/pr
 
 console.log('SPH Fluid Simulation Viewer initializing...');
 
-// API base URL
-const API_BASE = 'http://localhost:3000';
+// API base URL (empty for relative URLs - works with Vite proxy and production)
+const API_BASE = '';
 
 // Application state
 let currentSimulationId: string | null = null;
@@ -77,7 +77,10 @@ simControls.onStart(async (configName) => {
 
     const data = await response.json();
     currentSimulationId = data.simulation_id;
-    const wsUrl = data.ws_url;
+
+    // Build WebSocket URL from current location (works with Vite proxy and production)
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${wsProtocol}//${window.location.host}/ws/simulation/${data.simulation_id}`;
 
     console.log('Simulation created:', data);
 

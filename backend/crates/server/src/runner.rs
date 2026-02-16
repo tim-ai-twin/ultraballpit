@@ -22,14 +22,23 @@ pub struct SimulationRunner {
     dt: f32,
     /// Subsample count (~5% of particles)
     subsample_count: usize,
+    /// Domain minimum bounds
+    domain_min: [f32; 3],
+    /// Domain maximum bounds
+    domain_max: [f32; 3],
+    /// Fluid type (0=Water, 1=Air, 2=Mixed)
+    fluid_type: u8,
 }
 
 impl SimulationRunner {
     /// Create a new simulation runner from configuration
-    pub fn new(config: SimulationConfig) -> Result<Self, String> {
-        // Load geometry
-        let geometry_path = std::path::Path::new(&config.geometry_file);
-        let mesh = geometry::load_stl(geometry_path.to_str().unwrap())?;
+    ///
+    /// `config_dir` is the directory containing the config file, used to resolve
+    /// relative geometry file paths.
+    pub fn new(config: SimulationConfig, config_dir: &std::path::Path) -> Result<Self, String> {
+        // Resolve geometry path relative to config directory
+        let geometry_path = config_dir.join(&config.geometry_file);
+        let mesh = geometry::load_stl(geometry_path.to_str().ok_or("Invalid geometry path")?)?;
         let sdf = geometry::mesh_to_sdf(&mesh, &config.domain, 0.5 * config.particle_spacing);
 
         // Initialize domain (fluid and boundary particles)
@@ -63,6 +72,12 @@ impl SimulationRunner {
         // Calculate timestep (CFL condition)
         let dt = config.cfl_number * h / config.speed_of_sound;
 
+        let fluid_type = match config.fluid_type {
+            orchestrator::config::ConfigFluidType::Water => 0,
+            orchestrator::config::ConfigFluidType::Air => 1,
+            orchestrator::config::ConfigFluidType::Mixed => 2,
+        };
+
         Ok(Self {
             kernel: Arc::new(Mutex::new(kernel)),
             status: Arc::new(Mutex::new(SimStatus::Created)),
@@ -70,6 +85,9 @@ impl SimulationRunner {
             sim_time: Arc::new(Mutex::new(0.0)),
             dt,
             subsample_count,
+            domain_min: config.domain.min,
+            domain_max: config.domain.max,
+            fluid_type,
         })
     }
 
@@ -146,5 +164,20 @@ impl SimulationRunner {
     /// Get timestep duration
     pub fn dt(&self) -> f32 {
         self.dt
+    }
+
+    /// Get domain minimum bounds
+    pub fn domain_min(&self) -> [f32; 3] {
+        self.domain_min
+    }
+
+    /// Get domain maximum bounds
+    pub fn domain_max(&self) -> [f32; 3] {
+        self.domain_max
+    }
+
+    /// Get fluid type (0=Water, 1=Air, 2=Mixed)
+    pub fn fluid_type(&self) -> u8 {
+        self.fluid_type
     }
 }
