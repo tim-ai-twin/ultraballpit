@@ -5,9 +5,19 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+gpu = ["wgpu", "pollster"]
+
 [dependencies]
 nalgebra = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 bytemuck = { version = "1", features = ["derive"] }
+wgpu = { version = "24", optional = true }
+pollster = { version = "0.4", optional = true }
+
+[[bench]]
+name = "gpu_throughput"
+harness = false

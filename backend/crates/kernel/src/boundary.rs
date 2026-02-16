@@ -16,6 +16,7 @@ use crate::sph::wendland_c2;
 ///
 /// Boundary particles have fixed positions and outward normals. Their pressure
 /// is updated each timestep by mirroring from the nearest fluid particles.
+#[derive(Clone)]
 pub struct BoundaryParticles {
     /// X positions (meters)
     pub x: Vec<f32>,

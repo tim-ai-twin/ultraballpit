@@ -12,6 +12,9 @@ mod tests;
 #[cfg(test)]
 mod benchmarks;
 
+#[cfg(all(test, feature = "gpu"))]
+mod gpu_tests;
+
 pub mod analytical;
 
 use kernel::{CpuKernel, ErrorMetrics, FluidType, ParticleArrays, SimulationKernel};

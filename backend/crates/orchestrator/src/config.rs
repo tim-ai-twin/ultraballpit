@@ -3,6 +3,24 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 
+/// Compute backend selection for the simulation kernel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendType {
+    /// CPU-only reference implementation
+    Cpu,
+    /// GPU-accelerated via wgpu/Metal
+    Gpu,
+    /// Automatically select GPU if available, fall back to CPU
+    Auto,
+}
+
+impl Default for BackendType {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
 /// Main simulation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulationConfig {
@@ -38,6 +56,9 @@ pub struct SimulationConfig {
     /// CFL condition for adaptive timestep
     #[serde(default = "default_cfl")]
     pub cfl_number: f32,
+    /// Compute backend: "cpu", "gpu", or "auto" (default: "auto")
+    #[serde(default)]
+    pub backend: BackendType,
 }
 
 /// Fluid type configuration
@@ -273,6 +294,7 @@ mod tests {
             max_timesteps: None,
             max_time: None,
             cfl_number: default_cfl(),
+            backend: BackendType::default(),
         };
 
         assert!((config.smoothing_length() - 0.013).abs() < 1e-6);
@@ -297,6 +319,7 @@ mod tests {
             max_timesteps: None,
             max_time: None,
             cfl_number: default_cfl(),
+            backend: BackendType::default(),
         };
 
         assert!(config.validate().is_err());
@@ -325,6 +348,7 @@ mod tests {
             max_timesteps: None,
             max_time: None,
             cfl_number: default_cfl(),
+            backend: BackendType::default(),
         };
 
         assert!(config.validate().is_err());

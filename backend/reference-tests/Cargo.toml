@@ -5,6 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+gpu = ["kernel/gpu", "orchestrator/gpu"]
+
 [[bin]]
 name = "reference-tests"
 path = "src/main.rs"

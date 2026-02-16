@@ -18,11 +18,18 @@ pub mod neighbor;
 pub mod particle;
 pub mod sph;
 
+#[cfg(feature = "gpu")]
+#[allow(missing_docs)]
+pub mod gpu;
+
 pub use boundary::BoundaryParticles;
 pub use eos::{ideal_gas_eos, tait_eos};
 pub use neighbor::NeighborGrid;
 pub use particle::{FluidType, ParticleArrays};
 pub use sph::{wendland_c2, wendland_c2_gradient};
+
+#[cfg(feature = "gpu")]
+pub use gpu::GpuKernel;
 
 // ---------------------------------------------------------------------------
 // SimulationKernel trait

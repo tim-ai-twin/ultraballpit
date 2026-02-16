@@ -895,6 +895,7 @@ mod tests {
             max_timesteps: None,
             max_time: None,
             cfl_number: 0.4,
+            backend: crate::config::BackendType::default(),
         };
 
         // Create empty SDF (no geometry)
@@ -937,6 +938,7 @@ mod tests {
             max_timesteps: None,
             max_time: None,
             cfl_number: 0.4,
+            backend: crate::config::BackendType::default(),
         };
 
         let sdf = GridSDF {

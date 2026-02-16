@@ -5,6 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+gpu = ["kernel/gpu"]
+
 [dependencies]
 kernel = { path = "../kernel" }
 nalgebra = { workspace = true }

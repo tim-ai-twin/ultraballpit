@@ -19,7 +19,7 @@ pub mod distributed;
 pub use config::SimulationConfig;
 pub use runner::SimulationRunner;
 
-use kernel::{BoundaryParticles, CpuKernel};
+use kernel::{BoundaryParticles, CpuKernel, SimulationKernel};
 use std::path::Path;
 
 /// Create a complete simulation from a configuration file
@@ -99,10 +99,10 @@ pub fn create_simulation(config_path: &str) -> Result<SimulationRunner, Box<dyn 
         boundary_particles.push(bp.x, bp.y, bp.z, bp.mass, bp.nx, bp.ny, bp.nz);
     }
 
-    // 6. Create CPU kernel
-    tracing::info!("Creating CPU simulation kernel...");
+    // 6. Create kernel based on backend config
     let h = config.smoothing_length();
-    let kernel = CpuKernel::new(
+    let kernel: Box<dyn SimulationKernel + Send> = create_kernel(
+        &config.backend,
         fluid_particles,
         boundary_particles,
         h,
@@ -117,7 +117,7 @@ pub fn create_simulation(config_path: &str) -> Result<SimulationRunner, Box<dyn 
     // 7. Wrap in SimulationRunner
     tracing::info!("Creating simulation runner...");
     let runner = SimulationRunner::new(
-        Box::new(kernel),
+        kernel,
         h,
         config.speed_of_sound,
         config.cfl_number,
@@ -127,6 +127,135 @@ pub fn create_simulation(config_path: &str) -> Result<SimulationRunner, Box<dyn 
 
     tracing::info!("Simulation ready to start");
     Ok(runner)
+}
+
+// ===========================================================================
+// T102: Backend selection helper
+// ===========================================================================
+
+/// Create a simulation kernel based on the backend configuration.
+///
+/// For `Auto`, attempts GPU first and falls back to CPU if unavailable.
+/// For `Gpu`, returns a GPU kernel or panics if GPU is unavailable.
+/// For `Cpu`, always returns a CPU kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn create_kernel(
+    backend: &config::BackendType,
+    particles: kernel::ParticleArrays,
+    boundary: BoundaryParticles,
+    h: f32,
+    gravity: [f32; 3],
+    speed_of_sound: f32,
+    cfl_number: f32,
+    viscosity: f32,
+    domain_min: [f32; 3],
+    domain_max: [f32; 3],
+) -> Box<dyn kernel::SimulationKernel + Send> {
+    match backend {
+        config::BackendType::Cpu => {
+            tracing::info!("Creating CPU simulation kernel...");
+            Box::new(CpuKernel::new(
+                particles,
+                boundary,
+                h,
+                gravity,
+                speed_of_sound,
+                cfl_number,
+                viscosity,
+                domain_min,
+                domain_max,
+            ))
+        }
+        #[cfg(feature = "gpu")]
+        config::BackendType::Gpu => {
+            tracing::info!("Creating GPU simulation kernel...");
+            match kernel::GpuKernel::new(
+                particles,
+                boundary,
+                h,
+                gravity,
+                speed_of_sound,
+                cfl_number,
+                viscosity,
+                domain_min,
+                domain_max,
+            ) {
+                Ok(gpu) => Box::new(gpu),
+                Err(e) => {
+                    panic!("GPU backend requested but initialization failed: {e}");
+                }
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        config::BackendType::Gpu => {
+            panic!("GPU backend requested but 'gpu' feature is not enabled. Compile with --features gpu");
+        }
+        #[cfg(feature = "gpu")]
+        config::BackendType::Auto => {
+            tracing::info!("Auto-detecting backend...");
+            if kernel::gpu::gpu_available() {
+                tracing::info!("GPU available, creating GPU kernel...");
+                // Clone particles/boundary in case GPU init fails and we need CPU fallback
+                let particles_backup = particles.clone();
+                let boundary_backup = boundary.clone();
+                match kernel::GpuKernel::new(
+                    particles,
+                    boundary,
+                    h,
+                    gravity,
+                    speed_of_sound,
+                    cfl_number,
+                    viscosity,
+                    domain_min,
+                    domain_max,
+                ) {
+                    Ok(gpu) => Box::new(gpu),
+                    Err(e) => {
+                        tracing::warn!("GPU init failed ({e}), falling back to CPU");
+                        Box::new(CpuKernel::new(
+                            particles_backup,
+                            boundary_backup,
+                            h,
+                            gravity,
+                            speed_of_sound,
+                            cfl_number,
+                            viscosity,
+                            domain_min,
+                            domain_max,
+                        ))
+                    }
+                }
+            } else {
+                tracing::info!("No GPU available, using CPU kernel");
+                Box::new(CpuKernel::new(
+                    particles,
+                    boundary,
+                    h,
+                    gravity,
+                    speed_of_sound,
+                    cfl_number,
+                    viscosity,
+                    domain_min,
+                    domain_max,
+                ))
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        config::BackendType::Auto => {
+            tracing::info!("GPU feature not enabled, using CPU kernel");
+            Box::new(CpuKernel::new(
+                particles,
+                boundary,
+                h,
+                gravity,
+                speed_of_sound,
+                cfl_number,
+                viscosity,
+                domain_min,
+                domain_max,
+            ))
+        }
+    }
 }
 
 // ===========================================================================
