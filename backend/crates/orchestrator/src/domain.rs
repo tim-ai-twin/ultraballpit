@@ -47,11 +47,18 @@ pub fn setup_domain(
         air_mass,
     );
 
-    // Generate boundary particles on domain walls
+    // Generate boundary particles on domain walls.
+    // Boundary mass must match the fluid rest density for correct SPH density estimation.
+    let boundary_mass = match config.fluid_type {
+        ConfigFluidType::Water => water_mass,
+        ConfigFluidType::Air => air_mass,
+        // For mixed: use water mass for boundary (dominates density near walls)
+        ConfigFluidType::Mixed => water_mass,
+    };
     generate_wall_boundary_particles(
         &mut boundary_particles,
         config,
-        water_mass,
+        boundary_mass,
     );
 
     // Generate boundary particles on geometry surfaces
@@ -59,7 +66,7 @@ pub fn setup_domain(
         &mut boundary_particles,
         config,
         sdf,
-        water_mass,
+        boundary_mass,
     );
 
     tracing::info!(
@@ -160,7 +167,18 @@ fn generate_wall_boundary_particles(
     // Number of boundary particle layers per wall (Adami et al. 2012 needs >= 3)
     let n_layers: usize = 3;
 
-    // X-min face (yz plane), outward normal = (-1, 0, 0), inward = (+1, 0, 0)
+    // Boundary layers are offset by (layer + 0.5) * spacing outward from the
+    // domain face.  This mirrors the fluid particle grid across the wall:
+    //   fluid at  domain_min + 0.5 * spacing
+    //   layer 0   domain_min - 0.5 * spacing
+    //   layer 1   domain_min - 1.5 * spacing
+    //   layer 2   domain_min - 2.5 * spacing
+    //
+    // Without the 0.5-offset, layer 0 sits AT the domain edge, only 0.5 spacing
+    // from the first fluid layer (vs 1.0 between fluid layers), inflating SPH
+    // density by ~25% near walls and producing wildly wrong pressures.
+
+    // X-min face (yz plane), inward normal = (+1, 0, 0)
     if matches!(config.boundary_conditions.x_min,
         BoundaryType::Simple(SimpleBoundary::Wall))
     {
@@ -174,11 +192,11 @@ fn generate_wall_boundary_particles(
                     let z = domain_min[2] + (k as f32 + 0.5) * spacing;
 
                     boundary_particles.push(BoundaryParticleData {
-                        x: domain_min[0] - layer as f32 * spacing,
+                        x: domain_min[0] - (layer as f32 + 0.5) * spacing,
                         y,
                         z,
                         mass,
-                        nx: 1.0, // Outward normal (pointing into domain)
+                        nx: 1.0,
                         ny: 0.0,
                         nz: 0.0,
                     });
@@ -187,7 +205,7 @@ fn generate_wall_boundary_particles(
         }
     }
 
-    // X-max face, outward normal = (+1, 0, 0), layers go outward (+x)
+    // X-max face, inward normal = (-1, 0, 0)
     if matches!(config.boundary_conditions.x_max,
         BoundaryType::Simple(SimpleBoundary::Wall))
     {
@@ -201,11 +219,11 @@ fn generate_wall_boundary_particles(
                     let z = domain_min[2] + (k as f32 + 0.5) * spacing;
 
                     boundary_particles.push(BoundaryParticleData {
-                        x: domain_max[0] + layer as f32 * spacing,
+                        x: domain_max[0] + (layer as f32 + 0.5) * spacing,
                         y,
                         z,
                         mass,
-                        nx: -1.0, // Outward normal
+                        nx: -1.0,
                         ny: 0.0,
                         nz: 0.0,
                     });
@@ -214,7 +232,7 @@ fn generate_wall_boundary_particles(
         }
     }
 
-    // Y-min face (xz plane), outward normal = (0, -1, 0), layers go outward (-y)
+    // Y-min face (xz plane), inward normal = (0, +1, 0)
     if matches!(config.boundary_conditions.y_min,
         BoundaryType::Simple(SimpleBoundary::Wall))
     {
@@ -229,11 +247,11 @@ fn generate_wall_boundary_particles(
 
                     boundary_particles.push(BoundaryParticleData {
                         x,
-                        y: domain_min[1] - layer as f32 * spacing,
+                        y: domain_min[1] - (layer as f32 + 0.5) * spacing,
                         z,
                         mass,
                         nx: 0.0,
-                        ny: 1.0, // Outward normal (pointing into domain)
+                        ny: 1.0,
                         nz: 0.0,
                     });
                 }
@@ -241,7 +259,7 @@ fn generate_wall_boundary_particles(
         }
     }
 
-    // Y-max face, outward normal = (0, +1, 0), layers go outward (+y)
+    // Y-max face, inward normal = (0, -1, 0)
     if matches!(config.boundary_conditions.y_max,
         BoundaryType::Simple(SimpleBoundary::Wall))
     {
@@ -256,11 +274,11 @@ fn generate_wall_boundary_particles(
 
                     boundary_particles.push(BoundaryParticleData {
                         x,
-                        y: domain_max[1] + layer as f32 * spacing,
+                        y: domain_max[1] + (layer as f32 + 0.5) * spacing,
                         z,
                         mass,
                         nx: 0.0,
-                        ny: -1.0, // Outward normal
+                        ny: -1.0,
                         nz: 0.0,
                     });
                 }
@@ -268,7 +286,7 @@ fn generate_wall_boundary_particles(
         }
     }
 
-    // Z-min face (xy plane), outward normal = (0, 0, -1), layers go outward (-z)
+    // Z-min face (xy plane), inward normal = (0, 0, +1)
     if matches!(config.boundary_conditions.z_min,
         BoundaryType::Simple(SimpleBoundary::Wall))
     {
@@ -284,18 +302,18 @@ fn generate_wall_boundary_particles(
                     boundary_particles.push(BoundaryParticleData {
                         x,
                         y,
-                        z: domain_min[2] - layer as f32 * spacing,
+                        z: domain_min[2] - (layer as f32 + 0.5) * spacing,
                         mass,
                         nx: 0.0,
                         ny: 0.0,
-                        nz: 1.0, // Outward normal (pointing into domain)
+                        nz: 1.0,
                     });
                 }
             }
         }
     }
 
-    // Z-max face, outward normal = (0, 0, +1), layers go outward (+z)
+    // Z-max face, inward normal = (0, 0, -1)
     if matches!(config.boundary_conditions.z_max,
         BoundaryType::Simple(SimpleBoundary::Wall))
     {
@@ -311,11 +329,11 @@ fn generate_wall_boundary_particles(
                     boundary_particles.push(BoundaryParticleData {
                         x,
                         y,
-                        z: domain_max[2] + layer as f32 * spacing,
+                        z: domain_max[2] + (layer as f32 + 0.5) * spacing,
                         mass,
                         nx: 0.0,
                         ny: 0.0,
-                        nz: -1.0, // Outward normal
+                        nz: -1.0,
                     });
                 }
             }
@@ -358,8 +376,9 @@ fn generate_geometry_boundary_particles(
                     let normal = sdf.gradient([x, y, z]);
 
                     for layer in 0..n_layers {
-                        // Offset each layer along the inward normal (opposite to gradient)
-                        let offset = layer as f32 * spacing;
+                        // Offset each layer by (layer + 0.5) * spacing along the
+                        // inward normal, mirroring the fluid grid across the surface.
+                        let offset = (layer as f32 + 0.5) * spacing;
                         boundary_particles.push(BoundaryParticleData {
                             x: x - normal[0] * offset,
                             y: y - normal[1] * offset,

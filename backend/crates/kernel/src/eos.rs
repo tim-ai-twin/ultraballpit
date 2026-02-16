@@ -12,6 +12,12 @@ pub const AIR_REST_DENSITY: f32 = 1.204;
 /// Tait equation exponent (gamma) for water -- standard WCSPH value.
 pub const WATER_GAMMA: f32 = 7.0;
 
+/// Tait equation exponent (gamma) for air -- adiabatic index for diatomic gas.
+/// Using the physical adiabatic index keeps the weakly compressible EOS
+/// consistent with gas dynamics while still producing gauge pressure (zero
+/// at rest density) as required by WCSPH.
+pub const AIR_GAMMA: f32 = 1.4;
+
 /// Specific gas constant for dry air, R_specific (J/(kg K)).
 pub const AIR_R_SPECIFIC: f32 = 287.058;
 

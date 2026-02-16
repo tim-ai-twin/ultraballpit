@@ -9,7 +9,7 @@
 
 use std::f32::consts::PI;
 
-use crate::eos::{self, WATER_GAMMA, WATER_REST_DENSITY};
+use crate::eos::{self, AIR_GAMMA, AIR_REST_DENSITY, WATER_GAMMA, WATER_REST_DENSITY};
 use crate::neighbor::NeighborGrid;
 use crate::particle::{FluidType, ParticleArrays};
 
@@ -153,8 +153,13 @@ pub fn compute_density(
 
 /// Compute pressure from density using the appropriate equation of state.
 ///
-/// Water uses the Tait EOS; air uses the ideal gas EOS. Negative pressure
-/// (tension) is permitted for water to maintain cohesion of the fluid.
+/// Both water and air use the Tait (weakly compressible) EOS, which produces
+/// gauge pressure (zero at rest density). This is essential for WCSPH stability:
+/// the ideal gas EOS returns absolute pressure (~101 kPa) whose small SPH
+/// discretization noise gets amplified into catastrophic forces.
+///
+/// Water: gamma=7, rho0=1000 kg/m^3
+/// Air:   gamma=1.4, rho0=1.204 kg/m^3
 pub fn compute_pressure(particles: &mut ParticleArrays, speed_of_sound: f32) {
     for i in 0..particles.len() {
         particles.pressure[i] = match particles.fluid_type[i] {
@@ -164,9 +169,12 @@ pub fn compute_pressure(particles: &mut ParticleArrays, speed_of_sound: f32) {
                 speed_of_sound,
                 WATER_GAMMA,
             ),
-            FluidType::Air => {
-                eos::ideal_gas_eos(particles.density[i], particles.temperature[i])
-            }
+            FluidType::Air => eos::tait_eos(
+                particles.density[i],
+                AIR_REST_DENSITY,
+                speed_of_sound,
+                AIR_GAMMA,
+            ),
         };
     }
 }
@@ -240,6 +248,14 @@ pub fn compute_pressure_forces(
         let pi_clamped = particles.pressure[i].max(0.0);
         let pi_clamped_over_rho2 = pi_clamped / (particles.density[i] * particles.density[i]);
 
+        // Use the rest density matching this fluid particle's type for the
+        // boundary density denominator. This ensures correct force scaling
+        // for both water (rho0=1000) and air (rho0=1.204) particles.
+        let boundary_rho = match particles.fluid_type[i] {
+            FluidType::Water => WATER_REST_DENSITY,
+            FluidType::Air => AIR_REST_DENSITY,
+        };
+
         for b in 0..boundary_x.len() {
             let dx = px - boundary_x[b];
             let dy = py - boundary_y[b];
@@ -248,8 +264,6 @@ pub fn compute_pressure_forces(
             if r < support_radius {
                 let (gx, gy, gz) = wendland_c2_gradient(dx, dy, dz, r, h);
 
-                // Use boundary density = rest density (1000 kg/m3) for the denominator
-                let boundary_rho = WATER_REST_DENSITY;
                 let pb_over_rho2_b =
                     boundary_pressure[b] / (boundary_rho * boundary_rho);
                 let factor =
