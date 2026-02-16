@@ -39,7 +39,9 @@ pub struct CreateSimulationResponse {
 /// Configuration file metadata
 #[derive(Debug, Serialize)]
 pub struct ConfigInfo {
-    /// Configuration name
+    /// Configuration ID (filename stem, e.g., "water-box-1cm")
+    pub id: String,
+    /// Configuration display name
     pub name: String,
     /// File path
     pub path: String,
@@ -133,7 +135,13 @@ pub async fn list_configs(
                     orchestrator::config::ConfigFluidType::Mixed => "Mixed",
                 };
 
+                let id = path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
                 configs.push(ConfigInfo {
+                    id,
                     name: config.name.clone(),
                     path: path.to_string_lossy().to_string(),
                     fluid_type: fluid_type.to_string(),

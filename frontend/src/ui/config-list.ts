@@ -1,6 +1,7 @@
 // T037: Config selector UI component
 
 interface Config {
+  id: string;
   name: string;
   path: string;
   fluid_type: string;
@@ -76,9 +77,9 @@ export class ConfigList {
 
     // Attach event listeners
     this.configs.forEach((config) => {
-      const button = document.getElementById(`config-${config.name}`);
+      const button = document.getElementById(`config-${config.id}`);
       if (button) {
-        button.addEventListener('click', () => this.handleSelect(config.name));
+        button.addEventListener('click', () => this.handleSelect(config.id));
       }
     });
   }
@@ -89,10 +90,10 @@ export class ConfigList {
   private renderConfigItems(): string {
     return this.configs
       .map((config) => {
-        const isSelected = this.selectedConfig === config.name;
+        const isSelected = this.selectedConfig === config.id;
         return `
           <button
-            id="config-${config.name}"
+            id="config-${config.id}"
             style="
               display: block;
               width: 100%;
