@@ -45,7 +45,9 @@ struct SimParams {
 @group(0) @binding(1) var<storage, read> pos_x: array<f32>;
 @group(0) @binding(2) var<storage, read> pos_y: array<f32>;
 @group(0) @binding(3) var<storage, read> pos_z: array<f32>;
-@group(0) @binding(4) var<storage, read> mass: array<f32>;
+// Mass stored as f16 pairs packed in u32: two f16 values per u32.
+// Read with read_mass() helper.
+@group(0) @binding(4) var<storage, read> mass_packed: array<u32>;
 
 // Group 2: SPH state + boundary
 @group(2) @binding(0) var<storage, read_write> density: array<f32>;
@@ -55,11 +57,19 @@ struct SimParams {
 @group(2) @binding(4) var<storage, read> bnd_y: array<f32>;
 @group(2) @binding(5) var<storage, read> bnd_z: array<f32>;
 @group(2) @binding(6) var<storage, read> bnd_mass: array<f32>;
+@group(2) @binding(7) var<storage, read> bnd_cell_counts: array<u32>;
+@group(2) @binding(8) var<storage, read> bnd_cell_offsets: array<u32>;
+@group(2) @binding(9) var<storage, read> bnd_sorted_indices: array<u32>;
 
 // Group 3: Grid data (read-only for density)
 @group(3) @binding(2) var<storage, read> cell_offsets: array<u32>;
 @group(3) @binding(1) var<storage, read> cell_counts: array<u32>;
 @group(3) @binding(3) var<storage, read> sorted_indices: array<u32>;
+
+fn read_mass(idx: u32) -> f32 {
+    let pair = unpack2x16float(mass_packed[idx >> 1u]);
+    return pair[idx & 1u];
+}
 
 fn wendland_c2(r: f32, h: f32) -> f32 {
     let q = r / h;
@@ -111,7 +121,7 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pz = pos_z[i];
 
     // Self-contribution
-    var rho = mass[i] * wendland_c2(0.0, h);
+    var rho = read_mass(i) * wendland_c2(0.0, h);
 
     // Fluid neighbor contributions via neighbor grid
     let cell = pos_to_cell_i32(px, py, pz);
@@ -141,23 +151,43 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
 
                     if dist_sq <= support_radius_sq {
                         let r = sqrt(dist_sq);
-                        rho = rho + mass[j] * wendland_c2(r, h);
+                        rho = rho + read_mass(j) * wendland_c2(r, h);
                     }
                 }
             }
         }
     }
 
-    // Boundary particle contributions
-    for (var b = 0u; b < params.n_boundary; b = b + 1u) {
-        let ddx = px - bnd_x[b];
-        let ddy = py - bnd_y[b];
-        let ddz = pz - bnd_z[b];
-        let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
+    // Boundary particle contributions (grid-accelerated)
+    if params.n_boundary > 0u {
+        for (var bz_off = -1; bz_off <= 1; bz_off = bz_off + 1) {
+            let bnz = cell.z + bz_off;
+            if bnz < 0 || bnz >= i32(params.grid_dim_z) { continue; }
+            for (var by_off = -1; by_off <= 1; by_off = by_off + 1) {
+                let bny = cell.y + by_off;
+                if bny < 0 || bny >= i32(params.grid_dim_y) { continue; }
+                for (var bx_off = -1; bx_off <= 1; bx_off = bx_off + 1) {
+                    let bnx = cell.x + bx_off;
+                    if bnx < 0 || bnx >= i32(params.grid_dim_x) { continue; }
 
-        if dist_sq < support_radius_sq {
-            let r = sqrt(dist_sq);
-            rho = rho + bnd_mass[b] * wendland_c2(r, h);
+                    let bc = cell_hash(u32(bnx), u32(bny), u32(bnz));
+                    let b_start = bnd_cell_offsets[bc];
+                    let b_count = bnd_cell_counts[bc];
+
+                    for (var bs = b_start; bs < b_start + b_count; bs = bs + 1u) {
+                        let b = bnd_sorted_indices[bs];
+                        let ddx = px - bnd_x[b];
+                        let ddy = py - bnd_y[b];
+                        let ddz = pz - bnd_z[b];
+                        let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
+
+                        if dist_sq < support_radius_sq {
+                            let r = sqrt(dist_sq);
+                            rho = rho + bnd_mass[b] * wendland_c2(r, h);
+                        }
+                    }
+                }
+            }
         }
     }
 

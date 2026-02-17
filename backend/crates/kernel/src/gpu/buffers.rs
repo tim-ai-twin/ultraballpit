@@ -66,12 +66,21 @@ pub struct GpuBuffers {
     pub bnd_mass: wgpu::Buffer,
     pub bnd_pressure: wgpu::Buffer,
 
-    // Neighbor grid buffers
+    // Neighbor grid buffers (fluid particles, rebuilt every step)
     pub cell_indices: wgpu::Buffer,
     pub cell_counts: wgpu::Buffer,
     pub cell_offsets: wgpu::Buffer,
     pub sorted_indices: wgpu::Buffer,
     pub write_heads: wgpu::Buffer,
+
+    // Boundary particle grid (built once at init, boundary particles are static)
+    pub bnd_cell_counts: wgpu::Buffer,
+    pub bnd_cell_offsets: wgpu::Buffer,
+    pub bnd_sorted_indices: wgpu::Buffer,
+
+    // Original f32 mass data (mass never changes during simulation, so we
+    // store it CPU-side and skip GPU readback).
+    pub mass_f32: Vec<f32>,
 
     // Staging buffers for readback
     pub staging_density: wgpu::Buffer,
@@ -82,7 +91,6 @@ pub struct GpuBuffers {
     pub staging_vel_y: wgpu::Buffer,
     pub staging_vel_z: wgpu::Buffer,
     pub staging_pressure: wgpu::Buffer,
-    pub staging_mass: wgpu::Buffer,
     pub staging_fluid_type: wgpu::Buffer,
     pub staging_acc_x: wgpu::Buffer,
     pub staging_acc_y: wgpu::Buffer,
@@ -98,6 +106,51 @@ pub struct GpuBuffers {
 
 /// Minimum buffer size (wgpu requires non-zero buffers).
 const MIN_BUF_SIZE: u64 = 4;
+
+/// Convert f32 to IEEE 754 half-precision (f16) bits.
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = (bits >> 31) & 1;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let frac = bits & 0x7F_FFFF;
+
+    if exp == 0xFF {
+        // Inf/NaN
+        return ((sign << 15) | 0x7C00 | if frac != 0 { 1 } else { 0 }) as u16;
+    }
+
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 31 {
+        return ((sign << 15) | 0x7C00) as u16; // overflow → Inf
+    }
+    if new_exp <= 0 {
+        if new_exp < -10 {
+            return (sign << 15) as u16; // underflow → zero
+        }
+        let frac_with_implicit = frac | 0x80_0000;
+        let shift = 1 - new_exp;
+        return ((sign << 15) | (frac_with_implicit >> (13 + shift))) as u16;
+    }
+
+    ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
+}
+
+/// Pack a slice of f32 mass values into u32 pairs of f16.
+/// Each u32 holds two f16 values: low bits = even index, high bits = odd index.
+fn pack_mass_f16(masses: &[f32]) -> Vec<u32> {
+    let n_packed = (masses.len() + 1) / 2;
+    let mut packed = Vec::with_capacity(n_packed);
+    for i in (0..masses.len()).step_by(2) {
+        let lo = f32_to_f16_bits(masses[i]) as u32;
+        let hi = if i + 1 < masses.len() {
+            f32_to_f16_bits(masses[i + 1]) as u32
+        } else {
+            0u32
+        };
+        packed.push(lo | (hi << 16));
+    }
+    packed
+}
 
 /// Create a storage buffer from f32 slice data. If the slice is empty, creates
 /// a minimal buffer.
@@ -179,7 +232,11 @@ impl GpuBuffers {
         let acc_z = create_storage_buf(device, "acc_z", &particles.az);
         let density = create_storage_buf(device, "density", &particles.density);
         let pressure = create_storage_buf(device, "pressure", &particles.pressure);
-        let mass = create_storage_buf(device, "mass", &particles.mass);
+        // Pack mass as f16 pairs in u32s to halve memory bandwidth.
+        // Mass is read-only during simulation, so f16 precision (~3 decimal
+        // digits) is more than sufficient.
+        let mass_packed = pack_mass_f16(&particles.mass);
+        let mass = create_storage_buf_u32(device, "mass_packed", &mass_packed);
 
         // Convert FluidType to u32
         let ft_u32: Vec<u32> = particles.fluid_type.iter().map(|ft| *ft as u32).collect();
@@ -192,7 +249,7 @@ impl GpuBuffers {
         let bnd_mass = create_storage_buf(device, "bnd_mass", &boundary.mass);
         let bnd_pressure = create_storage_buf(device, "bnd_pressure", &boundary.pressure);
 
-        // Neighbor grid buffers
+        // Neighbor grid buffers (fluid particles)
         let zeros_n = vec![0u32; n.max(1)];
         let zeros_cells = vec![0u32; total_cells.max(1)];
 
@@ -201,6 +258,16 @@ impl GpuBuffers {
         let cell_offsets = create_storage_buf_u32(device, "cell_offsets", &zeros_cells);
         let sorted_indices = create_storage_buf_u32(device, "sorted_indices", &zeros_n);
         let write_heads = create_storage_buf_u32(device, "write_heads", &zeros_cells);
+
+        // Boundary particle grid (built once, boundary particles are static)
+        let cell_size = params.cell_size;
+        let (bnd_cell_counts_data, bnd_cell_offsets_data, bnd_sorted_indices_data) =
+            build_boundary_grid(boundary, params, grid_dims, total_cells);
+        let bnd_cell_counts = create_storage_buf_u32(device, "bnd_cell_counts", &bnd_cell_counts_data);
+        let bnd_cell_offsets = create_storage_buf_u32(device, "bnd_cell_offsets", &bnd_cell_offsets_data);
+        let bnd_sorted_indices = create_storage_buf_u32(device, "bnd_sorted_indices",
+            if bnd_sorted_indices_data.is_empty() { &[0u32] } else { &bnd_sorted_indices_data });
+        let _ = cell_size; // used above via params
 
         // Staging buffers for readback
         let f32_size = std::mem::size_of::<f32>() as u64;
@@ -216,7 +283,6 @@ impl GpuBuffers {
         let staging_vel_y = create_staging_buf(device, "staging_vel_y", particle_bytes);
         let staging_vel_z = create_staging_buf(device, "staging_vel_z", particle_bytes);
         let staging_pressure = create_staging_buf(device, "staging_pressure", particle_bytes);
-        let staging_mass = create_staging_buf(device, "staging_mass", particle_bytes);
         let staging_fluid_type = create_staging_buf(device, "staging_fluid_type", particle_u32_bytes);
         let staging_acc_x = create_staging_buf(device, "staging_acc_x", particle_bytes);
         let staging_acc_y = create_staging_buf(device, "staging_acc_y", particle_bytes);
@@ -247,6 +313,10 @@ impl GpuBuffers {
             cell_offsets,
             sorted_indices,
             write_heads,
+            bnd_cell_counts,
+            bnd_cell_offsets,
+            bnd_sorted_indices,
+            mass_f32: particles.mass.clone(),
             staging_density,
             staging_pos_x,
             staging_pos_y,
@@ -255,7 +325,6 @@ impl GpuBuffers {
             staging_vel_y,
             staging_vel_z,
             staging_pressure,
-            staging_mass,
             staging_fluid_type,
             staging_acc_x,
             staging_acc_y,
@@ -290,6 +359,8 @@ impl GpuBuffers {
             label: Some("readback"),
         });
 
+        // Note: mass is not copied — it's stored as f16-packed on GPU and
+        // never changes during simulation, so we use self.mass_f32 instead.
         encoder.copy_buffer_to_buffer(&self.pos_x, 0, &self.staging_pos_x, 0, byte_len);
         encoder.copy_buffer_to_buffer(&self.pos_y, 0, &self.staging_pos_y, 0, byte_len);
         encoder.copy_buffer_to_buffer(&self.pos_z, 0, &self.staging_pos_z, 0, byte_len);
@@ -298,7 +369,6 @@ impl GpuBuffers {
         encoder.copy_buffer_to_buffer(&self.vel_z, 0, &self.staging_vel_z, 0, byte_len);
         encoder.copy_buffer_to_buffer(&self.density, 0, &self.staging_density, 0, byte_len);
         encoder.copy_buffer_to_buffer(&self.pressure, 0, &self.staging_pressure, 0, byte_len);
-        encoder.copy_buffer_to_buffer(&self.mass, 0, &self.staging_mass, 0, byte_len);
         encoder.copy_buffer_to_buffer(&self.fluid_type, 0, &self.staging_fluid_type, 0, u32_byte_len);
         encoder.copy_buffer_to_buffer(&self.acc_x, 0, &self.staging_acc_x, 0, byte_len);
         encoder.copy_buffer_to_buffer(&self.acc_y, 0, &self.staging_acc_y, 0, byte_len);
@@ -318,7 +388,6 @@ impl GpuBuffers {
         let az = read_f32_buffer(device, &self.staging_acc_z, n);
         let density_vec = read_f32_buffer(device, &self.staging_density, n);
         let pressure_vec = read_f32_buffer(device, &self.staging_pressure, n);
-        let mass_vec = read_f32_buffer(device, &self.staging_mass, n);
         let ft_u32 = read_u32_buffer(device, &self.staging_fluid_type, n);
 
         let fluid_type: Vec<crate::particle::FluidType> = ft_u32
@@ -344,7 +413,7 @@ impl GpuBuffers {
             az,
             density: density_vec,
             pressure: pressure_vec,
-            mass: mass_vec,
+            mass: self.mass_f32.clone(),
             temperature: vec![293.15; n],
             fluid_type,
         }
@@ -387,6 +456,57 @@ fn read_f32_buffer(device: &wgpu::Device, buffer: &wgpu::Buffer, count: usize) -
     drop(data);
     buffer.unmap();
     result
+}
+
+/// Build a spatial hash grid for boundary particles on the CPU.
+/// Returns (cell_counts, cell_offsets, sorted_indices).
+fn build_boundary_grid(
+    boundary: &BoundaryParticles,
+    params: &GpuSimParams,
+    grid_dims: [u32; 3],
+    total_cells: usize,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let n_bnd = boundary.len();
+    if n_bnd == 0 {
+        return (vec![0u32; total_cells.max(1)], vec![0u32; total_cells.max(1)], Vec::new());
+    }
+
+    let cell_size = params.cell_size;
+    let dmin = [params.domain_min_x, params.domain_min_y, params.domain_min_z];
+    let gdims = [grid_dims[0] as usize, grid_dims[1] as usize, grid_dims[2] as usize];
+
+    // Hash each boundary particle to its cell
+    let mut cell_for_particle = vec![0usize; n_bnd];
+    let mut counts = vec![0u32; total_cells];
+
+    for i in 0..n_bnd {
+        let cx = ((boundary.x[i] - dmin[0]) / cell_size).floor().max(0.0).min((gdims[0] - 1) as f32) as usize;
+        let cy = ((boundary.y[i] - dmin[1]) / cell_size).floor().max(0.0).min((gdims[1] - 1) as f32) as usize;
+        let cz = ((boundary.z[i] - dmin[2]) / cell_size).floor().max(0.0).min((gdims[2] - 1) as f32) as usize;
+        let cell = cx + cy * gdims[0] + cz * gdims[0] * gdims[1];
+        cell_for_particle[i] = cell;
+        counts[cell] += 1;
+    }
+
+    // Exclusive prefix sum
+    let mut offsets = vec![0u32; total_cells];
+    let mut running = 0u32;
+    for c in 0..total_cells {
+        offsets[c] = running;
+        running += counts[c];
+    }
+
+    // Scatter boundary particle indices into sorted order
+    let mut write_heads = offsets.clone();
+    let mut sorted = vec![0u32; n_bnd];
+    for i in 0..n_bnd {
+        let cell = cell_for_particle[i];
+        let pos = write_heads[cell] as usize;
+        sorted[pos] = i as u32;
+        write_heads[cell] += 1;
+    }
+
+    (counts, offsets, sorted)
 }
 
 /// Block on mapping a staging buffer and read u32 data.

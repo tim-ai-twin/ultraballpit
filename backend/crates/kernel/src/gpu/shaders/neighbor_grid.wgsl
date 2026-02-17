@@ -89,17 +89,48 @@ fn count_particles(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicAdd(&cell_counts[cell], 1u);
 }
 
-// Pass 2: Prefix sum (sequential, run with 1 workgroup of 1 thread)
-// For small grids this is fine. For large grids, a parallel prefix sum would be needed.
-@compute @workgroup_size(1)
-fn prefix_sum(@builtin(global_invocation_id) gid: vec3<u32>) {
+// Pass 2: Parallel prefix sum using 256 threads with shared memory.
+// Each thread handles a contiguous block of cells. A shared-memory scan
+// of per-block totals propagates offsets across blocks.
+// Handles up to 256 * 256 = 65536 cells in a single workgroup dispatch.
+var<workgroup> block_totals: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn prefix_sum(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x;
     let n_cells = total_cells();
-    var running = 0u;
-    for (var c = 0u; c < n_cells; c = c + 1u) {
+    let block_size = (n_cells + 255u) / 256u;
+    let start = tid * block_size;
+    let end = min(start + block_size, n_cells);
+
+    // Phase 1: each thread computes local prefix sum for its block
+    var local_sum = 0u;
+    for (var c = start; c < end; c = c + 1u) {
         let count = atomicLoad(&cell_counts[c]);
-        cell_offsets[c] = running;
-        atomicStore(&write_heads[c], running);
-        running = running + count;
+        cell_offsets[c] = local_sum;
+        local_sum = local_sum + count;
+    }
+    block_totals[tid] = local_sum;
+
+    workgroupBarrier();
+
+    // Phase 2: thread 0 scans the 256 block totals (exclusive prefix sum)
+    if tid == 0u {
+        var running = 0u;
+        for (var i = 0u; i < 256u; i = i + 1u) {
+            let old = block_totals[i];
+            block_totals[i] = running;
+            running = running + old;
+        }
+    }
+
+    workgroupBarrier();
+
+    // Phase 3: add block offset to local results and initialize write_heads
+    let offset = block_totals[tid];
+    for (var c = start; c < end; c = c + 1u) {
+        cell_offsets[c] = cell_offsets[c] + offset;
+        atomicStore(&write_heads[c], cell_offsets[c]);
     }
 }
 

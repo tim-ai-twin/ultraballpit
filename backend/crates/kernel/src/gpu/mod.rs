@@ -22,11 +22,33 @@
 
 pub mod buffers;
 
+use std::cell::{Cell, UnsafeCell};
+use std::time::Instant;
+
 use buffers::{GpuBuffers, GpuSimParams};
 use crate::boundary::BoundaryParticles;
 use crate::eos;
 use crate::particle::{FluidType, ParticleArrays};
 use crate::{ErrorMetrics, SimulationKernel};
+
+/// Per-pass wall-clock timing breakdown of a single GPU simulation step.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GpuStepProfile {
+    /// Neighbor grid build: clear + count + prefix-sum + scatter (microseconds).
+    pub grid_build_us: u64,
+    /// Density summation + EOS pressure (microseconds).
+    pub density_us: u64,
+    /// Adami boundary pressure mirroring (microseconds).
+    pub boundary_pressure_us: u64,
+    /// Force computation: pressure + viscous + gravity + repulsive (microseconds).
+    pub forces_us: u64,
+    /// Integration: half_kick + drift + half_kick (microseconds).
+    pub integrate_us: u64,
+    /// GPU-to-CPU particle data readback (microseconds).
+    pub readback_us: u64,
+    /// Total wall-clock time for the entire step (microseconds).
+    pub total_us: u64,
+}
 
 /// GPU-accelerated SPH simulation kernel using wgpu compute shaders.
 pub struct GpuKernel {
@@ -80,8 +102,8 @@ pub struct GpuKernel {
     domain_max: [f32; 3],
     grid_dims: [u32; 3],
 
-    // Cached CPU-side particle data (refreshed after each step).
-    cached_particles: ParticleArrays,
+    // Cached CPU-side particle data (refreshed lazily via interior mutability).
+    cached_particles: UnsafeCell<ParticleArrays>,
 
     // Conservation tracking
     initial_energy: f64,
@@ -89,6 +111,27 @@ pub struct GpuKernel {
 
     // First-step bootstrap flag
     needs_init: bool,
+
+    // Lazy readback: true when GPU data is newer than cached_particles.
+    // Uses Cell for interior mutability so particles() can trigger readback.
+    cache_dirty: Cell<bool>,
+
+    // Workgroup size used for compute dispatches (default 256).
+    workgroup_size: u32,
+
+    // Verlet neighbor list: skip grid rebuild when particles haven't moved far.
+    // Accumulated estimated max displacement since last grid build.
+    verlet_displacement: f32,
+    // Skin distance: rebuild when displacement exceeds skin/2.
+    // Grid uses support_radius + skin for neighbor search, so the list
+    // remains valid as long as no particle moves more than skin/2.
+    verlet_skin: f32,
+
+    // GPU timestamp query resources for precise profiling
+    timestamp_query_set: wgpu::QuerySet,
+    timestamp_resolve_buf: wgpu::Buffer,
+    timestamp_staging_buf: wgpu::Buffer,
+    timestamp_period: f32,
 }
 
 /// Error returned when GPU initialization fails.
@@ -169,7 +212,7 @@ impl GpuKernel {
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("sph_gpu_device"),
-                required_features: wgpu::Features::empty(),
+                required_features: wgpu::Features::TIMESTAMP_QUERY,
                 required_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
             },
@@ -218,10 +261,14 @@ impl GpuKernel {
         // --- Create buffers ---
         let bufs = GpuBuffers::new(&device, &particles, &boundary, grid_dims, &sim_params);
 
-        // Cache initial particles
-        let cached_particles = particles.clone();
+        // Cache initial particles (wrapped in UnsafeCell for lazy readback)
+        let cached_particles = UnsafeCell::new(particles.clone());
 
         // --- Load shaders ---
+        // Default workgroup size; can be overridden via set_workgroup_size() before use.
+        let workgroup_size = 256u32;
+        let wg_str = format!("@workgroup_size({})", workgroup_size);
+
         let grid_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("neighbor_grid"),
             source: wgpu::ShaderSource::Wgsl(
@@ -229,18 +276,18 @@ impl GpuKernel {
             ),
         });
 
+        let density_src: String = include_str!("shaders/density.wgsl")
+            .replace("@workgroup_size(256)", &wg_str);
         let density_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("density"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("shaders/density.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(density_src.into()),
         });
 
+        let forces_src: String = include_str!("shaders/forces.wgsl")
+            .replace("@workgroup_size(256)", &wg_str);
         let forces_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("forces"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("shaders/forces.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(forces_src.into()),
         });
 
         let integrate_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -292,7 +339,7 @@ impl GpuKernel {
                 bgl_storage_ro(4), // mass
             ],
         });
-        // Group 2: density(rw), pressure(rw), fluid_type(read), bnd_x/y/z(read), bnd_mass(read) -- no bnd_pressure
+        // Group 2: density(rw), pressure(rw), fluid_type(read), bnd(read), bnd_grid(read)
         let bgl_density_g2 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("density_g2_bgl"),
             entries: &[
@@ -303,6 +350,9 @@ impl GpuKernel {
                 bgl_storage_ro(4), // bnd_y
                 bgl_storage_ro(5), // bnd_z
                 bgl_storage_ro(6), // bnd_mass
+                bgl_storage_ro(7), // bnd_cell_counts
+                bgl_storage_ro(8), // bnd_cell_offsets
+                bgl_storage_ro(9), // bnd_sorted_indices
             ],
         });
         // Group 3: cell_counts(read), cell_offsets(read), sorted_indices(read) -- bindings 1,2,3
@@ -339,18 +389,21 @@ impl GpuKernel {
                 bgl_storage_rw(5), // acc_z
             ],
         });
-        // Group 2: density(read), pressure(read), fluid_type(read), bnd(read), bnd_mass(read), bnd_pressure(rw)
+        // Group 2: density(read), pressure(read), fluid_type(read), bnd(read), bnd_pressure(rw), bnd_grid(read)
         let bgl_forces_g2 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("forces_g2_bgl"),
             entries: &[
-                bgl_storage_ro(0), // density
-                bgl_storage_ro(1), // pressure
-                bgl_storage_ro(2), // fluid_type
-                bgl_storage_ro(3), // bnd_x
-                bgl_storage_ro(4), // bnd_y
-                bgl_storage_ro(5), // bnd_z
-                bgl_storage_ro(6), // bnd_mass
-                bgl_storage_rw(7), // bnd_pressure
+                bgl_storage_ro(0),  // density
+                bgl_storage_ro(1),  // pressure
+                bgl_storage_ro(2),  // fluid_type
+                bgl_storage_ro(3),  // bnd_x
+                bgl_storage_ro(4),  // bnd_y
+                bgl_storage_ro(5),  // bnd_z
+                bgl_storage_ro(6),  // bnd_mass
+                bgl_storage_rw(7),  // bnd_pressure
+                bgl_storage_ro(8),  // bnd_cell_counts
+                bgl_storage_ro(9),  // bnd_cell_offsets
+                bgl_storage_ro(10), // bnd_sorted_indices
             ],
         });
         // Group 3: same as density group 3 (cell_counts, cell_offsets, sorted_indices read)
@@ -492,6 +545,27 @@ impl GpuKernel {
             cache: None,
         });
 
+        // --- Timestamp query resources ---
+        // 16 timestamps: pairs of (begin, end) for up to 8 passes
+        let timestamp_query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 16,
+        });
+        let timestamp_resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("timestamp_resolve"),
+            size: 16 * 8, // 16 u64 timestamps
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let timestamp_staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("timestamp_staging"),
+            size: 16 * 8,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let timestamp_period = queue.get_timestamp_period();
+
         Ok(Self {
             device,
             queue,
@@ -529,148 +603,565 @@ impl GpuKernel {
             initial_energy,
             initial_mass,
             needs_init: true,
+            cache_dirty: Cell::new(false),
+            workgroup_size,
+            // Verlet skin: fraction of smoothing length. Conservative choice.
+            verlet_skin: 0.5 * h,
+            verlet_displacement: f32::MAX, // Force first rebuild
+            timestamp_query_set,
+            timestamp_resolve_buf,
+            timestamp_staging_buf,
+            timestamp_period,
         })
     }
 
-    /// Dispatch the full force computation pipeline on the GPU:
-    /// neighbor grid -> density -> boundary pressure -> forces
-    fn compute_forces_gpu(&self, params: &GpuSimParams) {
+    /// Set workgroup size for density and forces shaders and rebuild pipelines.
+    ///
+    /// Only 32, 64, 128, 256 are valid. Grid and integrate shaders stay at 256.
+    /// Must be called before any `step()` calls.
+    pub fn set_workgroup_size(&mut self, wg: u32) {
+        assert!(matches!(wg, 32 | 64 | 128 | 256), "workgroup_size must be 32, 64, 128, or 256");
+        self.workgroup_size = wg;
+
+        let wg_str = format!("@workgroup_size({})", wg);
+
+        let density_src: String = include_str!("shaders/density.wgsl")
+            .replace("@workgroup_size(256)", &wg_str);
+        let density_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("density"),
+            source: wgpu::ShaderSource::Wgsl(density_src.into()),
+        });
+
+        let forces_src: String = include_str!("shaders/forces.wgsl")
+            .replace("@workgroup_size(256)", &wg_str);
+        let forces_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("forces"),
+            source: wgpu::ShaderSource::Wgsl(forces_src.into()),
+        });
+
+        // Rebuild affected pipeline layouts
+        let pl_layout_density = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("density_pl"),
+            bind_group_layouts: &[&self.bgl_density_g0, &self.bgl_empty, &self.bgl_density_g2, &self.bgl_density_g3],
+            push_constant_ranges: &[],
+        });
+        let pl_layout_forces = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("forces_pl"),
+            bind_group_layouts: &[&self.bgl_forces_g0, &self.bgl_forces_g1, &self.bgl_forces_g2, &self.bgl_forces_g3],
+            push_constant_ranges: &[],
+        });
+
+        self.pipeline_density = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("density"),
+            layout: Some(&pl_layout_density),
+            module: &density_shader,
+            entry_point: Some("compute_density"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        self.pipeline_boundary_pressure = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("boundary_pressure"),
+            layout: Some(&pl_layout_forces),
+            module: &forces_shader,
+            entry_point: Some("update_boundary_pressures"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        self.pipeline_forces = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("forces"),
+            layout: Some(&pl_layout_forces),
+            module: &forces_shader,
+            entry_point: Some("compute_forces"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+    }
+
+    /// Encode the neighbor grid build passes into a command encoder.
+    fn encode_grid(&self, encoder: &mut wgpu::CommandEncoder) {
         let n_particles = self.bufs.n_particles;
         let total_cells = self.bufs.total_cells;
-        let n_boundary = self.bufs.n_boundary;
 
-        let wg_particles = dispatch_size(n_particles, 256);
+        let wg_grid_particles = dispatch_size(n_particles, 256);
         let wg_cells = dispatch_size(total_cells, 256);
-        let wg_boundary = dispatch_size(n_boundary.max(1), 256);
 
-        // Update params
-        self.bufs.update_params(&self.queue, params);
-
-        // Create bind groups for grid shader (groups 0 and 3)
         let grid_bg0 = self.create_grid_bg0();
         let grid_bg3 = self.create_grid_bg3();
         let empty_bg = self.create_empty_bind_group();
 
-        // Create bind groups for density shader (groups 0, 2, 3)
+        // 1. Clear
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("grid_clear"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_grid_clear);
+            pass.set_bind_group(0, &grid_bg0, &[]); pass.set_bind_group(1, &empty_bg, &[]);
+            pass.set_bind_group(2, &empty_bg, &[]); pass.set_bind_group(3, &grid_bg3, &[]);
+            pass.dispatch_workgroups(wg_cells, 1, 1);
+        }
+        // 2. Count
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("grid_count"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_grid_count);
+            pass.set_bind_group(0, &grid_bg0, &[]); pass.set_bind_group(1, &empty_bg, &[]);
+            pass.set_bind_group(2, &empty_bg, &[]); pass.set_bind_group(3, &grid_bg3, &[]);
+            pass.dispatch_workgroups(wg_grid_particles, 1, 1);
+        }
+        // 3. Prefix sum (parallel, 256 threads)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("grid_prefix"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_grid_prefix);
+            pass.set_bind_group(0, &grid_bg0, &[]); pass.set_bind_group(1, &empty_bg, &[]);
+            pass.set_bind_group(2, &empty_bg, &[]); pass.set_bind_group(3, &grid_bg3, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        // 4. Scatter
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("grid_scatter"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_grid_scatter);
+            pass.set_bind_group(0, &grid_bg0, &[]); pass.set_bind_group(1, &empty_bg, &[]);
+            pass.set_bind_group(2, &empty_bg, &[]); pass.set_bind_group(3, &grid_bg3, &[]);
+            pass.dispatch_workgroups(wg_grid_particles, 1, 1);
+        }
+    }
+
+    /// Encode density + boundary pressure + forces passes into a command encoder.
+    fn encode_density_forces(&self, encoder: &mut wgpu::CommandEncoder, params: &GpuSimParams) {
+        let n_particles = self.bufs.n_particles;
+        let n_boundary = self.bufs.n_boundary;
+        let wg = self.workgroup_size;
+
+        let wg_particles = dispatch_size(n_particles, wg);
+        let wg_boundary = dispatch_size(n_boundary.max(1), wg);
+
+        self.bufs.update_params(&self.queue, params);
+
         let density_bg0 = self.create_density_bg0();
         let density_bg2 = self.create_density_bg2();
         let density_bg3 = self.create_density_forces_bg3();
-
-        // Create bind groups for forces shader (groups 0, 1, 2, 3)
         let forces_bg0 = self.create_forces_bg0();
         let forces_bg1 = self.create_forces_bg1();
         let forces_bg2 = self.create_forces_bg2();
         let forces_bg3 = self.create_forces_bg3();
+        let empty_bg = self.create_empty_bind_group();
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("force_pipeline"),
-        });
-
-        // 1. Neighbor grid: clear
+        // Density summation + EOS pressure
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("grid_clear"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline_grid_clear);
-            pass.set_bind_group(0, &grid_bg0, &[]);
-            pass.set_bind_group(1, &empty_bg, &[]);
-            pass.set_bind_group(2, &empty_bg, &[]);
-            pass.set_bind_group(3, &grid_bg3, &[]);
-            pass.dispatch_workgroups(wg_cells, 1, 1);
-        }
-
-        // 2. Neighbor grid: count
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("grid_count"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline_grid_count);
-            pass.set_bind_group(0, &grid_bg0, &[]);
-            pass.set_bind_group(1, &empty_bg, &[]);
-            pass.set_bind_group(2, &empty_bg, &[]);
-            pass.set_bind_group(3, &grid_bg3, &[]);
-            pass.dispatch_workgroups(wg_particles, 1, 1);
-        }
-
-        // 3. Neighbor grid: prefix sum (single thread)
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("grid_prefix"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline_grid_prefix);
-            pass.set_bind_group(0, &grid_bg0, &[]);
-            pass.set_bind_group(1, &empty_bg, &[]);
-            pass.set_bind_group(2, &empty_bg, &[]);
-            pass.set_bind_group(3, &grid_bg3, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
-
-        // 4. Neighbor grid: scatter
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("grid_scatter"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline_grid_scatter);
-            pass.set_bind_group(0, &grid_bg0, &[]);
-            pass.set_bind_group(1, &empty_bg, &[]);
-            pass.set_bind_group(2, &empty_bg, &[]);
-            pass.set_bind_group(3, &grid_bg3, &[]);
-            pass.dispatch_workgroups(wg_particles, 1, 1);
-        }
-
-        // 5. Density summation + EOS pressure
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("density"),
-                timestamp_writes: None,
+                label: Some("density"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline_density);
-            pass.set_bind_group(0, &density_bg0, &[]);
-            pass.set_bind_group(1, &empty_bg, &[]);
-            pass.set_bind_group(2, &density_bg2, &[]);
-            pass.set_bind_group(3, &density_bg3, &[]);
+            pass.set_bind_group(0, &density_bg0, &[]); pass.set_bind_group(1, &empty_bg, &[]);
+            pass.set_bind_group(2, &density_bg2, &[]); pass.set_bind_group(3, &density_bg3, &[]);
             pass.dispatch_workgroups(wg_particles, 1, 1);
         }
 
-        // 6. Boundary pressure mirroring
+        // Boundary pressure mirroring
         if n_boundary > 0 {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("boundary_pressure"),
-                timestamp_writes: None,
+                label: Some("boundary_pressure"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline_boundary_pressure);
-            pass.set_bind_group(0, &forces_bg0, &[]);
-            pass.set_bind_group(1, &forces_bg1, &[]);
-            pass.set_bind_group(2, &forces_bg2, &[]);
-            pass.set_bind_group(3, &forces_bg3, &[]);
+            pass.set_bind_group(0, &forces_bg0, &[]); pass.set_bind_group(1, &forces_bg1, &[]);
+            pass.set_bind_group(2, &forces_bg2, &[]); pass.set_bind_group(3, &forces_bg3, &[]);
             pass.dispatch_workgroups(wg_boundary, 1, 1);
         }
 
-        // 7. All forces (pressure + viscous + gravity + boundary repulsive)
+        // All forces
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("forces"),
-                timestamp_writes: None,
+                label: Some("forces"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline_forces);
-            pass.set_bind_group(0, &forces_bg0, &[]);
-            pass.set_bind_group(1, &forces_bg1, &[]);
-            pass.set_bind_group(2, &forces_bg2, &[]);
-            pass.set_bind_group(3, &forces_bg3, &[]);
+            pass.set_bind_group(0, &forces_bg0, &[]); pass.set_bind_group(1, &forces_bg1, &[]);
+            pass.set_bind_group(2, &forces_bg2, &[]); pass.set_bind_group(3, &forces_bg3, &[]);
             pass.dispatch_workgroups(wg_particles, 1, 1);
         }
+    }
 
+    /// Encode the full force computation pipeline into a command encoder:
+    /// [neighbor grid if needed] -> density -> boundary pressure -> forces.
+    ///
+    /// Uses Verlet neighbor lists to skip grid rebuild when particles
+    /// haven't moved more than skin/2 since the last rebuild.
+    fn encode_forces(&mut self, encoder: &mut wgpu::CommandEncoder, params: &GpuSimParams) {
+        let needs_grid = self.verlet_displacement >= self.verlet_skin * 0.5;
+        if needs_grid {
+            self.encode_grid(encoder);
+            self.verlet_displacement = 0.0;
+        }
+        self.encode_density_forces(encoder, params);
+    }
+
+    /// Submit the force computation pipeline as a standalone operation.
+    /// Used only for the initial bootstrap step (always rebuilds grid).
+    fn compute_forces_gpu(&mut self, params: &GpuSimParams) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("force_pipeline"),
+        });
+        // Always build grid on init — force Verlet rebuild
+        self.verlet_displacement = f32::MAX;
+        self.encode_forces(&mut encoder, params);
         self.queue.submit(std::iter::once(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait);
     }
 
-    /// Refresh the cached CPU-side particle data from GPU.
-    fn refresh_cache(&mut self) {
-        self.cached_particles = self.bufs.readback_particles(&self.device, &self.queue);
+    /// Encode integration passes (half_kick, drift, half_kick) into an encoder.
+    fn encode_integrate(&self, encoder: &mut wgpu::CommandEncoder, wg_particles: u32) {
+        let bg0 = self.create_integrate_bg0();
+        let bg1 = self.create_integrate_bg1();
+
+        // Half-kick: v += a * dt/2
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("half_kick"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_half_kick);
+            pass.set_bind_group(0, &bg0, &[]);
+            pass.set_bind_group(1, &bg1, &[]);
+            pass.dispatch_workgroups(wg_particles, 1, 1);
+        }
+
+        // Drift: x += v * dt + domain clamping
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("drift"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_drift);
+            pass.set_bind_group(0, &bg0, &[]);
+            pass.set_bind_group(1, &bg1, &[]);
+            pass.dispatch_workgroups(wg_particles, 1, 1);
+        }
+    }
+
+    /// Encode the final half-kick pass into an encoder.
+    fn encode_half_kick(&self, encoder: &mut wgpu::CommandEncoder, wg_particles: u32) {
+        let bg0 = self.create_integrate_bg0();
+        let bg1 = self.create_integrate_bg1();
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("half_kick_2"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline_half_kick);
+        pass.set_bind_group(0, &bg0, &[]);
+        pass.set_bind_group(1, &bg1, &[]);
+        pass.dispatch_workgroups(wg_particles, 1, 1);
+    }
+
+    /// Ensure the CPU-side particle cache is up-to-date with GPU data.
+    ///
+    /// Uses interior mutability (UnsafeCell + Cell) so this can be called
+    /// from `&self` methods like `particles()` and `error_metrics()`.
+    ///
+    /// # Safety
+    /// Safe because GpuKernel is `!Sync` (wgpu::Device is !Sync), so no
+    /// concurrent access is possible. The UnsafeCell is only mutated here,
+    /// and only when cache_dirty is true (preventing re-entrant mutation).
+    fn ensure_cache(&self) {
+        if self.cache_dirty.get() {
+            let data = self.bufs.readback_particles(&self.device, &self.queue);
+            // SAFETY: No other reference to cached_particles can exist because
+            // we only hand out references after this call completes, and
+            // GpuKernel is !Sync so no concurrent access.
+            unsafe { *self.cached_particles.get() = data; }
+            self.cache_dirty.set(false);
+        }
+    }
+
+    /// Execute one simulation step without waiting for GPU completion.
+    ///
+    /// The command buffer is submitted but `poll(Wait)` is not called.
+    /// Call `sync()` after a batch of steps to ensure all GPU work is done.
+    /// This allows the GPU command processor to queue multiple steps,
+    /// eliminating CPU-GPU sync latency between steps.
+    pub fn step_no_sync(&mut self, dt: f32) {
+        let n_particles = self.bufs.n_particles;
+        if n_particles == 0 {
+            return;
+        }
+
+        let params = self.make_params(dt);
+        let wg_particles = dispatch_size(n_particles, 256);
+
+        if self.needs_init {
+            self.compute_forces_gpu(&params);
+            self.needs_init = false;
+        }
+
+        self.bufs.update_params(&self.queue, &params);
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("step_nosync"),
+        });
+        self.encode_integrate(&mut encoder, wg_particles);
+        self.encode_forces(&mut encoder, &params);
+        self.encode_half_kick(&mut encoder, wg_particles);
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Track estimated max displacement for Verlet neighbor list reuse.
+        self.verlet_displacement += self.speed_of_sound * dt;
+
+        self.cache_dirty.set(true);
+    }
+
+    /// Wait for all submitted GPU work to complete.
+    pub fn sync(&self) {
+        self.device.poll(wgpu::Maintain::Wait);
+    }
+
+    /// Execute one simulation step with per-pass GPU timestamp profiling.
+    ///
+    /// Uses hardware timestamp queries for precise GPU-side timing.
+    /// Each phase gets its own compute pass with timestamp writes.
+    /// All passes are batched into a single submit for minimal overhead.
+    pub fn step_profiled(&mut self, dt: f32) -> GpuStepProfile {
+        let total_start = Instant::now();
+        let n_particles = self.bufs.n_particles;
+        if n_particles == 0 {
+            return GpuStepProfile::default();
+        }
+
+        let params = self.make_params(dt);
+        let wg_integrate = dispatch_size(n_particles, 256);
+        let wg = self.workgroup_size;
+
+        if self.needs_init {
+            self.compute_forces_gpu(&params);
+            self.needs_init = false;
+        }
+
+        self.bufs.update_params(&self.queue, &params);
+
+        let n_total = self.bufs.n_particles;
+        let total_cells = self.bufs.total_cells;
+        let n_boundary = self.bufs.n_boundary;
+        let wg_grid_p = dispatch_size(n_total, 256);
+        let wg_cells = dispatch_size(total_cells, 256);
+        let wg_particles = dispatch_size(n_total, wg);
+        let wg_boundary = dispatch_size(n_boundary.max(1), wg);
+
+        // Create all bind groups upfront
+        let grid_bg0 = self.create_grid_bg0();
+        let grid_bg3 = self.create_grid_bg3();
+        let empty_bg = self.create_empty_bind_group();
+        let density_bg0 = self.create_density_bg0();
+        let density_bg2 = self.create_density_bg2();
+        let density_bg3 = self.create_density_forces_bg3();
+        let forces_bg0 = self.create_forces_bg0();
+        let forces_bg1 = self.create_forces_bg1();
+        let forces_bg2 = self.create_forces_bg2();
+        let forces_bg3 = self.create_forces_bg3();
+        let integrate_bg0 = self.create_integrate_bg0();
+        let integrate_bg1 = self.create_integrate_bg1();
+
+        let qs = &self.timestamp_query_set;
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("step_profiled"),
+        });
+
+        // TS 0-1: Integrate (half_kick + drift)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("prof_half_kick"),
+                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                    query_set: qs, beginning_of_pass_write_index: Some(0), end_of_pass_write_index: None,
+                }),
+            });
+            pass.set_pipeline(&self.pipeline_half_kick);
+            pass.set_bind_group(0, &integrate_bg0, &[]);
+            pass.set_bind_group(1, &integrate_bg1, &[]);
+            pass.dispatch_workgroups(wg_integrate, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("prof_drift"),
+                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                    query_set: qs, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(1),
+                }),
+            });
+            pass.set_pipeline(&self.pipeline_drift);
+            pass.set_bind_group(0, &integrate_bg0, &[]);
+            pass.set_bind_group(1, &integrate_bg1, &[]);
+            pass.dispatch_workgroups(wg_integrate, 1, 1);
+        }
+
+        // TS 2-3: Grid build (clear, count, prefix, scatter)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("prof_grid_clear"),
+                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                    query_set: qs, beginning_of_pass_write_index: Some(2), end_of_pass_write_index: None,
+                }),
+            });
+            pass.set_pipeline(&self.pipeline_grid_clear);
+            pass.set_bind_group(0, &grid_bg0, &[]); pass.set_bind_group(1, &empty_bg, &[]);
+            pass.set_bind_group(2, &empty_bg, &[]); pass.set_bind_group(3, &grid_bg3, &[]);
+            pass.dispatch_workgroups(wg_cells, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("prof_grid_count"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_grid_count);
+            pass.set_bind_group(0, &grid_bg0, &[]); pass.set_bind_group(1, &empty_bg, &[]);
+            pass.set_bind_group(2, &empty_bg, &[]); pass.set_bind_group(3, &grid_bg3, &[]);
+            pass.dispatch_workgroups(wg_grid_p, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("prof_grid_prefix"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_grid_prefix);
+            pass.set_bind_group(0, &grid_bg0, &[]); pass.set_bind_group(1, &empty_bg, &[]);
+            pass.set_bind_group(2, &empty_bg, &[]); pass.set_bind_group(3, &grid_bg3, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("prof_grid_scatter"),
+                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                    query_set: qs, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(3),
+                }),
+            });
+            pass.set_pipeline(&self.pipeline_grid_scatter);
+            pass.set_bind_group(0, &grid_bg0, &[]); pass.set_bind_group(1, &empty_bg, &[]);
+            pass.set_bind_group(2, &empty_bg, &[]); pass.set_bind_group(3, &grid_bg3, &[]);
+            pass.dispatch_workgroups(wg_grid_p, 1, 1);
+        }
+
+        // TS 4-5: Density
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("prof_density"),
+                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                    query_set: qs, beginning_of_pass_write_index: Some(4), end_of_pass_write_index: Some(5),
+                }),
+            });
+            pass.set_pipeline(&self.pipeline_density);
+            pass.set_bind_group(0, &density_bg0, &[]); pass.set_bind_group(1, &empty_bg, &[]);
+            pass.set_bind_group(2, &density_bg2, &[]); pass.set_bind_group(3, &density_bg3, &[]);
+            pass.dispatch_workgroups(wg_particles, 1, 1);
+        }
+
+        // TS 6-7: Boundary pressure
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("prof_boundary_pressure"),
+                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                    query_set: qs, beginning_of_pass_write_index: Some(6), end_of_pass_write_index: Some(7),
+                }),
+            });
+            if n_boundary > 0 {
+                pass.set_pipeline(&self.pipeline_boundary_pressure);
+                pass.set_bind_group(0, &forces_bg0, &[]); pass.set_bind_group(1, &forces_bg1, &[]);
+                pass.set_bind_group(2, &forces_bg2, &[]); pass.set_bind_group(3, &forces_bg3, &[]);
+                pass.dispatch_workgroups(wg_boundary, 1, 1);
+            }
+            // Empty dispatch if no boundary — timestamps still written
+        }
+
+        // TS 8-9: Forces
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("prof_forces"),
+                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                    query_set: qs, beginning_of_pass_write_index: Some(8), end_of_pass_write_index: Some(9),
+                }),
+            });
+            pass.set_pipeline(&self.pipeline_forces);
+            pass.set_bind_group(0, &forces_bg0, &[]); pass.set_bind_group(1, &forces_bg1, &[]);
+            pass.set_bind_group(2, &forces_bg2, &[]); pass.set_bind_group(3, &forces_bg3, &[]);
+            pass.dispatch_workgroups(wg_particles, 1, 1);
+        }
+
+        // TS 10-11: Second half-kick
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("prof_half_kick_2"),
+                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                    query_set: qs, beginning_of_pass_write_index: Some(10), end_of_pass_write_index: Some(11),
+                }),
+            });
+            pass.set_pipeline(&self.pipeline_half_kick);
+            pass.set_bind_group(0, &integrate_bg0, &[]);
+            pass.set_bind_group(1, &integrate_bg1, &[]);
+            pass.dispatch_workgroups(wg_integrate, 1, 1);
+        }
+
+        // Resolve timestamps and copy to staging
+        encoder.resolve_query_set(qs, 0..12, &self.timestamp_resolve_buf, 0);
+        encoder.copy_buffer_to_buffer(
+            &self.timestamp_resolve_buf, 0,
+            &self.timestamp_staging_buf, 0,
+            12 * 8,
+        );
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+
+        // Read timestamps
+        let timestamps = self.read_timestamps(12);
+        let ns_per_tick = self.timestamp_period as f64;
+
+        let ts_to_us = |begin: u64, end: u64| -> u64 {
+            ((end.saturating_sub(begin)) as f64 * ns_per_tick / 1000.0) as u64
+        };
+
+        let integrate_us = ts_to_us(timestamps[0], timestamps[1])
+            + ts_to_us(timestamps[10], timestamps[11]);
+        let grid_build_us = ts_to_us(timestamps[2], timestamps[3]);
+        let density_us = ts_to_us(timestamps[4], timestamps[5]);
+        let boundary_pressure_us = ts_to_us(timestamps[6], timestamps[7]);
+        let forces_us = ts_to_us(timestamps[8], timestamps[9]);
+
+        // Reset Verlet displacement since profiling always rebuilds grid
+        self.verlet_displacement = 0.0;
+        self.verlet_displacement += self.speed_of_sound * dt;
+
+        // Readback
+        let t0 = Instant::now();
+        let data = self.bufs.readback_particles(&self.device, &self.queue);
+        unsafe { *self.cached_particles.get() = data; }
+        self.cache_dirty.set(false);
+        let readback_us = t0.elapsed().as_micros() as u64;
+
+        let total_us = total_start.elapsed().as_micros() as u64;
+
+        GpuStepProfile {
+            grid_build_us,
+            density_us,
+            boundary_pressure_us,
+            forces_us,
+            integrate_us,
+            readback_us,
+            total_us,
+        }
+    }
+
+    /// Read back N u64 timestamps from the staging buffer.
+    fn read_timestamps(&self, count: usize) -> Vec<u64> {
+        let slice = self.timestamp_staging_buf.slice(..((count * 8) as u64));
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+
+        let data = slice.get_mapped_range();
+        let result: Vec<u64> = bytemuck::cast_slice(&data)[..count].to_vec();
+        drop(data);
+        self.timestamp_staging_buf.unmap();
+        result
     }
 
     // ---- Bind group creation helpers ----
@@ -732,7 +1223,7 @@ impl GpuKernel {
         })
     }
 
-    /// Density group 2: density(rw), pressure(rw), fluid_type(read), bnd_x/y/z(read), bnd_mass(read)
+    /// Density group 2: density(rw), pressure(rw), fluid_type(read), bnd(read), bnd_grid(read)
     fn create_density_bg2(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("density_bg2"),
@@ -745,6 +1236,9 @@ impl GpuKernel {
                 wgpu::BindGroupEntry { binding: 4, resource: self.bufs.bnd_y.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: self.bufs.bnd_z.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: self.bufs.bnd_mass.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: self.bufs.bnd_cell_counts.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: self.bufs.bnd_cell_offsets.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: self.bufs.bnd_sorted_indices.as_entire_binding() },
             ],
         })
     }
@@ -796,7 +1290,7 @@ impl GpuKernel {
         })
     }
 
-    /// Forces group 2: density(read), pressure(read), fluid_type(read), bnd(read), bnd_pressure(rw)
+    /// Forces group 2: density(read), pressure(read), fluid_type(read), bnd(read), bnd_pressure(rw), bnd_grid(read)
     fn create_forces_bg2(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("forces_bg2"),
@@ -810,6 +1304,9 @@ impl GpuKernel {
                 wgpu::BindGroupEntry { binding: 5, resource: self.bufs.bnd_z.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: self.bufs.bnd_mass.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: self.bufs.bnd_pressure.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: self.bufs.bnd_cell_counts.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: self.bufs.bnd_cell_offsets.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: self.bufs.bnd_sorted_indices.as_entire_binding() },
             ],
         })
     }
@@ -907,82 +1404,43 @@ impl SimulationKernel for GpuKernel {
         // Update params buffer with current dt
         self.bufs.update_params(&self.queue, &params);
 
-        // --- 1. Half-kick: v += a * dt/2 ---
-        {
-            let bg0 = self.create_integrate_bg0();
-            let bg1 = self.create_integrate_bg1();
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("half_kick"),
-            });
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("half_kick"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipeline_half_kick);
-                pass.set_bind_group(0, &bg0, &[]);
-                pass.set_bind_group(1, &bg1, &[]);
-                pass.dispatch_workgroups(wg_particles, 1, 1);
-            }
-            self.queue.submit(std::iter::once(encoder.finish()));
-            self.device.poll(wgpu::Maintain::Wait);
-        }
+        // Batch all passes into a single command encoder + submit + poll.
+        // wgpu guarantees pass ordering within an encoder, so this is safe
+        // and eliminates 3 CPU-GPU sync round-trips vs the old approach.
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("step_batched"),
+        });
 
-        // --- 2. Drift: x += v * dt + domain clamping ---
-        {
-            let bg0 = self.create_integrate_bg0();
-            let bg1 = self.create_integrate_bg1();
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("drift"),
-            });
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("drift"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipeline_drift);
-                pass.set_bind_group(0, &bg0, &[]);
-                pass.set_bind_group(1, &bg1, &[]);
-                pass.dispatch_workgroups(wg_particles, 1, 1);
-            }
-            self.queue.submit(std::iter::once(encoder.finish()));
-            self.device.poll(wgpu::Maintain::Wait);
-        }
+        // 1-2. Half-kick + drift
+        self.encode_integrate(&mut encoder, wg_particles);
 
-        // --- 3-7. Full force computation pipeline ---
-        self.compute_forces_gpu(&params);
+        // 3-7. Force computation pipeline (grid + density + boundary + forces)
+        self.encode_forces(&mut encoder, &params);
 
-        // --- 8. Second half-kick: v += a * dt/2 ---
-        {
-            let bg0 = self.create_integrate_bg0();
-            let bg1 = self.create_integrate_bg1();
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("half_kick_2"),
-            });
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("half_kick_2"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipeline_half_kick);
-                pass.set_bind_group(0, &bg0, &[]);
-                pass.set_bind_group(1, &bg1, &[]);
-                pass.dispatch_workgroups(wg_particles, 1, 1);
-            }
-            self.queue.submit(std::iter::once(encoder.finish()));
-            self.device.poll(wgpu::Maintain::Wait);
-        }
+        // 8. Second half-kick
+        self.encode_half_kick(&mut encoder, wg_particles);
 
-        // Readback particle data to keep CPU cache in sync
-        self.refresh_cache();
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+
+        // Track estimated max displacement for Verlet neighbor list reuse.
+        // Conservative upper bound: no particle exceeds speed of sound.
+        self.verlet_displacement += self.speed_of_sound * dt;
+
+        // Mark cache as stale; readback deferred until particles() is called
+        self.cache_dirty.set(true);
     }
 
     fn particles(&self) -> &ParticleArrays {
-        &self.cached_particles
+        self.ensure_cache();
+        // SAFETY: ensure_cache() guarantees no outstanding mutable reference.
+        // The returned reference borrows `self`, preventing step() from being
+        // called while it's alive (step takes &mut self).
+        unsafe { &*self.cached_particles.get() }
     }
 
     fn error_metrics(&self) -> ErrorMetrics {
-        let particles = self.particles();
+        let particles = self.particles(); // triggers lazy readback if needed
         let n = particles.len();
 
         // Maximum density variation

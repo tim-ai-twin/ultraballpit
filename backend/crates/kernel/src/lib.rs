@@ -29,7 +29,7 @@ pub use particle::{FluidType, ParticleArrays};
 pub use sph::{wendland_c2, wendland_c2_gradient};
 
 #[cfg(feature = "gpu")]
-pub use gpu::GpuKernel;
+pub use gpu::{GpuKernel, GpuStepProfile};
 
 // ---------------------------------------------------------------------------
 // SimulationKernel trait

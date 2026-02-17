@@ -21,3 +21,15 @@ pollster = { version = "0.4", optional = true }
 [[bench]]
 name = "gpu_throughput"
 harness = false
+
+[[bench]]
+name = "workgroup_sweep"
+harness = false
+
+[[bench]]
+name = "scaling"
+harness = false
+
+[[bench]]
+name = "vec4_packing"
+harness = false

@@ -155,10 +155,13 @@ fn gpu_cpu_parity_100_steps() {
         max_pos_error
     );
 
-    // Density tolerance: 0.1% relative
+    // Density tolerance: 0.5% relative.
+    // GPU uses f16-packed mass (3 decimal digits precision) vs CPU f32 mass,
+    // so a small density divergence is expected and acceptable for WCSPH
+    // which tolerates ~3% compressibility.
     assert!(
-        max_density_error < 0.001,
-        "Density error too large: {:.6e} > 0.001",
+        max_density_error < 0.005,
+        "Density error too large: {:.6e} > 0.005",
         max_density_error
     );
 }
