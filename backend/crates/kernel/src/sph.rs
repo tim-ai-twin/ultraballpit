@@ -88,11 +88,23 @@ pub fn wendland_c2_gradient(dx: f32, dy: f32, dz: f32, r: f32, h: f32) -> (f32, 
 // T017: SPH density summation
 // ---------------------------------------------------------------------------
 
-/// Compute density for all particles using SPH summation.
+/// Delta-SPH diffusion coefficient (Molteni & Colagrossi 2009).
+/// Typical value: 0.1 for moderate diffusion.
+const DELTA_SPH: f32 = 0.1;
+
+/// Compute density for all particles using SPH summation, with optional
+/// delta-SPH density diffusion (Molteni & Colagrossi 2009).
 ///
 /// ```text
 /// rho_i = sum_j m_j * W(|r_i - r_j|, h)
 /// ```
+///
+/// The diffusion correction is:
+/// ```text
+/// D_i = delta * h * c_s * sum_j V_j * (rho_i - rho_j) * (2 * r_ij · grad_W / |r_ij|^2)
+/// ```
+///
+/// This suppresses density noise and improves hydrostatic pressure accuracy.
 ///
 /// Includes self-contribution (W(0, h) * m_i) and contributions from
 /// boundary particles. Boundary particles contribute to density but do
@@ -145,6 +157,126 @@ pub fn compute_density(
 
         particles.density[i] = rho;
     }
+}
+
+/// Compute delta-SPH density diffusion term (Molteni & Colagrossi 2009).
+///
+/// Returns a per-particle diffusion rate that should be applied as:
+/// `rho_i += diffusion[i] * dt`
+///
+/// The term suppresses density noise, improving pressure field smoothness
+/// and enabling lower speed of sound (larger timesteps).
+pub fn compute_density_diffusion(
+    particles: &ParticleArrays,
+    grid: &NeighborGrid,
+    h: f32,
+    speed_of_sound: f32,
+) -> Vec<f32> {
+    let n = particles.len();
+    let support_radius = 2.0 * h;
+    let eta_sq = 0.01 * h * h;
+    let mut diffusion = vec![0.0f32; n];
+
+    for i in 0..n {
+        let mut diff_sum = 0.0f32;
+
+        grid.for_each_neighbor(
+            i,
+            &particles.x,
+            &particles.y,
+            &particles.z,
+            support_radius,
+            |j| {
+                let dx = particles.x[i] - particles.x[j];
+                let dy = particles.y[i] - particles.y[j];
+                let dz = particles.z[i] - particles.z[j];
+                let dist_sq = dx * dx + dy * dy + dz * dz;
+                let r = dist_sq.sqrt();
+
+                let (gx, gy, gz) = wendland_c2_gradient(dx, dy, dz, r, h);
+
+                // Volume of neighbor j: V_j = m_j / rho_j
+                let v_j = particles.mass[j] / particles.density[j];
+
+                // r_ij · grad_W
+                let r_dot_grad = dx * gx + dy * gy + dz * gz;
+
+                // Diffusion: delta * h * c_s * V_j * (rho_i - rho_j) * 2 * r·gradW / (|r|^2 + eta^2)
+                // Sign note: our r = x_i - x_j, so r·gradW < 0. The paper uses r_ij = x_j - x_i,
+                // so (rho_i - rho_j) with our r·gradW gives the correct diffusion sign.
+                let density_diff = particles.density[i] - particles.density[j];
+                diff_sum += v_j * density_diff * 2.0 * r_dot_grad / (dist_sq + eta_sq);
+            },
+        );
+
+        diffusion[i] = DELTA_SPH * h * speed_of_sound * diff_sum;
+    }
+
+    diffusion
+}
+
+// ---------------------------------------------------------------------------
+// XSPH velocity smoothing (Monaghan 1989)
+// ---------------------------------------------------------------------------
+
+/// XSPH smoothing coefficient. Range [0, 1]; higher = more smoothing.
+/// 0.5 is the standard value from Monaghan 1989.
+const XSPH_EPSILON: f32 = 0.5;
+
+/// Compute XSPH velocity correction for all particles.
+///
+/// ```text
+/// v_xsph_i = v_i + epsilon * sum_j (m_j / rho_avg_ij) * (v_j - v_i) * W(r_ij, h)
+/// ```
+///
+/// where `rho_avg_ij = 0.5 * (rho_i + rho_j)`.
+///
+/// Returns three vectors (dvx, dvy, dvz) of corrections to be added to velocity
+/// before the position update (drift step).
+pub fn compute_xsph_correction(
+    particles: &ParticleArrays,
+    grid: &NeighborGrid,
+    h: f32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let n = particles.len();
+    let support_radius = 2.0 * h;
+    let mut dvx = vec![0.0f32; n];
+    let mut dvy = vec![0.0f32; n];
+    let mut dvz = vec![0.0f32; n];
+
+    for i in 0..n {
+        let mut cx = 0.0f32;
+        let mut cy = 0.0f32;
+        let mut cz = 0.0f32;
+
+        grid.for_each_neighbor(
+            i,
+            &particles.x,
+            &particles.y,
+            &particles.z,
+            support_radius,
+            |j| {
+                let dx = particles.x[i] - particles.x[j];
+                let dy = particles.y[i] - particles.y[j];
+                let dz = particles.z[i] - particles.z[j];
+                let r = (dx * dx + dy * dy + dz * dz).sqrt();
+
+                let w = wendland_c2(r, h);
+                let rho_avg = 0.5 * (particles.density[i] + particles.density[j]);
+                let factor = particles.mass[j] / rho_avg.max(1.0) * w;
+
+                cx += factor * (particles.vx[j] - particles.vx[i]);
+                cy += factor * (particles.vy[j] - particles.vy[i]);
+                cz += factor * (particles.vz[j] - particles.vz[i]);
+            },
+        );
+
+        dvx[i] = XSPH_EPSILON * cx;
+        dvy[i] = XSPH_EPSILON * cy;
+        dvz[i] = XSPH_EPSILON * cz;
+    }
+
+    (dvx, dvy, dvz)
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +505,70 @@ pub fn apply_gravity(particles: &mut ParticleArrays, gravity: [f32; 3]) {
         particles.ay[i] += gravity[1];
         particles.az[i] += gravity[2];
     }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-tune speed of sound
+// ---------------------------------------------------------------------------
+
+/// Minimum speed of sound floor (m/s).
+/// Even in very calm simulations, c_s must be large enough to produce
+/// meaningful pressure response.
+const MIN_SPEED_OF_SOUND: f32 = 1.0;
+
+/// Auto-tune the speed of sound based on domain geometry and gravity.
+///
+/// The WCSPH rule is `c_s >= 10 * v_max` for <1% density variation.
+/// For gravity-driven flows, `v_max ≈ sqrt(2 * g * H)` where H is domain height.
+///
+/// Returns the minimum `c_s` that satisfies the weakly-compressible constraint
+/// for the given domain, or `c_s_config` if it's already larger.
+///
+/// # Arguments
+/// * `gravity` - Gravity vector [gx, gy, gz]
+/// * `domain_min` - Domain minimum bounds
+/// * `domain_max` - Domain maximum bounds
+/// * `c_s_config` - The configured (user-specified) speed of sound
+pub fn auto_tune_speed_of_sound(
+    gravity: [f32; 3],
+    domain_min: [f32; 3],
+    domain_max: [f32; 3],
+    c_s_config: f32,
+) -> f32 {
+    // Gravity magnitude
+    let g_mag = (gravity[0] * gravity[0] + gravity[1] * gravity[1] + gravity[2] * gravity[2]).sqrt();
+
+    if g_mag < 1.0e-6 {
+        // No gravity — use config value or floor
+        return c_s_config.max(MIN_SPEED_OF_SOUND);
+    }
+
+    // Domain height along gravity direction
+    let g_norm = [gravity[0] / g_mag, gravity[1] / g_mag, gravity[2] / g_mag];
+    let extent = [
+        domain_max[0] - domain_min[0],
+        domain_max[1] - domain_min[1],
+        domain_max[2] - domain_min[2],
+    ];
+    // Project domain extent onto gravity direction
+    let height = (extent[0] * g_norm[0].abs() + extent[1] * g_norm[1].abs() + extent[2] * g_norm[2].abs())
+        .abs();
+
+    // v_max estimate from freefall: sqrt(2 * g * H)
+    let v_max_est = (2.0 * g_mag * height).sqrt();
+
+    // WCSPH constraint: c_s >= 10 * v_max for <1% density variation
+    // Use factor of 10 (standard) — can reduce to 7 for <3% variation (SC-003)
+    let c_s_auto = (10.0 * v_max_est).max(MIN_SPEED_OF_SOUND);
+
+    // Use the auto-tuned value (it should be lower than typical config defaults)
+    // but respect an explicitly low user setting
+    let result = c_s_auto.min(c_s_config);
+    tracing::info!(
+        "Auto-tuned c_s: v_max_est={:.3} m/s, c_s_auto={:.2} m/s, c_s_config={:.2} m/s → using {:.2} m/s",
+        v_max_est, c_s_auto, c_s_config, result
+    );
+    result
 }
 
 // ---------------------------------------------------------------------------

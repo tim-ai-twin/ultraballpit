@@ -150,7 +150,7 @@ fn default_temperature() -> f32 {
 }
 
 fn default_cfl() -> f32 {
-    0.4
+    0.5
 }
 
 impl Default for BoundaryConditions {

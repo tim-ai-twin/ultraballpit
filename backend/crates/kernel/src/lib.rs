@@ -67,6 +67,14 @@ pub trait SimulationKernel {
 
     /// Number of particles in the simulation.
     fn particle_count(&self) -> usize;
+
+    /// Save a checkpoint of the current particle state for potential rollback.
+    /// Returns true if checkpointing is supported and succeeded.
+    fn save_checkpoint(&mut self) -> bool { false }
+
+    /// Restore the last saved checkpoint, undoing any steps since save.
+    /// Returns true if restoration succeeded.
+    fn restore_checkpoint(&mut self) -> bool { false }
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +117,8 @@ pub struct CpuKernel {
     domain_max: [f32; 3],
     /// Whether the initial force computation has been performed.
     needs_init: bool,
+    /// Saved particle state for optimistic timestepping rollback.
+    checkpoint: Option<ParticleArrays>,
 }
 
 impl CpuKernel {
@@ -159,6 +169,7 @@ impl CpuKernel {
             domain_min,
             domain_max,
             needs_init: true,
+            checkpoint: None,
         }
     }
 
@@ -187,7 +198,9 @@ impl CpuKernel {
     /// Run the full force computation pipeline (density, pressure, boundary
     /// pressures, forces) without integration. Used for bootstrapping
     /// initial accelerations for Velocity Verlet.
-    fn compute_forces(&mut self) {
+    ///
+    /// `dt` is the simulation timestep used for delta-SPH density diffusion.
+    fn compute_forces(&mut self, dt: f32) {
         let n = self.particles.len();
 
         // Update neighbor grid
@@ -197,7 +210,14 @@ impl CpuKernel {
             &self.particles.z,
         );
 
-        // Compute density (T017)
+        // Delta-SPH density diffusion (Molteni & Colagrossi 2009)
+        // Computed BEFORE density summation so it uses previous-step density,
+        // matching the GPU shader which reads density[i] before overwriting.
+        let diffusion = sph::compute_density_diffusion(
+            &self.particles, &self.grid, self.h, self.speed_of_sound,
+        );
+
+        // Compute density (T017) -- overwrites density with summation values
         sph::compute_density(
             &mut self.particles,
             &self.boundary.x,
@@ -207,6 +227,11 @@ impl CpuKernel {
             &self.grid,
             self.h,
         );
+
+        // Apply diffusion correction to the new summation density
+        for i in 0..n {
+            self.particles.density[i] += diffusion[i] * dt;
+        }
 
         // Compute pressure from EOS
         sph::compute_pressure(&mut self.particles, self.speed_of_sound);
@@ -268,7 +293,7 @@ impl SimulationKernel for CpuKernel {
         // forces have been computed yet. The first half-kick would do nothing,
         // producing incorrect results. So we run the force pipeline once first.
         if self.needs_init {
-            self.compute_forces();
+            self.compute_forces(dt);
             self.needs_init = false;
         }
 
@@ -279,11 +304,16 @@ impl SimulationKernel for CpuKernel {
             self.particles.vz[i] += self.particles.az[i] * half_dt;
         }
 
-        // --- 2. Drift: x(t + dt) = x(t) + v(t + dt/2) * dt ---
+        // --- 2. Drift with XSPH correction: x(t+dt) = x(t) + (v + dv_xsph) * dt ---
+        // XSPH smooths the velocity field used for position updates, reducing
+        // particle disorder and improving stability (Monaghan 1989).
+        let (dvx, dvy, dvz) = sph::compute_xsph_correction(
+            &self.particles, &self.grid, self.h,
+        );
         for i in 0..n {
-            self.particles.x[i] += self.particles.vx[i] * dt;
-            self.particles.y[i] += self.particles.vy[i] * dt;
-            self.particles.z[i] += self.particles.vz[i] * dt;
+            self.particles.x[i] += (self.particles.vx[i] + dvx[i]) * dt;
+            self.particles.y[i] += (self.particles.vy[i] + dvy[i]) * dt;
+            self.particles.z[i] += (self.particles.vz[i] + dvz[i]) * dt;
         }
 
         // --- 2b. Boundary collision: clamp positions to domain bounds ---
@@ -294,7 +324,7 @@ impl SimulationKernel for CpuKernel {
         );
 
         // --- 3-7. Compute all forces ---
-        self.compute_forces();
+        self.compute_forces(dt);
 
         // --- 8. Second half-kick: v(t + dt) = v(t + dt/2) + a(t + dt) * dt/2 ---
         for i in 0..n {
@@ -348,6 +378,20 @@ impl SimulationKernel for CpuKernel {
 
     fn particle_count(&self) -> usize {
         self.particles.len()
+    }
+
+    fn save_checkpoint(&mut self) -> bool {
+        self.checkpoint = Some(self.particles.clone());
+        true
+    }
+
+    fn restore_checkpoint(&mut self) -> bool {
+        if let Some(cp) = self.checkpoint.take() {
+            self.particles = cp;
+            true
+        } else {
+            false
+        }
     }
 }
 

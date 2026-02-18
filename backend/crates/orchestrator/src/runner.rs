@@ -185,6 +185,14 @@ fn run_simulation_loop(
     let mut sim_time = 0.0_f64;
     let mut timestep_count = 0_u64;
 
+    // Optimistic timestepping: try larger dt, rollback if quality degrades
+    const OPTIMISTIC_ALPHA: f32 = 1.5;
+    const DENSITY_VAR_LIMIT: f32 = 0.03; // 3% max density variation (spec SC-003)
+    const COOLDOWN_STEPS: u32 = 10; // steps to skip optimistic after a rollback
+    let mut cooldown = 0u32;
+    let mut optimistic_accepted = 0u64;
+    let mut optimistic_rejected = 0u64;
+
     loop {
         // Check state
         let current_state = {
@@ -197,19 +205,42 @@ fn run_simulation_loop(
                 // Execute one timestep
 
                 // Compute adaptive timestep using CFL condition
-                let particles = kernel.particles();
-                let dt = kernel::sph::compute_timestep(
-                    particles,
+                let dt_safe = kernel::sph::compute_timestep(
+                    kernel.particles(),
                     h,
                     speed_of_sound,
                     cfl_number,
                 );
 
-                // Step the kernel
-                kernel.step(dt);
+                // Optimistic timestepping: try a larger dt when not in cooldown
+                let dt_used;
+                if cooldown > 0 {
+                    cooldown -= 1;
+                    kernel.step(dt_safe);
+                    dt_used = dt_safe;
+                } else if kernel.save_checkpoint() {
+                    let dt_try = dt_safe * OPTIMISTIC_ALPHA;
+                    kernel.step(dt_try);
+                    let metrics = kernel.error_metrics();
+                    if metrics.max_density_variation > DENSITY_VAR_LIMIT {
+                        // Optimistic step violated density bound, rollback
+                        kernel.restore_checkpoint();
+                        kernel.step(dt_safe);
+                        dt_used = dt_safe;
+                        optimistic_rejected += 1;
+                        cooldown = COOLDOWN_STEPS;
+                    } else {
+                        dt_used = dt_try;
+                        optimistic_accepted += 1;
+                    }
+                } else {
+                    // Kernel doesn't support checkpointing, use safe dt
+                    kernel.step(dt_safe);
+                    dt_used = dt_safe;
+                };
 
                 // Update counters
-                sim_time += dt as f64;
+                sim_time += dt_used as f64;
                 timestep_count += 1;
 
                 // Update shared state
@@ -248,11 +279,13 @@ fn run_simulation_loop(
                 if timestep_count % 100 == 0 {
                     let wall_time = start_wall_time.elapsed().as_secs_f64();
                     tracing::debug!(
-                        "Step {}: sim_time={:.4}s, dt={:.6}s, wall_time={:.2}s",
+                        "Step {}: sim_time={:.4}s, dt={:.6}s, wall_time={:.2}s, optimistic={}/{}",
                         timestep_count,
                         sim_time,
-                        dt,
+                        dt_used,
                         wall_time,
+                        optimistic_accepted,
+                        optimistic_accepted + optimistic_rejected,
                     );
                 }
             }
@@ -271,11 +304,24 @@ fn run_simulation_loop(
         }
     }
 
-    tracing::info!(
-        "Simulation thread exiting: {} timesteps, {:.4}s simulated",
-        timestep_count,
-        sim_time
-    );
+    let total_optimistic = optimistic_accepted + optimistic_rejected;
+    if total_optimistic > 0 {
+        tracing::info!(
+            "Simulation thread exiting: {} timesteps, {:.4}s simulated, \
+             optimistic {}/{} accepted ({:.0}%)",
+            timestep_count,
+            sim_time,
+            optimistic_accepted,
+            total_optimistic,
+            100.0 * optimistic_accepted as f64 / total_optimistic as f64,
+        );
+    } else {
+        tracing::info!(
+            "Simulation thread exiting: {} timesteps, {:.4}s simulated",
+            timestep_count,
+            sim_time
+        );
+    }
 }
 
 /// Extension trait to get particle snapshots and metrics from the runner

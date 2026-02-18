@@ -62,7 +62,8 @@ fn half_kick(@builtin(global_invocation_id) gid: vec3<u32>) {
     vel_z[i] = vel_z[i] + acc_z[i] * half_dt;
 }
 
-// Entry point: Drift (x += v * dt) with domain clamping
+// Entry point: Drift with XSPH correction (x += (v + dv_xsph) * dt) + domain clamping.
+// Before this pass, the XSPH pass writes corrections to acc_x/y/z.
 @compute @workgroup_size(256)
 fn drift(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -72,10 +73,10 @@ fn drift(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let dt = params.dt;
 
-    // Drift
-    pos_x[i] = pos_x[i] + vel_x[i] * dt;
-    pos_y[i] = pos_y[i] + vel_y[i] * dt;
-    pos_z[i] = pos_z[i] + vel_z[i] * dt;
+    // Drift with XSPH velocity smoothing: acc holds XSPH correction
+    pos_x[i] = pos_x[i] + (vel_x[i] + acc_x[i]) * dt;
+    pos_y[i] = pos_y[i] + (vel_y[i] + acc_y[i]) * dt;
+    pos_z[i] = pos_z[i] + (vel_z[i] + acc_z[i]) * dt;
 
     // Domain clamping with velocity reflection
     // X-min

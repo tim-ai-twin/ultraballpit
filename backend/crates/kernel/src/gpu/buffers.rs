@@ -96,6 +96,9 @@ pub struct GpuBuffers {
     pub staging_acc_y: wgpu::Buffer,
     pub staging_acc_z: wgpu::Buffer,
 
+    /// Temporary buffer for particle reordering (single buffer reused for each array).
+    pub reorder_temp: wgpu::Buffer,
+
     /// Number of fluid particles
     pub n_particles: u32,
     /// Number of boundary particles
@@ -137,7 +140,7 @@ fn f32_to_f16_bits(x: f32) -> u16 {
 
 /// Pack a slice of f32 mass values into u32 pairs of f16.
 /// Each u32 holds two f16 values: low bits = even index, high bits = odd index.
-fn pack_mass_f16(masses: &[f32]) -> Vec<u32> {
+pub fn pack_mass_f16(masses: &[f32]) -> Vec<u32> {
     let n_packed = (masses.len() + 1) / 2;
     let mut packed = Vec::with_capacity(n_packed);
     for i in (0..masses.len()).step_by(2) {
@@ -288,6 +291,14 @@ impl GpuBuffers {
         let staging_acc_y = create_staging_buf(device, "staging_acc_y", particle_bytes);
         let staging_acc_z = create_staging_buf(device, "staging_acc_z", particle_bytes);
 
+        // Temp buffer for particle reordering (one array at a time)
+        let reorder_temp = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("reorder_temp"),
+            size: particle_bytes.max(particle_u32_bytes).max(MIN_BUF_SIZE),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             params_buffer,
             pos_x,
@@ -317,6 +328,7 @@ impl GpuBuffers {
             bnd_cell_offsets,
             bnd_sorted_indices,
             mass_f32: particles.mass.clone(),
+            reorder_temp,
             staging_density,
             staging_pos_x,
             staging_pos_y,
@@ -341,6 +353,10 @@ impl GpuBuffers {
     }
 
     /// Read back all particle data from GPU to CPU.
+    ///
+    /// Maps all staging buffers in parallel with a single `poll(Wait)`,
+    /// then reads all mapped ranges. This eliminates 11 sequential
+    /// map+poll+unmap cycles.
     pub fn readback_particles(
         &self,
         device: &wgpu::Device,
@@ -376,19 +392,60 @@ impl GpuBuffers {
 
         queue.submit(std::iter::once(encoder.finish()));
 
-        // Map and read
-        let x = read_f32_buffer(device, &self.staging_pos_x, n);
-        let y = read_f32_buffer(device, &self.staging_pos_y, n);
-        let z = read_f32_buffer(device, &self.staging_pos_z, n);
-        let vx = read_f32_buffer(device, &self.staging_vel_x, n);
-        let vy = read_f32_buffer(device, &self.staging_vel_y, n);
-        let vz = read_f32_buffer(device, &self.staging_vel_z, n);
-        let ax = read_f32_buffer(device, &self.staging_acc_x, n);
-        let ay = read_f32_buffer(device, &self.staging_acc_y, n);
-        let az = read_f32_buffer(device, &self.staging_acc_z, n);
-        let density_vec = read_f32_buffer(device, &self.staging_density, n);
-        let pressure_vec = read_f32_buffer(device, &self.staging_pressure, n);
-        let ft_u32 = read_u32_buffer(device, &self.staging_fluid_type, n);
+        // Issue all map_async calls before polling — this lets the driver
+        // process all mappings in a single poll(Wait) round-trip.
+        let staging_bufs: &[&wgpu::Buffer] = &[
+            &self.staging_pos_x, &self.staging_pos_y, &self.staging_pos_z,
+            &self.staging_vel_x, &self.staging_vel_y, &self.staging_vel_z,
+            &self.staging_acc_x, &self.staging_acc_y, &self.staging_acc_z,
+            &self.staging_density, &self.staging_pressure, &self.staging_fluid_type,
+        ];
+
+        let senders: Vec<_> = staging_bufs.iter().map(|buf| {
+            let slice = buf.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+            rx
+        }).collect();
+
+        // Single poll to complete all mappings
+        device.poll(wgpu::Maintain::Wait);
+
+        // Verify all mappings succeeded
+        for rx in &senders {
+            rx.recv().unwrap().unwrap();
+        }
+
+        // Read all mapped ranges
+        let read_f32 = |buf: &wgpu::Buffer| -> Vec<f32> {
+            let data = buf.slice(..).get_mapped_range();
+            let result: Vec<f32> = bytemuck::cast_slice(&data)[..n].to_vec();
+            drop(data);
+            buf.unmap();
+            result
+        };
+        let read_u32 = |buf: &wgpu::Buffer| -> Vec<u32> {
+            let data = buf.slice(..).get_mapped_range();
+            let result: Vec<u32> = bytemuck::cast_slice(&data)[..n].to_vec();
+            drop(data);
+            buf.unmap();
+            result
+        };
+
+        let x = read_f32(&self.staging_pos_x);
+        let y = read_f32(&self.staging_pos_y);
+        let z = read_f32(&self.staging_pos_z);
+        let vx = read_f32(&self.staging_vel_x);
+        let vy = read_f32(&self.staging_vel_y);
+        let vz = read_f32(&self.staging_vel_z);
+        let ax = read_f32(&self.staging_acc_x);
+        let ay = read_f32(&self.staging_acc_y);
+        let az = read_f32(&self.staging_acc_z);
+        let density_vec = read_f32(&self.staging_density);
+        let pressure_vec = read_f32(&self.staging_pressure);
+        let ft_u32 = read_u32(&self.staging_fluid_type);
 
         let fluid_type: Vec<crate::particle::FluidType> = ft_u32
             .iter()
@@ -509,19 +566,3 @@ fn build_boundary_grid(
     (counts, offsets, sorted)
 }
 
-/// Block on mapping a staging buffer and read u32 data.
-fn read_u32_buffer(device: &wgpu::Device, buffer: &wgpu::Buffer, count: usize) -> Vec<u32> {
-    let slice = buffer.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        tx.send(result).unwrap();
-    });
-    device.poll(wgpu::Maintain::Wait);
-    rx.recv().unwrap().unwrap();
-
-    let data = slice.get_mapped_range();
-    let result: Vec<u32> = bytemuck::cast_slice(&data)[..count].to_vec();
-    drop(data);
-    buffer.unmap();
-    result
-}

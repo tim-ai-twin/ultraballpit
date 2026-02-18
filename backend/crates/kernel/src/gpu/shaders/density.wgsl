@@ -5,9 +5,14 @@
 //
 // Includes self-contribution, fluid neighbor contributions (via neighbor grid),
 // and boundary particle contributions.
+//
+// Also computes delta-SPH density diffusion (Molteni & Colagrossi 2009):
+//   D_i = delta * h * c_s * sum_j V_j * (rho_i - rho_j) * 2 * (r · gradW) / |r|^2
+// Using the previous step's density for the diffusion source term.
 
 const PI: f32 = 3.14159265358979323846;
 const WENDLAND_C2_NORM_3D: f32 = 0.41780189; // 21 / (16 * PI)
+const DELTA_SPH: f32 = 0.1;
 
 // EOS constants
 const WATER_REST_DENSITY: f32 = 1000.0;
@@ -83,6 +88,21 @@ fn wendland_c2(r: f32, h: f32) -> f32 {
     return WENDLAND_C2_NORM_3D / h3 * t4 * (1.0 + 2.0 * q);
 }
 
+fn wendland_c2_gradient_from_dist_sq(dx: f32, dy: f32, dz: f32, dist_sq: f32, h: f32) -> vec3<f32> {
+    let inv_r = inverseSqrt(dist_sq);
+    let r = dist_sq * inv_r;
+    let q = r / h;
+    if q >= 2.0 || dist_sq < 1.0e-24 {
+        return vec3<f32>(0.0, 0.0, 0.0);
+    }
+
+    let h3 = h * h * h;
+    let one_minus_half_q = 1.0 - 0.5 * q;
+    let t3 = one_minus_half_q * one_minus_half_q * one_minus_half_q;
+    let dw_dr = WENDLAND_C2_NORM_3D / (h3 * h) * (-5.0 * q) * t3;
+    return vec3<f32>(dw_dr * dx * inv_r, dw_dr * dy * inv_r, dw_dr * dz * inv_r);
+}
+
 fn pos_to_cell_i32(px: f32, py: f32, pz: f32) -> vec3<i32> {
     let cx = i32(floor((px - params.domain_min_x) / params.cell_size));
     let cy = i32(floor((py - params.domain_min_y) / params.cell_size));
@@ -115,13 +135,20 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
     let h = params.h;
     let support_radius = 2.0 * h;
     let support_radius_sq = support_radius * support_radius;
+    let eta_sq = 0.01 * h * h;
 
     let px = pos_x[i];
     let py = pos_y[i];
     let pz = pos_z[i];
 
+    // Read old density for delta-SPH diffusion (before overwrite)
+    let old_rho_i = density[i];
+
     // Self-contribution
     var rho = read_mass(i) * wendland_c2(0.0, h);
+
+    // Delta-SPH diffusion accumulator
+    var diff_sum = 0.0;
 
     // Fluid neighbor contributions via neighbor grid
     let cell = pos_to_cell_i32(px, py, pz);
@@ -150,8 +177,17 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
 
                     if dist_sq <= support_radius_sq {
-                        let r = sqrt(dist_sq);
+                        let r = dist_sq * inverseSqrt(max(dist_sq, 1.0e-24));
                         rho = rho + read_mass(j) * wendland_c2(r, h);
+
+                        // Delta-SPH diffusion using previous-step densities
+                        let grad = wendland_c2_gradient_from_dist_sq(ddx, ddy, ddz, dist_sq, h);
+                        let old_rho_j = density[j];
+                        let v_j = read_mass(j) / max(old_rho_j, 1.0);
+                        let r_dot_grad = ddx * grad.x + ddy * grad.y + ddz * grad.z;
+                        // Sign: our r = x_i - x_j, so r·gradW < 0. Use (rho_i - rho_j)
+                        // to get correct diffusion sign (paper uses r_ij = x_j - x_i).
+                        diff_sum = diff_sum + v_j * (old_rho_i - old_rho_j) * 2.0 * r_dot_grad / (dist_sq + eta_sq);
                     }
                 }
             }
@@ -182,7 +218,7 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
 
                         if dist_sq < support_radius_sq {
-                            let r = sqrt(dist_sq);
+                            let r = dist_sq * inverseSqrt(max(dist_sq, 1.0e-24));
                             rho = rho + bnd_mass[b] * wendland_c2(r, h);
                         }
                     }
@@ -190,6 +226,10 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
     }
+
+    // Apply delta-SPH diffusion correction
+    let diffusion = DELTA_SPH * h * params.speed_of_sound * diff_sum;
+    rho = rho + diffusion * params.dt;
 
     density[i] = rho;
 

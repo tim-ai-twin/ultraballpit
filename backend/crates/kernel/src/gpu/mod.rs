@@ -25,6 +25,7 @@ pub mod buffers;
 use std::cell::{Cell, UnsafeCell};
 use std::time::Instant;
 
+use wgpu::util::DeviceExt;
 use buffers::{GpuBuffers, GpuSimParams};
 use crate::boundary::BoundaryParticles;
 use crate::eos;
@@ -50,6 +51,16 @@ pub struct GpuStepProfile {
     pub total_us: u64,
 }
 
+/// Uniform params for the reorder shader.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct ReorderParams {
+    n_particles: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
 /// GPU-accelerated SPH simulation kernel using wgpu compute shaders.
 pub struct GpuKernel {
     // wgpu resources
@@ -66,6 +77,8 @@ pub struct GpuKernel {
     pipeline_forces: wgpu::ComputePipeline,
     pipeline_half_kick: wgpu::ComputePipeline,
     pipeline_drift: wgpu::ComputePipeline,
+    pipeline_xsph: wgpu::ComputePipeline,
+    pipeline_reorder: wgpu::ComputePipeline,
 
     // Bind group layouts -- per-group, per-shader-family
     // Grid shader: groups 0, 3
@@ -83,6 +96,10 @@ pub struct GpuKernel {
     // Integrate shader: groups 0, 1
     bgl_integrate_g0: wgpu::BindGroupLayout,
     bgl_integrate_g1: wgpu::BindGroupLayout,
+
+    // Reorder shader: group 0 (params + perm + source + dest)
+    bgl_reorder_g0: wgpu::BindGroupLayout,
+    reorder_params_buffer: wgpu::Buffer,
 
     // Empty bind group layout for unused group slots in pipeline layouts
     bgl_empty: wgpu::BindGroupLayout,
@@ -126,6 +143,10 @@ pub struct GpuKernel {
     // Grid uses support_radius + skin for neighbor search, so the list
     // remains valid as long as no particle moves more than skin/2.
     verlet_skin: f32,
+
+    // Particle reorder: step counter for periodic Morton-order resorting
+    steps_since_reorder: u32,
+    reorder_interval: u32,
 
     // GPU timestamp query resources for precise profiling
     timestamp_query_set: wgpu::QuerySet,
@@ -297,6 +318,20 @@ impl GpuKernel {
             ),
         });
 
+        let xsph_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("xsph"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/xsph.wgsl").into(),
+            ),
+        });
+
+        let reorder_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("reorder"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/reorder.wgsl").into(),
+            ),
+        });
+
         // --- Bind group layouts ---
         // Empty layout for unused group slots
         let bgl_empty = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -440,6 +475,18 @@ impl GpuKernel {
             ],
         });
 
+        // -- Reorder shader layout (group 0) --
+        // Group 0: params(uniform), perm(read), source(read), dest(rw)
+        let bgl_reorder_g0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("reorder_g0_bgl"),
+            entries: &[
+                bgl_uniform(0),    // reorder params
+                bgl_storage_ro(1), // perm (sorted_indices)
+                bgl_storage_ro(2), // source buffer
+                bgl_storage_rw(3), // dest buffer (temp)
+            ],
+        });
+
         // --- Pipeline layouts ---
         // Grid: uses groups 0 and 3; empty groups at 1 and 2
         let pl_layout_grid = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -545,6 +592,42 @@ impl GpuKernel {
             cache: None,
         });
 
+        // XSPH pipeline (uses forces layout — same bind groups)
+        let pipeline_xsph = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("xsph"),
+            layout: Some(&pl_layout_forces),
+            module: &xsph_shader,
+            entry_point: Some("compute_xsph"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // Reorder pipeline
+        let pl_layout_reorder = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("reorder_pl"),
+            bind_group_layouts: &[&bgl_reorder_g0],
+            push_constant_ranges: &[],
+        });
+        let pipeline_reorder = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("reorder_scatter"),
+            layout: Some(&pl_layout_reorder),
+            module: &reorder_shader,
+            entry_point: Some("scatter"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // Reorder params uniform buffer
+        let reorder_params = ReorderParams {
+            n_particles: particles.len() as u32,
+            _pad0: 0, _pad1: 0, _pad2: 0,
+        };
+        let reorder_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("reorder_params"),
+            contents: bytemuck::bytes_of(&reorder_params),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         // --- Timestamp query resources ---
         // 16 timestamps: pairs of (begin, end) for up to 8 passes
         let timestamp_query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
@@ -578,6 +661,8 @@ impl GpuKernel {
             pipeline_forces,
             pipeline_half_kick,
             pipeline_drift,
+            pipeline_xsph,
+            pipeline_reorder,
             bgl_grid_g0,
             bgl_grid_g3,
             bgl_density_g0,
@@ -589,6 +674,8 @@ impl GpuKernel {
             bgl_forces_g3,
             bgl_integrate_g0,
             bgl_integrate_g1,
+            bgl_reorder_g0,
+            reorder_params_buffer,
             bgl_empty,
             bufs,
             h,
@@ -608,6 +695,8 @@ impl GpuKernel {
             // Verlet skin: fraction of smoothing length. Conservative choice.
             verlet_skin: 0.5 * h,
             verlet_displacement: f32::MAX, // Force first rebuild
+            steps_since_reorder: 0,
+            reorder_interval: 50, // Reorder every 50 steps
             timestamp_query_set,
             timestamp_resolve_buf,
             timestamp_staging_buf,
@@ -812,7 +901,7 @@ impl GpuKernel {
         self.device.poll(wgpu::Maintain::Wait);
     }
 
-    /// Encode integration passes (half_kick, drift, half_kick) into an encoder.
+    /// Encode integration passes (half_kick, xsph, drift) into an encoder.
     fn encode_integrate(&self, encoder: &mut wgpu::CommandEncoder, wg_particles: u32) {
         let bg0 = self.create_integrate_bg0();
         let bg1 = self.create_integrate_bg1();
@@ -829,7 +918,29 @@ impl GpuKernel {
             pass.dispatch_workgroups(wg_particles, 1, 1);
         }
 
-        // Drift: x += v * dt + domain clamping
+        // XSPH: compute smoothed velocity correction, write to acc buffers.
+        // Uses forces-style bind groups (acc as read_write, grid access).
+        // The previous step's neighbor grid is still valid since positions
+        // haven't changed yet in this step.
+        {
+            let xsph_bg0 = self.create_forces_bg0();
+            let xsph_bg1 = self.create_forces_bg1();
+            let xsph_bg2 = self.create_forces_bg2();
+            let xsph_bg3 = self.create_forces_bg3();
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("xsph"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_xsph);
+            pass.set_bind_group(0, &xsph_bg0, &[]);
+            pass.set_bind_group(1, &xsph_bg1, &[]);
+            pass.set_bind_group(2, &xsph_bg2, &[]);
+            pass.set_bind_group(3, &xsph_bg3, &[]);
+            pass.dispatch_workgroups(wg_particles, 1, 1);
+        }
+
+        // Drift: x += (v + xsph_correction) * dt + domain clamping
+        // acc buffers now hold XSPH corrections (from XSPH pass above)
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("drift"),
@@ -894,6 +1005,12 @@ impl GpuKernel {
         if self.needs_init {
             self.compute_forces_gpu(&params);
             self.needs_init = false;
+        }
+
+        // Periodic particle reorder
+        self.steps_since_reorder += 1;
+        if self.steps_since_reorder >= self.reorder_interval {
+            self.reorder_particles();
         }
 
         self.bufs.update_params(&self.queue, &params);
@@ -968,7 +1085,7 @@ impl GpuKernel {
             label: Some("step_profiled"),
         });
 
-        // TS 0-1: Integrate (half_kick + drift)
+        // TS 0-1: Integrate (half_kick + xsph + drift)
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("prof_half_kick"),
@@ -979,6 +1096,19 @@ impl GpuKernel {
             pass.set_pipeline(&self.pipeline_half_kick);
             pass.set_bind_group(0, &integrate_bg0, &[]);
             pass.set_bind_group(1, &integrate_bg1, &[]);
+            pass.dispatch_workgroups(wg_integrate, 1, 1);
+        }
+        // XSPH: compute velocity correction → acc buffers
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("prof_xsph"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_xsph);
+            pass.set_bind_group(0, &forces_bg0, &[]);
+            pass.set_bind_group(1, &forces_bg1, &[]);
+            pass.set_bind_group(2, &forces_bg2, &[]);
+            pass.set_bind_group(3, &forces_bg3, &[]);
             pass.dispatch_workgroups(wg_integrate, 1, 1);
         }
         {
@@ -1161,6 +1291,129 @@ impl GpuKernel {
         let result: Vec<u64> = bytemuck::cast_slice(&data)[..count].to_vec();
         drop(data);
         self.timestamp_staging_buf.unmap();
+        result
+    }
+
+    /// Reorder all particle buffers into spatially-sorted order.
+    ///
+    /// Uses the grid's sorted_indices as a permutation to rearrange particle
+    /// data so that spatially adjacent particles are contiguous in memory.
+    /// This dramatically improves GPU cache hit rates for neighbor traversal.
+    ///
+    /// After reorder, forces a grid rebuild on the next step since particle
+    /// indices have changed.
+    fn reorder_particles(&mut self) {
+        let n = self.bufs.n_particles;
+        if n == 0 {
+            return;
+        }
+
+        let wg = dispatch_size(n, 256);
+        let byte_len = (n as u64) * 4;
+
+        // The buffers to reorder (all f32 or u32 arrays indexed by particle ID).
+        // Mass is skipped (f16-packed, read-only, small cache footprint).
+        let buffers_to_reorder: Vec<&wgpu::Buffer> = vec![
+            &self.bufs.pos_x, &self.bufs.pos_y, &self.bufs.pos_z,
+            &self.bufs.vel_x, &self.bufs.vel_y, &self.bufs.vel_z,
+            &self.bufs.acc_x, &self.bufs.acc_y, &self.bufs.acc_z,
+            &self.bufs.density, &self.bufs.pressure, &self.bufs.fluid_type,
+        ];
+
+        // For each buffer: scatter to temp, then copy temp back.
+        for source_buf in &buffers_to_reorder {
+            // Create bind group: params, perm=sorted_indices, source, dest=temp
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("reorder_bg"),
+                layout: &self.bgl_reorder_g0,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.reorder_params_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.bufs.sorted_indices.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: source_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: self.bufs.reorder_temp.as_entire_binding() },
+                ],
+            });
+
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("reorder"),
+            });
+
+            // Scatter: temp[k] = source[sorted_indices[k]]
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("reorder_scatter"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipeline_reorder);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(wg, 1, 1);
+            }
+
+            // Copy temp back to source
+            encoder.copy_buffer_to_buffer(&self.bufs.reorder_temp, 0, source_buf, 0, byte_len);
+
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // Wait for all reorder operations to complete
+        self.device.poll(wgpu::Maintain::Wait);
+
+        // Also reorder the CPU-side mass_f32 to match
+        if !self.bufs.mass_f32.is_empty() {
+            // Read sorted_indices from GPU
+            let perm = self.read_sorted_indices();
+            let old_mass = self.bufs.mass_f32.clone();
+            for k in 0..n as usize {
+                if k < perm.len() && perm[k] < old_mass.len() {
+                    self.bufs.mass_f32[k] = old_mass[perm[k]];
+                }
+            }
+            // Re-upload packed mass
+            let mass_packed = buffers::pack_mass_f16(&self.bufs.mass_f32);
+            self.queue.write_buffer(
+                &self.bufs.mass,
+                0,
+                bytemuck::cast_slice(&mass_packed),
+            );
+        }
+
+        // Force grid rebuild since particle indices changed
+        self.verlet_displacement = f32::MAX;
+        self.steps_since_reorder = 0;
+    }
+
+    /// Read sorted_indices from GPU (for CPU-side mass reorder).
+    fn read_sorted_indices(&self) -> Vec<usize> {
+        let n = self.bufs.n_particles as usize;
+        // Use the reorder_temp buffer as a staging buffer for this read
+        let byte_len = (n as u64) * 4;
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("perm_staging"),
+            size: byte_len.max(4),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("read_perm"),
+        });
+        encoder.copy_buffer_to_buffer(&self.bufs.sorted_indices, 0, &staging, 0, byte_len);
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+
+        let data = slice.get_mapped_range();
+        let u32_data: &[u32] = bytemuck::cast_slice(&data);
+        let result: Vec<usize> = u32_data[..n].iter().map(|&v| v as usize).collect();
+        drop(data);
+        staging.unmap();
         result
     }
 
@@ -1399,6 +1652,14 @@ impl SimulationKernel for GpuKernel {
         if self.needs_init {
             self.compute_forces_gpu(&params);
             self.needs_init = false;
+        }
+
+        // Periodic particle reorder for cache-friendly memory access.
+        // Done before the step so the grid rebuild this triggers is free
+        // (grid would be rebuilt anyway this step).
+        self.steps_since_reorder += 1;
+        if self.steps_since_reorder >= self.reorder_interval {
+            self.reorder_particles();
         }
 
         // Update params buffer with current dt

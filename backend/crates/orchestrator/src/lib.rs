@@ -151,6 +151,13 @@ pub fn create_kernel(
     domain_min: [f32; 3],
     domain_max: [f32; 3],
 ) -> Box<dyn kernel::SimulationKernel + Send> {
+    // Auto-tune speed of sound based on domain geometry and gravity.
+    // This typically reduces c_s from the (overly conservative) default of 50 m/s
+    // to a physically appropriate value, enabling 2-5x larger timesteps.
+    let speed_of_sound = kernel::sph::auto_tune_speed_of_sound(
+        gravity, domain_min, domain_max, speed_of_sound,
+    );
+
     match backend {
         config::BackendType::Cpu => {
             tracing::info!("Creating CPU simulation kernel...");

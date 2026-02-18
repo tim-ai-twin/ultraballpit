@@ -93,9 +93,11 @@ fn read_mass(idx: u32) -> f32 {
     return pair[idx & 1u];
 }
 
-fn wendland_c2_gradient(dx: f32, dy: f32, dz: f32, r: f32, h: f32) -> vec3<f32> {
+fn wendland_c2_gradient_from_dist_sq(dx: f32, dy: f32, dz: f32, dist_sq: f32, h: f32) -> vec3<f32> {
+    let inv_r = inverseSqrt(dist_sq);
+    let r = dist_sq * inv_r;
     let q = r / h;
-    if q >= 2.0 || r < 1.0e-12 {
+    if q >= 2.0 || dist_sq < 1.0e-24 {
         return vec3<f32>(0.0, 0.0, 0.0);
     }
 
@@ -105,7 +107,6 @@ fn wendland_c2_gradient(dx: f32, dy: f32, dz: f32, r: f32, h: f32) -> vec3<f32> 
 
     let dw_dr = WENDLAND_C2_NORM_3D / (h3 * h) * (-5.0 * q) * t3;
 
-    let inv_r = 1.0 / r;
     return vec3<f32>(dw_dr * dx * inv_r, dw_dr * dy * inv_r, dw_dr * dz * inv_r);
 }
 
@@ -167,7 +168,8 @@ fn update_boundary_pressures(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let dist_sq = dx * dx + dy * dy + dz * dz;
 
                     if dist_sq < support_radius_sq {
-                        let r = sqrt(dist_sq);
+                        let inv_r = inverseSqrt(max(dist_sq, 1.0e-24));
+                        let r = dist_sq * inv_r;
                         let w = wendland_c2(r, h);
                         let g_dot_dr = params.gravity_x * dx + params.gravity_y * dy + params.gravity_z * dz;
                         let p_extrapolated = pressure[f] + density[f] * g_dot_dr;
@@ -253,8 +255,7 @@ fn compute_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
 
                     if dist_sq > support_radius_sq { continue; }
 
-                    let r = sqrt(dist_sq);
-                    let grad = wendland_c2_gradient(ddx, ddy, ddz, r, h);
+                    let grad = wendland_c2_gradient_from_dist_sq(ddx, ddy, ddz, dist_sq, h);
 
                     // Pressure forces
                     let pj_over_rho2_j = pressure[j] / (density[j] * density[j]);
@@ -313,21 +314,21 @@ fn compute_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
 
                         if dist_sq < support_radius_sq {
-                            let r = sqrt(dist_sq);
-                            let grad = wendland_c2_gradient(ddx, ddy, ddz, r, h);
+                            let grad = wendland_c2_gradient_from_dist_sq(ddx, ddy, ddz, dist_sq, h);
                             let pb_over_rho2_b = bnd_pressure[b] / (boundary_rho * boundary_rho);
                             let factor = -m_i * bnd_mass[b] * (pi_clamped_over_rho2 + pb_over_rho2_b);
                             fx = fx + factor * grad.x;
                             fy = fy + factor * grad.y;
                             fz = fz + factor * grad.z;
 
-                            if r < r0 && r > 1.0e-12 {
-                                let s = 1.0 - r / r0;
+                            let inv_r_bnd = inverseSqrt(max(dist_sq, 1.0e-24));
+                            let r_bnd = dist_sq * inv_r_bnd;
+                            if r_bnd < r0 && dist_sq > 1.0e-24 {
+                                let s = 1.0 - r_bnd / r0;
                                 let force_mag = d_repulsive * s * s / r0;
-                                let inv_r = 1.0 / r;
-                                fx = fx + force_mag * ddx * inv_r * m_i;
-                                fy = fy + force_mag * ddy * inv_r * m_i;
-                                fz = fz + force_mag * ddz * inv_r * m_i;
+                                fx = fx + force_mag * ddx * inv_r_bnd * m_i;
+                                fy = fy + force_mag * ddy * inv_r_bnd * m_i;
+                                fz = fz + force_mag * ddz * inv_r_bnd * m_i;
                             }
                         }
                     }
