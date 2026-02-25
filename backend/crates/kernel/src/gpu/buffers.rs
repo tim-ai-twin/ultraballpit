@@ -99,6 +99,22 @@ pub struct GpuBuffers {
     /// Temporary buffer for particle reordering (single buffer reused for each array).
     pub reorder_temp: wgpu::Buffer,
 
+    // PCISPH state buffers (always allocated; unused for WCSPH)
+    pub pcisph_orig_pos_x: wgpu::Buffer,
+    pub pcisph_orig_pos_y: wgpu::Buffer,
+    pub pcisph_orig_pos_z: wgpu::Buffer,
+    pub pcisph_pred_vel_x: wgpu::Buffer,
+    pub pcisph_pred_vel_y: wgpu::Buffer,
+    pub pcisph_pred_vel_z: wgpu::Buffer,
+    pub pcisph_np_acc_x: wgpu::Buffer,
+    pub pcisph_np_acc_y: wgpu::Buffer,
+    pub pcisph_np_acc_z: wgpu::Buffer,
+    pub pcisph_delta: wgpu::Buffer,
+    /// Convergence counter: [0]=sum of density errors (fixed-point), [1]=count of over-compressed
+    pub pcisph_convergence: wgpu::Buffer,
+    /// Staging buffer for convergence readback (2 × u32)
+    pub staging_convergence: wgpu::Buffer,
+
     /// Number of fluid particles
     pub n_particles: u32,
     /// Number of boundary particles
@@ -299,6 +315,21 @@ impl GpuBuffers {
             mapped_at_creation: false,
         });
 
+        // PCISPH state buffers (allocated for all solver types; small overhead)
+        let zeros_f32_n = vec![0.0f32; n.max(1)];
+        let pcisph_orig_pos_x = create_storage_buf(device, "pcisph_orig_pos_x", &zeros_f32_n);
+        let pcisph_orig_pos_y = create_storage_buf(device, "pcisph_orig_pos_y", &zeros_f32_n);
+        let pcisph_orig_pos_z = create_storage_buf(device, "pcisph_orig_pos_z", &zeros_f32_n);
+        let pcisph_pred_vel_x = create_storage_buf(device, "pcisph_pred_vel_x", &zeros_f32_n);
+        let pcisph_pred_vel_y = create_storage_buf(device, "pcisph_pred_vel_y", &zeros_f32_n);
+        let pcisph_pred_vel_z = create_storage_buf(device, "pcisph_pred_vel_z", &zeros_f32_n);
+        let pcisph_np_acc_x = create_storage_buf(device, "pcisph_np_acc_x", &zeros_f32_n);
+        let pcisph_np_acc_y = create_storage_buf(device, "pcisph_np_acc_y", &zeros_f32_n);
+        let pcisph_np_acc_z = create_storage_buf(device, "pcisph_np_acc_z", &zeros_f32_n);
+        let pcisph_delta = create_storage_buf(device, "pcisph_delta", &zeros_f32_n);
+        let pcisph_convergence = create_storage_buf_u32(device, "pcisph_convergence", &[0u32, 0u32]);
+        let staging_convergence = create_staging_buf(device, "staging_convergence", 8); // 2 × u32
+
         Self {
             params_buffer,
             pos_x,
@@ -329,6 +360,18 @@ impl GpuBuffers {
             bnd_sorted_indices,
             mass_f32: particles.mass.clone(),
             reorder_temp,
+            pcisph_orig_pos_x,
+            pcisph_orig_pos_y,
+            pcisph_orig_pos_z,
+            pcisph_pred_vel_x,
+            pcisph_pred_vel_y,
+            pcisph_pred_vel_z,
+            pcisph_np_acc_x,
+            pcisph_np_acc_y,
+            pcisph_np_acc_z,
+            pcisph_delta,
+            pcisph_convergence,
+            staging_convergence,
             staging_density,
             staging_pos_x,
             staging_pos_y,
@@ -474,6 +517,35 @@ impl GpuBuffers {
             temperature: vec![293.15; n],
             fluid_type,
         }
+    }
+
+    /// Read back the PCISPH convergence counters (2 × u32) from GPU.
+    /// Returns (sum_density_error_fixed_point, count_over_compressed).
+    pub fn readback_convergence(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> [u32; 2] {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("readback_convergence"),
+        });
+        encoder.copy_buffer_to_buffer(&self.pcisph_convergence, 0, &self.staging_convergence, 0, 8);
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = self.staging_convergence.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+
+        let data = slice.get_mapped_range();
+        let vals: &[u32] = bytemuck::cast_slice(&data);
+        let result = [vals[0], vals[1]];
+        drop(data);
+        self.staging_convergence.unmap();
+        result
     }
 
     /// Read back only the density buffer from GPU to CPU.

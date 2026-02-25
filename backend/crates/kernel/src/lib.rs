@@ -28,6 +28,15 @@ pub use neighbor::NeighborGrid;
 pub use particle::{FluidType, ParticleArrays};
 pub use sph::{wendland_c2, wendland_c2_gradient};
 
+/// SPH solver type selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SolverType {
+    /// Weakly Compressible SPH (explicit EOS, acoustic CFL).
+    Wcsph,
+    /// Predictive-Corrective Incompressible SPH (iterative pressure solve, advective CFL).
+    Pcisph,
+}
+
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuKernel, GpuStepProfile};
 
@@ -75,6 +84,9 @@ pub trait SimulationKernel {
     /// Restore the last saved checkpoint, undoing any steps since save.
     /// Returns true if restoration succeeded.
     fn restore_checkpoint(&mut self) -> bool { false }
+
+    /// Return the solver type used by this kernel.
+    fn solver_type(&self) -> SolverType;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,10 +131,12 @@ pub struct CpuKernel {
     needs_init: bool,
     /// Saved particle state for optimistic timestepping rollback.
     checkpoint: Option<ParticleArrays>,
+    /// Solver type (WCSPH or PCISPH).
+    solver_type: SolverType,
 }
 
 impl CpuKernel {
-    /// Create a new CPU simulation kernel.
+    /// Create a new CPU simulation kernel (WCSPH solver).
     ///
     /// # Arguments
     /// * `particles` - Initial fluid particle data.
@@ -145,6 +159,27 @@ impl CpuKernel {
         viscosity: f32,
         domain_min: [f32; 3],
         domain_max: [f32; 3],
+    ) -> Self {
+        Self::with_solver(
+            particles, boundary, h, gravity, speed_of_sound,
+            cfl_number, viscosity, domain_min, domain_max,
+            SolverType::Wcsph,
+        )
+    }
+
+    /// Create a new CPU simulation kernel with a specified solver type.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_solver(
+        particles: ParticleArrays,
+        boundary: BoundaryParticles,
+        h: f32,
+        gravity: [f32; 3],
+        speed_of_sound: f32,
+        cfl_number: f32,
+        viscosity: f32,
+        domain_min: [f32; 3],
+        domain_max: [f32; 3],
+        solver_type: SolverType,
     ) -> Self {
         let cell_size = 2.0 * h;
         let grid = NeighborGrid::new(cell_size, domain_min, domain_max);
@@ -170,7 +205,13 @@ impl CpuKernel {
             domain_max,
             needs_init: true,
             checkpoint: None,
+            solver_type,
         }
+    }
+
+    /// Return the solver type.
+    pub fn solver_type(&self) -> SolverType {
+        self.solver_type
     }
 
     /// Compute total energy (kinetic + gravitational potential) for given particles.
@@ -195,6 +236,328 @@ impl CpuKernel {
 }
 
 impl CpuKernel {
+    /// Execute one WCSPH step using Velocity Verlet (kick-drift-kick) integration.
+    fn step_wcsph(&mut self, dt: f32) {
+        let n = self.particles.len();
+        let half_dt = 0.5 * dt;
+
+        // --- 0. Bootstrap: compute initial forces on first step ---
+        if self.needs_init {
+            self.compute_forces(dt);
+            self.needs_init = false;
+        }
+
+        // --- 1. Half-kick: v(t + dt/2) = v(t) + a(t) * dt/2 ---
+        for i in 0..n {
+            self.particles.vx[i] += self.particles.ax[i] * half_dt;
+            self.particles.vy[i] += self.particles.ay[i] * half_dt;
+            self.particles.vz[i] += self.particles.az[i] * half_dt;
+        }
+
+        // --- 2. Drift with XSPH correction: x(t+dt) = x(t) + (v + dv_xsph) * dt ---
+        let (dvx, dvy, dvz) = sph::compute_xsph_correction(
+            &self.particles, &self.grid, self.h,
+        );
+        for i in 0..n {
+            self.particles.x[i] += (self.particles.vx[i] + dvx[i]) * dt;
+            self.particles.y[i] += (self.particles.vy[i] + dvy[i]) * dt;
+            self.particles.z[i] += (self.particles.vz[i] + dvz[i]) * dt;
+        }
+
+        // --- 2b. Boundary collision: clamp positions to domain bounds ---
+        self.boundary.enforce_no_penetration_domain(
+            &mut self.particles,
+            self.domain_min,
+            self.domain_max,
+        );
+
+        // --- 3-7. Compute all forces ---
+        self.compute_forces(dt);
+
+        // --- 8. Second half-kick: v(t + dt) = v(t + dt/2) + a(t + dt) * dt/2 ---
+        for i in 0..n {
+            self.particles.vx[i] += self.particles.ax[i] * half_dt;
+            self.particles.vy[i] += self.particles.ay[i] * half_dt;
+            self.particles.vz[i] += self.particles.az[i] * half_dt;
+        }
+    }
+
+    /// Compute non-pressure forces (viscous + gravity + boundary repulsion).
+    ///
+    /// Used by PCISPH to separate non-pressure from pressure accelerations.
+    /// Returns (ax, ay, az) vectors of non-pressure accelerations.
+    fn compute_non_pressure_forces(&mut self) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let n = self.particles.len();
+        let mut ax = vec![0.0f32; n];
+        let mut ay = vec![0.0f32; n];
+        let mut az = vec![0.0f32; n];
+
+        // Temporarily set particle accelerations to zero, compute forces, then extract
+        let saved_ax: Vec<f32> = self.particles.ax.clone();
+        let saved_ay: Vec<f32> = self.particles.ay.clone();
+        let saved_az: Vec<f32> = self.particles.az.clone();
+
+        for i in 0..n {
+            self.particles.ax[i] = 0.0;
+            self.particles.ay[i] = 0.0;
+            self.particles.az[i] = 0.0;
+        }
+
+        // Viscous forces
+        sph::compute_viscous_forces(
+            &mut self.particles,
+            &self.grid,
+            self.h,
+            self.speed_of_sound,
+        );
+
+        // Gravity
+        sph::apply_gravity(&mut self.particles, self.gravity);
+
+        // Boundary repulsive forces
+        self.boundary.compute_repulsive_forces(
+            &mut self.particles,
+            self.h,
+            self.speed_of_sound,
+        );
+
+        // Extract non-pressure accelerations
+        for i in 0..n {
+            ax[i] = self.particles.ax[i];
+            ay[i] = self.particles.ay[i];
+            az[i] = self.particles.az[i];
+        }
+
+        // Restore saved accelerations
+        self.particles.ax = saved_ax;
+        self.particles.ay = saved_ay;
+        self.particles.az = saved_az;
+
+        (ax, ay, az)
+    }
+
+    /// Execute one PCISPH step (Solenthaler & Pajarola 2009).
+    ///
+    /// The predict-correct approach iterates on pressure until the density
+    /// error is below tolerance, allowing much larger timesteps than WCSPH.
+    fn step_pcisph(&mut self, dt: f32) {
+        let n = self.particles.len();
+        if n == 0 {
+            return;
+        }
+        self.needs_init = false;
+
+        // --- 1. Update neighbor grid ---
+        self.grid.update(
+            &self.particles.x,
+            &self.particles.y,
+            &self.particles.z,
+        );
+
+        // --- 2. Compute density (needed for viscous forces) ---
+        sph::compute_density(
+            &mut self.particles,
+            &self.boundary.x,
+            &self.boundary.y,
+            &self.boundary.z,
+            &self.boundary.mass,
+            &self.grid,
+            self.h,
+        );
+
+        // --- 3. Compute non-pressure forces ---
+        let (np_ax, np_ay, np_az) = self.compute_non_pressure_forces();
+
+        // --- 4. Initialize: predicted velocity from non-pressure forces ---
+        let mut pred_vx: Vec<f32> = self.particles.vx.clone();
+        let mut pred_vy: Vec<f32> = self.particles.vy.clone();
+        let mut pred_vz: Vec<f32> = self.particles.vz.clone();
+
+        for i in 0..n {
+            pred_vx[i] += np_ax[i] * dt;
+            pred_vy[i] += np_ay[i] * dt;
+            pred_vz[i] += np_az[i] * dt;
+        }
+
+        // Warm-start: retain a fraction of previous pressure as initial guess.
+        // Pure reset (standard PCISPH) can't build hydrostatic pressure because
+        // per-step density perturbations from gravity are too small. Warm-starting
+        // lets the pressure field build up over multiple steps.
+        // Factor 0.5 provides stability (prevents over-shoot) while allowing
+        // gradual convergence to the correct pressure field.
+        for i in 0..n {
+            self.particles.pressure[i] *= 0.5;
+        }
+
+        // Compute per-particle PCISPH scaling factors (delta_i) for this timestep.
+        // Per-particle delta ensures surface particles (fewer neighbors) get
+        // appropriately weaker corrections than interior particles.
+        let delta_per_particle = sph::compute_pcisph_per_particle_delta(
+            &self.particles, &self.grid, self.h, dt,
+        );
+        // Save original positions for prediction
+        let orig_x: Vec<f32> = self.particles.x.clone();
+        let orig_y: Vec<f32> = self.particles.y.clone();
+        let orig_z: Vec<f32> = self.particles.z.clone();
+        // --- 5. Pressure correction loop ---
+        let mut iteration = 0u32;
+        let mut pressure_ax = vec![0.0f32; n];
+        let mut pressure_ay = vec![0.0f32; n];
+        let mut pressure_az = vec![0.0f32; n];
+
+        loop {
+            // 5a. Predict positions: x* = x + v* * dt
+            for i in 0..n {
+                self.particles.x[i] = orig_x[i] + pred_vx[i] * dt;
+                self.particles.y[i] = orig_y[i] + pred_vy[i] * dt;
+                self.particles.z[i] = orig_z[i] + pred_vz[i] * dt;
+            }
+
+            // 5b. Update neighbor grid for predicted positions
+            self.grid.update(
+                &self.particles.x,
+                &self.particles.y,
+                &self.particles.z,
+            );
+
+            // 5c. Compute predicted density from predicted positions.
+            // Include boundary particles so that density near walls is correct.
+            sph::compute_density(
+                &mut self.particles,
+                &self.boundary.x,
+                &self.boundary.y,
+                &self.boundary.z,
+                &self.boundary.mass,
+                &self.grid,
+                self.h,
+            );
+
+            // 5d. Compute density error and update pressure (per-particle delta).
+            let mut avg_positive_density_error = 0.0f32;
+            let mut n_over = 0u32;
+            for i in 0..n {
+                let rest_density = match self.particles.fluid_type[i] {
+                    FluidType::Water => eos::WATER_REST_DENSITY,
+                    FluidType::Air => eos::AIR_REST_DENSITY,
+                };
+                let rho_err = self.particles.density[i] - rest_density;
+
+                // Update pressure: p += delta_i * rho_err
+                // Clamp pressure >= 0 (no tension)
+                self.particles.pressure[i] =
+                    (self.particles.pressure[i] + delta_per_particle[i] * rho_err).max(0.0);
+
+                // Track convergence using over-compression only
+                if rho_err > 0.0 {
+                    avg_positive_density_error += rho_err / rest_density;
+                    n_over += 1;
+                }
+            }
+            avg_positive_density_error = if n_over > 0 {
+                avg_positive_density_error / n_over as f32
+            } else {
+                0.0
+            };
+
+            // 5e. Update boundary pressures for pressure force computation
+            self.boundary.update_pressures(
+                &self.particles,
+                &self.grid,
+                self.gravity,
+                self.h,
+            );
+
+            // 5f. Compute pressure acceleration from corrected pressure
+            let (pax, pay, paz) = sph::compute_pressure_acceleration(
+                &self.particles,
+                &self.boundary.x,
+                &self.boundary.y,
+                &self.boundary.z,
+                &self.boundary.mass,
+                &self.boundary.pressure,
+                &self.grid,
+                self.h,
+            );
+            pressure_ax = pax;
+            pressure_ay = pay;
+            pressure_az = paz;
+
+            // 5g. Update predicted velocity: v* = v + (a_non_pressure + a_pressure) * dt
+            for i in 0..n {
+                pred_vx[i] = self.particles.vx[i] + (np_ax[i] + pressure_ax[i]) * dt;
+                pred_vy[i] = self.particles.vy[i] + (np_ay[i] + pressure_ay[i]) * dt;
+                pred_vz[i] = self.particles.vz[i] + (np_az[i] + pressure_az[i]) * dt;
+            }
+
+            iteration += 1;
+
+            // 5h. Check convergence (over-compression error only)
+            if iteration >= sph::PCISPH_MIN_ITERATIONS
+                && (avg_positive_density_error < sph::PCISPH_DENSITY_TOLERANCE
+                    || iteration >= sph::PCISPH_MAX_ITERATIONS)
+            {
+                break;
+            }
+        }
+
+        // --- 6. Final integration ---
+        // Update velocities and positions
+        for i in 0..n {
+            self.particles.vx[i] = pred_vx[i];
+            self.particles.vy[i] = pred_vy[i];
+            self.particles.vz[i] = pred_vz[i];
+        }
+
+        // Final positions: x = x_orig + v_final * dt
+        for i in 0..n {
+            self.particles.x[i] = orig_x[i] + self.particles.vx[i] * dt;
+            self.particles.y[i] = orig_y[i] + self.particles.vy[i] * dt;
+            self.particles.z[i] = orig_z[i] + self.particles.vz[i] * dt;
+        }
+
+        // XSPH smoothing on final velocity
+        let (dvx, dvy, dvz) = sph::compute_xsph_correction(
+            &self.particles, &self.grid, self.h,
+        );
+        for i in 0..n {
+            self.particles.x[i] += dvx[i] * dt;
+            self.particles.y[i] += dvy[i] * dt;
+            self.particles.z[i] += dvz[i] * dt;
+        }
+
+        // Domain clamping
+        self.boundary.enforce_no_penetration_domain(
+            &mut self.particles,
+            self.domain_min,
+            self.domain_max,
+        );
+
+        // Update neighbor grid for final positions
+        self.grid.update(
+            &self.particles.x,
+            &self.particles.y,
+            &self.particles.z,
+        );
+
+        // Recompute final density at corrected positions
+        sph::compute_density(
+            &mut self.particles,
+            &self.boundary.x,
+            &self.boundary.y,
+            &self.boundary.z,
+            &self.boundary.mass,
+            &self.grid,
+            self.h,
+        );
+
+        // Store final accelerations for timestep computation
+        for i in 0..n {
+            self.particles.ax[i] = np_ax[i] + pressure_ax[i];
+            self.particles.ay[i] = np_ay[i] + pressure_ay[i];
+            self.particles.az[i] = np_az[i] + pressure_az[i];
+        }
+    }
+
     /// Run the full force computation pipeline (density, pressure, boundary
     /// pressures, forces) without integration. Used for bootstrapping
     /// initial accelerations for Velocity Verlet.
@@ -285,52 +648,9 @@ impl CpuKernel {
 
 impl SimulationKernel for CpuKernel {
     fn step(&mut self, dt: f32) {
-        let n = self.particles.len();
-        let half_dt = 0.5 * dt;
-
-        // --- 0. Bootstrap: compute initial forces on first step ---
-        // On the very first timestep, all accelerations are zero because no
-        // forces have been computed yet. The first half-kick would do nothing,
-        // producing incorrect results. So we run the force pipeline once first.
-        if self.needs_init {
-            self.compute_forces(dt);
-            self.needs_init = false;
-        }
-
-        // --- 1. Half-kick: v(t + dt/2) = v(t) + a(t) * dt/2 ---
-        for i in 0..n {
-            self.particles.vx[i] += self.particles.ax[i] * half_dt;
-            self.particles.vy[i] += self.particles.ay[i] * half_dt;
-            self.particles.vz[i] += self.particles.az[i] * half_dt;
-        }
-
-        // --- 2. Drift with XSPH correction: x(t+dt) = x(t) + (v + dv_xsph) * dt ---
-        // XSPH smooths the velocity field used for position updates, reducing
-        // particle disorder and improving stability (Monaghan 1989).
-        let (dvx, dvy, dvz) = sph::compute_xsph_correction(
-            &self.particles, &self.grid, self.h,
-        );
-        for i in 0..n {
-            self.particles.x[i] += (self.particles.vx[i] + dvx[i]) * dt;
-            self.particles.y[i] += (self.particles.vy[i] + dvy[i]) * dt;
-            self.particles.z[i] += (self.particles.vz[i] + dvz[i]) * dt;
-        }
-
-        // --- 2b. Boundary collision: clamp positions to domain bounds ---
-        self.boundary.enforce_no_penetration_domain(
-            &mut self.particles,
-            self.domain_min,
-            self.domain_max,
-        );
-
-        // --- 3-7. Compute all forces ---
-        self.compute_forces(dt);
-
-        // --- 8. Second half-kick: v(t + dt) = v(t + dt/2) + a(t + dt) * dt/2 ---
-        for i in 0..n {
-            self.particles.vx[i] += self.particles.ax[i] * half_dt;
-            self.particles.vy[i] += self.particles.ay[i] * half_dt;
-            self.particles.vz[i] += self.particles.az[i] * half_dt;
+        match self.solver_type {
+            SolverType::Wcsph => self.step_wcsph(dt),
+            SolverType::Pcisph => self.step_pcisph(dt),
         }
     }
 
@@ -392,6 +712,10 @@ impl SimulationKernel for CpuKernel {
         } else {
             false
         }
+    }
+
+    fn solver_type(&self) -> SolverType {
+        self.solver_type
     }
 }
 

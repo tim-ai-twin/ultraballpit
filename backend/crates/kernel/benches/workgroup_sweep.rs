@@ -38,6 +38,7 @@ fn bench_workgroup(n_particles: usize, wg_size: u32, n_steps: usize) -> f64 {
         particles, boundary, h,
         [0.0, -9.81, 0.0], 10.0, 0.4, 0.001,
         [0.0; 3], [0.1; 3],
+        kernel::SolverType::Wcsph,
     ).expect("GPU required");
 
     kernel.set_workgroup_size(wg_size);

@@ -52,6 +52,7 @@ fn main() {
             particles, boundary, h,
             [0.0, -9.81, 0.0], 10.0, 0.4, 0.001,
             [0.0; 3], [0.1; 3],
+            kernel::SolverType::Wcsph,
         ).expect("GPU required");
 
         let dt = 1e-5_f32;

@@ -1,5 +1,6 @@
 //! Configuration parsing and validation for SPH simulations
 
+use kernel::SolverType;
 use serde::{Deserialize, Serialize};
 use std::fs;
 
@@ -18,6 +19,32 @@ pub enum BackendType {
 impl Default for BackendType {
     fn default() -> Self {
         Self::Auto
+    }
+}
+
+/// SPH solver type selection for configuration files.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigSolverType {
+    /// Weakly Compressible SPH (explicit EOS, acoustic CFL). Default.
+    Wcsph,
+    /// Predictive-Corrective Incompressible SPH (iterative pressure solve, advective CFL).
+    Pcisph,
+}
+
+impl Default for ConfigSolverType {
+    fn default() -> Self {
+        Self::Wcsph
+    }
+}
+
+impl ConfigSolverType {
+    /// Convert to kernel `SolverType`.
+    pub fn to_kernel_solver_type(&self) -> SolverType {
+        match self {
+            Self::Wcsph => SolverType::Wcsph,
+            Self::Pcisph => SolverType::Pcisph,
+        }
     }
 }
 
@@ -59,6 +86,9 @@ pub struct SimulationConfig {
     /// Compute backend: "cpu", "gpu", or "auto" (default: "auto")
     #[serde(default)]
     pub backend: BackendType,
+    /// SPH solver: "wcsph" or "pcisph" (default: "wcsph")
+    #[serde(default)]
+    pub solver: ConfigSolverType,
 }
 
 /// Fluid type configuration
@@ -295,6 +325,7 @@ mod tests {
             max_time: None,
             cfl_number: default_cfl(),
             backend: BackendType::default(),
+            solver: ConfigSolverType::default(),
         };
 
         assert!((config.smoothing_length() - 0.013).abs() < 1e-6);
@@ -320,6 +351,7 @@ mod tests {
             max_time: None,
             cfl_number: default_cfl(),
             backend: BackendType::default(),
+            solver: ConfigSolverType::default(),
         };
 
         assert!(config.validate().is_err());
@@ -349,6 +381,7 @@ mod tests {
             max_time: None,
             cfl_number: default_cfl(),
             backend: BackendType::default(),
+            solver: ConfigSolverType::default(),
         };
 
         assert!(config.validate().is_err());

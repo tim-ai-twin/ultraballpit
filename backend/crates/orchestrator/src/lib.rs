@@ -101,6 +101,7 @@ pub fn create_simulation(config_path: &str) -> Result<SimulationRunner, Box<dyn 
 
     // 6. Create kernel based on backend config
     let h = config.smoothing_length();
+    let solver_type = config.solver.to_kernel_solver_type();
     let kernel: Box<dyn SimulationKernel + Send> = create_kernel(
         &config.backend,
         fluid_particles,
@@ -112,6 +113,7 @@ pub fn create_simulation(config_path: &str) -> Result<SimulationRunner, Box<dyn 
         config.viscosity,
         config.domain.min,
         config.domain.max,
+        solver_type,
     );
 
     // 7. Wrap in SimulationRunner
@@ -150,6 +152,7 @@ pub fn create_kernel(
     viscosity: f32,
     domain_min: [f32; 3],
     domain_max: [f32; 3],
+    solver_type: kernel::SolverType,
 ) -> Box<dyn kernel::SimulationKernel + Send> {
     // Auto-tune speed of sound based on domain geometry and gravity.
     // This typically reduces c_s from the (overly conservative) default of 50 m/s
@@ -158,21 +161,27 @@ pub fn create_kernel(
         gravity, domain_min, domain_max, speed_of_sound,
     );
 
+    let use_gpu = !matches!(backend, config::BackendType::Cpu);
+
+    if !use_gpu {
+        tracing::info!("Creating CPU simulation kernel (solver={solver_type:?})...");
+        return Box::new(CpuKernel::with_solver(
+            particles,
+            boundary,
+            h,
+            gravity,
+            speed_of_sound,
+            cfl_number,
+            viscosity,
+            domain_min,
+            domain_max,
+            solver_type,
+        ));
+    }
+
+    // GPU path
     match backend {
-        config::BackendType::Cpu => {
-            tracing::info!("Creating CPU simulation kernel...");
-            Box::new(CpuKernel::new(
-                particles,
-                boundary,
-                h,
-                gravity,
-                speed_of_sound,
-                cfl_number,
-                viscosity,
-                domain_min,
-                domain_max,
-            ))
-        }
+        config::BackendType::Cpu => unreachable!(), // handled above
         #[cfg(feature = "gpu")]
         config::BackendType::Gpu => {
             tracing::info!("Creating GPU simulation kernel...");
@@ -186,6 +195,7 @@ pub fn create_kernel(
                 viscosity,
                 domain_min,
                 domain_max,
+                solver_type,
             ) {
                 Ok(gpu) => Box::new(gpu),
                 Err(e) => {
@@ -202,7 +212,6 @@ pub fn create_kernel(
             tracing::info!("Auto-detecting backend...");
             if kernel::gpu::gpu_available() {
                 tracing::info!("GPU available, creating GPU kernel...");
-                // Clone particles/boundary in case GPU init fails and we need CPU fallback
                 let particles_backup = particles.clone();
                 let boundary_backup = boundary.clone();
                 match kernel::GpuKernel::new(
@@ -215,11 +224,12 @@ pub fn create_kernel(
                     viscosity,
                     domain_min,
                     domain_max,
+                    solver_type,
                 ) {
                     Ok(gpu) => Box::new(gpu),
                     Err(e) => {
                         tracing::warn!("GPU init failed ({e}), falling back to CPU");
-                        Box::new(CpuKernel::new(
+                        Box::new(CpuKernel::with_solver(
                             particles_backup,
                             boundary_backup,
                             h,
@@ -229,12 +239,13 @@ pub fn create_kernel(
                             viscosity,
                             domain_min,
                             domain_max,
+                            solver_type,
                         ))
                     }
                 }
             } else {
                 tracing::info!("No GPU available, using CPU kernel");
-                Box::new(CpuKernel::new(
+                Box::new(CpuKernel::with_solver(
                     particles,
                     boundary,
                     h,
@@ -244,13 +255,14 @@ pub fn create_kernel(
                     viscosity,
                     domain_min,
                     domain_max,
+                    solver_type,
                 ))
             }
         }
         #[cfg(not(feature = "gpu"))]
         config::BackendType::Auto => {
             tracing::info!("GPU feature not enabled, using CPU kernel");
-            Box::new(CpuKernel::new(
+            Box::new(CpuKernel::with_solver(
                 particles,
                 boundary,
                 h,
@@ -260,6 +272,7 @@ pub fn create_kernel(
                 viscosity,
                 domain_min,
                 domain_max,
+                solver_type,
             ))
         }
     }

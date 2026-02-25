@@ -11,6 +11,7 @@
 
 use kernel::{
     BoundaryParticles, CpuKernel, FluidType, GpuKernel, ParticleArrays, SimulationKernel,
+    SolverType,
 };
 
 /// Create a small water-box test case with known particle layout.
@@ -100,6 +101,7 @@ fn gpu_cpu_parity_100_steps() {
         viscosity,
         domain_min,
         domain_max,
+        kernel::SolverType::Wcsph,
     );
 
     let mut gpu_kernel = match gpu_result {
@@ -194,4 +196,99 @@ fn gpu_cpu_parity_100_steps() {
         "Density error too large: {:.6e} > 0.30",
         max_density_error
     );
+}
+
+#[test]
+fn gpu_pcisph_smoke_test() {
+    let (particles, boundary, h, gravity, speed_of_sound, cfl_number, viscosity, domain_min, domain_max) =
+        create_water_box();
+
+    let n = particles.len();
+    println!("GPU PCISPH smoke test: {} particles", n);
+
+    let mut gpu_kernel = match GpuKernel::new(
+        particles,
+        boundary,
+        h,
+        gravity,
+        speed_of_sound,
+        cfl_number,
+        viscosity,
+        domain_min,
+        domain_max,
+        SolverType::Pcisph,
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Skipping GPU PCISPH test: {e}");
+            return;
+        }
+    };
+
+    assert_eq!(gpu_kernel.solver_type(), SolverType::Pcisph);
+
+    // Run steps with PCISPH on GPU, checking for NaN after each
+    let dt = 5e-4_f32; // Larger timestep than WCSPH (advective CFL)
+    for step in 0..20 {
+        gpu_kernel.step(dt);
+        let p = gpu_kernel.particles();
+        // Print diagnostics every step
+        let (mut min_rho, mut max_rho) = (f32::MAX, f32::MIN);
+        let (mut min_p, mut max_p) = (f32::MAX, f32::MIN);
+        let (mut max_vel, mut max_acc) = (0.0_f32, 0.0_f32);
+        let mut has_nan = false;
+        for i in 0..n {
+            if !p.x[i].is_finite() || !p.y[i].is_finite() || !p.z[i].is_finite()
+                || !p.density[i].is_finite() || !p.pressure[i].is_finite()
+            {
+                if !has_nan {
+                    println!("  Step {} NaN at particle {}: pos=({:.6}, {:.6}, {:.6}) rho={:.1} p={:.1} vel=({:.6}, {:.6}, {:.6})",
+                        step+1, i, p.x[i], p.y[i], p.z[i], p.density[i], p.pressure[i],
+                        p.vx[i], p.vy[i], p.vz[i]);
+                }
+                has_nan = true;
+            }
+            min_rho = min_rho.min(p.density[i]);
+            max_rho = max_rho.max(p.density[i]);
+            min_p = min_p.min(p.pressure[i]);
+            max_p = max_p.max(p.pressure[i]);
+            let v = (p.vx[i]*p.vx[i] + p.vy[i]*p.vy[i] + p.vz[i]*p.vz[i]).sqrt();
+            max_vel = max_vel.max(v);
+            let a = (p.ax[i]*p.ax[i] + p.ay[i]*p.ay[i] + p.az[i]*p.az[i]).sqrt();
+            max_acc = max_acc.max(a);
+        }
+        println!("  Step {:>2}: rho=[{:.1}, {:.1}] p=[{:.1}, {:.1}] v_max={:.4} a_max={:.1}{}",
+            step+1, min_rho, max_rho, min_p, max_p, max_vel, max_acc,
+            if has_nan { " *** NaN ***" } else { "" });
+        if has_nan {
+            panic!("NaN detected at step {}", step+1);
+        }
+    }
+
+    let p = gpu_kernel.particles();
+    assert_eq!(p.len(), n, "Particle count should be preserved");
+
+    // Check no NaN/Inf
+    for i in 0..n {
+        assert!(p.x[i].is_finite(), "NaN/Inf in x[{}]", i);
+        assert!(p.y[i].is_finite(), "NaN/Inf in y[{}]", i);
+        assert!(p.z[i].is_finite(), "NaN/Inf in z[{}]", i);
+        assert!(p.density[i].is_finite(), "NaN/Inf in density[{}]", i);
+        assert!(p.density[i] > 0.0, "Non-positive density[{}]: {}", i, p.density[i]);
+    }
+
+    let metrics = gpu_kernel.error_metrics();
+    println!("  GPU PCISPH: density_var={:.2}%, mass={:.6}%, energy={:.1}%",
+        metrics.max_density_variation * 100.0,
+        metrics.mass_conservation * 100.0,
+        metrics.energy_conservation * 100.0);
+
+    // Mass should be conserved exactly
+    assert!(
+        metrics.mass_conservation < 0.001,
+        "Mass conservation error: {}",
+        metrics.mass_conservation
+    );
+
+    println!("GPU PCISPH smoke test PASSED");
 }

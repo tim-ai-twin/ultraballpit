@@ -82,6 +82,7 @@ fn benchmark_gpu(n_particles: usize, n_steps: usize) -> Option<GpuResult> {
         particles, boundary, h,
         [0.0, -9.81, 0.0], 10.0, 0.4, 0.001,
         domain_min, domain_max,
+        kernel::SolverType::Wcsph,
     ) {
         Ok(k) => k,
         Err(e) => {

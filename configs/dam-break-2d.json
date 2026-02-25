@@ -20,5 +20,6 @@
   "viscosity": 0.001,
   "initial_temperature": 293.15,
   "max_time": 0.5,
-  "cfl_number": 0.4
+  "cfl_number": 0.4,
+  "solver": "wcsph"
 }

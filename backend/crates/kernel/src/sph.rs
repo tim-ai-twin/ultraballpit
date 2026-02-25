@@ -580,6 +580,267 @@ const MIN_DT: f32 = 1.0e-8;
 /// Maximum allowed timestep (seconds).
 const MAX_DT: f32 = 0.01;
 
+// ---------------------------------------------------------------------------
+// PCISPH: Predictive-Corrective Incompressible SPH (Solenthaler & Pajarola 2009)
+// ---------------------------------------------------------------------------
+
+/// Default PCISPH convergence tolerance (1% mean density error).
+pub const PCISPH_DENSITY_TOLERANCE: f32 = 0.01;
+/// Minimum PCISPH correction iterations (prevents temporal oscillations).
+pub const PCISPH_MIN_ITERATIONS: u32 = 3;
+/// Maximum PCISPH correction iterations (safety cap).
+pub const PCISPH_MAX_ITERATIONS: u32 = 20;
+
+/// Compute per-particle PCISPH scaling factors (delta_i).
+///
+/// Each particle gets its own delta based on its actual neighborhood:
+/// ```text
+/// denom_i = -(|sum_j grad_W_ij|^2 + sum_j |grad_W_ij|^2)
+/// beta = dt^2 * m^2 * 2 / rho_0^2
+/// delta_i = -1 / (beta * denom_i)
+/// ```
+///
+/// Surface particles with fewer neighbors get weaker corrections,
+/// preventing the over-correction artifacts of global delta.
+pub fn compute_pcisph_per_particle_delta(
+    particles: &ParticleArrays,
+    grid: &NeighborGrid,
+    h: f32,
+    dt: f32,
+) -> Vec<f32> {
+    let n = particles.len();
+    let support_radius = 2.0 * h;
+    let mass = if n > 0 { particles.mass[0] } else { return Vec::new() };
+    let rest_density = if n > 0 {
+        match particles.fluid_type[0] {
+            FluidType::Water => WATER_REST_DENSITY,
+            FluidType::Air => AIR_REST_DENSITY,
+        }
+    } else {
+        return Vec::new();
+    };
+
+    let beta = (dt as f64) * (dt as f64) * (mass as f64) * (mass as f64) * 2.0
+        / ((rest_density as f64) * (rest_density as f64));
+
+    let mut deltas = vec![0.0f32; n];
+
+    for i in 0..n {
+        let mut sum_grad_x = 0.0_f64;
+        let mut sum_grad_y = 0.0_f64;
+        let mut sum_grad_z = 0.0_f64;
+        let mut sum_dot = 0.0_f64;
+
+        grid.for_each_neighbor(
+            i,
+            &particles.x,
+            &particles.y,
+            &particles.z,
+            support_radius,
+            |j| {
+                let dx = particles.x[i] - particles.x[j];
+                let dy = particles.y[i] - particles.y[j];
+                let dz = particles.z[i] - particles.z[j];
+                let r = (dx * dx + dy * dy + dz * dz).sqrt();
+                let (gx, gy, gz) = wendland_c2_gradient(dx, dy, dz, r, h);
+                sum_grad_x += gx as f64;
+                sum_grad_y += gy as f64;
+                sum_grad_z += gz as f64;
+                sum_dot += (gx * gx + gy * gy + gz * gz) as f64;
+            },
+        );
+
+        let sum_grad_sq = sum_grad_x * sum_grad_x
+            + sum_grad_y * sum_grad_y
+            + sum_grad_z * sum_grad_z;
+        let denom = -(sum_grad_sq + sum_dot);
+
+        if denom.abs() > 1.0e-30 && beta.abs() > 1.0e-30 {
+            deltas[i] = (-1.0 / (beta * denom)) as f32;
+        }
+    }
+
+    deltas
+}
+
+/// Compute an adaptive timestep using the advective CFL condition (PCISPH).
+///
+/// Unlike the WCSPH timestep which includes speed of sound, the PCISPH
+/// timestep only depends on particle velocity and acceleration:
+/// ```text
+/// dt = CFL * h / v_max
+/// ```
+///
+/// Also includes the force-based criterion as a secondary limit.
+pub fn compute_timestep_advective(
+    particles: &ParticleArrays,
+    h: f32,
+    cfl_number: f32,
+) -> f32 {
+    let mut max_v = 0.0_f32;
+    let mut max_accel = 0.0_f32;
+
+    for i in 0..particles.len() {
+        let v = (particles.vx[i] * particles.vx[i]
+            + particles.vy[i] * particles.vy[i]
+            + particles.vz[i] * particles.vz[i])
+            .sqrt();
+        if v > max_v {
+            max_v = v;
+        }
+        let a = (particles.ax[i] * particles.ax[i]
+            + particles.ay[i] * particles.ay[i]
+            + particles.az[i] * particles.az[i])
+            .sqrt();
+        if a > max_accel {
+            max_accel = a;
+        }
+    }
+
+    // Advective CFL: dt = CFL * h / v_max
+    // Use a floor for v_max to avoid infinite dt at rest
+    let v_floor = 0.1_f32; // 0.1 m/s floor
+    let dt_cfl = cfl_number * h / max_v.max(v_floor);
+
+    // Force-based CFL: dt_force = 0.25 * sqrt(h / max_accel)
+    let dt_force = if max_accel > 1.0e-12 {
+        0.25 * (h / max_accel).sqrt()
+    } else {
+        MAX_DT
+    };
+
+    let dt = dt_cfl.min(dt_force);
+    dt.clamp(MIN_DT, MAX_DT)
+}
+
+/// Compute fluid-only density summation (excluding boundary particles).
+///
+/// Used during PCISPH correction iterations where the density error should
+/// reflect fluid compressibility, not boundary particle contributions.
+/// Boundary forces are handled separately through repulsion.
+pub fn compute_density_fluid_only(
+    particles: &mut ParticleArrays,
+    grid: &NeighborGrid,
+    h: f32,
+) {
+    let n = particles.len();
+    let support_radius = 2.0 * h;
+
+    for i in 0..n {
+        let mut rho = particles.mass[i] * wendland_c2(0.0, h);
+
+        grid.for_each_neighbor(
+            i,
+            &particles.x,
+            &particles.y,
+            &particles.z,
+            support_radius,
+            |j| {
+                let dx = particles.x[i] - particles.x[j];
+                let dy = particles.y[i] - particles.y[j];
+                let dz = particles.z[i] - particles.z[j];
+                let r = (dx * dx + dy * dy + dz * dz).sqrt();
+                rho += particles.mass[j] * wendland_c2(r, h);
+            },
+        );
+
+        particles.density[i] = rho;
+    }
+}
+
+/// Compute pressure forces using only the pressure field (no density update).
+///
+/// Same as `compute_pressure_forces` but meant for use in the PCISPH correction
+/// loop where pressure has been set by the iterative correction, not EOS.
+/// Reuses the same symmetric SPH pressure gradient formulation.
+pub fn compute_pressure_acceleration(
+    particles: &ParticleArrays,
+    boundary_x: &[f32],
+    boundary_y: &[f32],
+    boundary_z: &[f32],
+    boundary_mass: &[f32],
+    boundary_pressure: &[f32],
+    grid: &NeighborGrid,
+    h: f32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let n = particles.len();
+    let support_radius = 2.0 * h;
+
+    let mut ax = vec![0.0f32; n];
+    let mut ay = vec![0.0f32; n];
+    let mut az = vec![0.0f32; n];
+
+    for i in 0..n {
+        let rho_i = particles.density[i];
+        let p_i = particles.pressure[i];
+        let pi_over_rho2_i = p_i / (rho_i * rho_i);
+
+        let mut fx = 0.0f32;
+        let mut fy = 0.0f32;
+        let mut fz = 0.0f32;
+
+        // Fluid-fluid
+        grid.for_each_neighbor(
+            i,
+            &particles.x,
+            &particles.y,
+            &particles.z,
+            support_radius,
+            |j| {
+                let dx = particles.x[i] - particles.x[j];
+                let dy = particles.y[i] - particles.y[j];
+                let dz = particles.z[i] - particles.z[j];
+                let r = (dx * dx + dy * dy + dz * dz).sqrt();
+
+                let (gx, gy, gz) = wendland_c2_gradient(dx, dy, dz, r, h);
+
+                let pj_over_rho2_j =
+                    particles.pressure[j] / (particles.density[j] * particles.density[j]);
+
+                let factor = -particles.mass[j] * (pi_over_rho2_i + pj_over_rho2_j);
+
+                fx += factor * gx;
+                fy += factor * gy;
+                fz += factor * gz;
+            },
+        );
+
+        // Boundary contributions (acceleration = F / m_i)
+        // Clamp fluid pressure >= 0 for boundary interactions (same as WCSPH)
+        let px = particles.x[i];
+        let py = particles.y[i];
+        let pz = particles.z[i];
+        let pi_clamped = p_i.max(0.0);
+        let pi_clamped_over_rho2 = pi_clamped / (rho_i * rho_i);
+        let boundary_rho = match particles.fluid_type[i] {
+            FluidType::Water => WATER_REST_DENSITY,
+            FluidType::Air => AIR_REST_DENSITY,
+        };
+
+        for b in 0..boundary_x.len() {
+            let dx = px - boundary_x[b];
+            let dy = py - boundary_y[b];
+            let dz = pz - boundary_z[b];
+            let r = (dx * dx + dy * dy + dz * dz).sqrt();
+            if r < support_radius {
+                let (gx, gy, gz) = wendland_c2_gradient(dx, dy, dz, r, h);
+                let pb_over_rho2_b = boundary_pressure[b] / (boundary_rho * boundary_rho);
+                // Acceleration from boundary: -m_b * (P_i/rho_i^2 + P_b/rho_b^2) * grad_W
+                let f = -boundary_mass[b] * (pi_clamped_over_rho2 + pb_over_rho2_b);
+                fx += f * gx;
+                fy += f * gy;
+                fz += f * gz;
+            }
+        }
+
+        ax[i] = fx;
+        ay[i] = fy;
+        az[i] = fz;
+    }
+
+    (ax, ay, az)
+}
+
 /// Compute an adaptive timestep using the CFL condition and force-based criterion.
 ///
 /// Three criteria are combined (minimum is used):

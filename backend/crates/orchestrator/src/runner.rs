@@ -4,7 +4,7 @@
 //! lifecycle in a background thread, including start, pause, resume, and
 //! status tracking.
 
-use kernel::{ErrorMetrics, ParticleArrays, SimulationKernel};
+use kernel::{ErrorMetrics, ParticleArrays, SimulationKernel, SolverType};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -204,13 +204,22 @@ fn run_simulation_loop(
             RunnerState::Running => {
                 // Execute one timestep
 
-                // Compute adaptive timestep using CFL condition
-                let dt_safe = kernel::sph::compute_timestep(
-                    kernel.particles(),
-                    h,
-                    speed_of_sound,
-                    cfl_number,
-                );
+                // Compute adaptive timestep using CFL condition.
+                // PCISPH uses advective CFL (no speed of sound term);
+                // WCSPH uses acoustic CFL.
+                let dt_safe = match kernel.solver_type() {
+                    SolverType::Pcisph => kernel::sph::compute_timestep_advective(
+                        kernel.particles(),
+                        h,
+                        cfl_number,
+                    ),
+                    SolverType::Wcsph => kernel::sph::compute_timestep(
+                        kernel.particles(),
+                        h,
+                        speed_of_sound,
+                        cfl_number,
+                    ),
+                };
 
                 // Optimistic timestepping: try a larger dt when not in cooldown
                 let dt_used;
