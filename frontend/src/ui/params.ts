@@ -324,8 +324,8 @@ export class ParamPanel {
     physics.appendChild(
       this.selectRow('fluid', s.fluidType, [
         ['Water', 'water'],
-        ['Air', 'air'],
-        ['Mixed', 'water + air'],
+        ['Air', 'air (CPU only)'],
+        ['Mixed', 'water + air (unstable)'],
       ], (v) => { this.state.fluidType = v as FormState['fluidType']; }),
     );
     physics.appendChild(
@@ -437,6 +437,7 @@ export class ParamPanel {
         this.state.obstacleRadius = minDim * 0.15;
         this.state.obstacleHeight = this.state.domainSize[1];
         this.state.obstacleBoxSize = [minDim * 0.3, minDim * 0.3, minDim * 0.3];
+        this.seatObstacle();
         this.render();
       }),
     );
@@ -463,6 +464,8 @@ export class ParamPanel {
       obstacle.appendChild(
         this.numberRow('height cm', s.obstacleHeight * 100, 0.05, (v) => {
           this.state.obstacleHeight = v / 100;
+          this.seatObstacle();
+          this.render();
         }),
       );
       obstacle.appendChild(
@@ -470,8 +473,16 @@ export class ParamPanel {
           ['x', 'x'],
           ['y', 'y'],
           ['z', 'z'],
-        ], (v) => { this.state.obstacleAxis = v as FormState['obstacleAxis']; }),
+        ], (v) => {
+          this.state.obstacleAxis = v as FormState['obstacleAxis'];
+          this.seatObstacle();
+          this.render();
+        }),
       );
+      const seatHint = document.createElement('div');
+      seatHint.className = 'hint';
+      seatHint.textContent = 'vertical pillars sit on the floor — raise center y to float';
+      obstacle.appendChild(seatHint);
     }
     if (s.obstacle === 'box') {
       obstacle.appendChild(
@@ -488,6 +499,21 @@ export class ParamPanel {
     this.updateEstimate();
   }
 
+  /**
+   * Rest the obstacle on the domain floor. A short pillar centered at
+   * mid-height floats, and water flowing underneath looks like it passes
+   * straight through the obstacle.
+   */
+  private seatObstacle(): void {
+    const s = this.state;
+    const floorY = s.domainMin[1];
+    if (s.obstacle === 'cylinder' && s.obstacleAxis === 'y') {
+      s.obstacleCenter[1] = floorY + s.obstacleHeight / 2;
+    } else if (s.obstacle === 'box') {
+      s.obstacleCenter[1] = floorY + s.obstacleBoxSize[1] / 2;
+    }
+  }
+
   private updateEstimate(): void {
     const el = this.container.querySelector('#particle-estimate');
     if (!el) return;
@@ -496,7 +522,7 @@ export class ParamPanel {
     if (n > 150000) {
       el.innerHTML = `≈ <span class="warn">${pretty} particles — may be slow</span>`;
     } else {
-      el.textContent = `≈ ${pretty} particles`;
+      el.textContent = `≈ ${pretty} particles · coarser = faster`;
     }
   }
 

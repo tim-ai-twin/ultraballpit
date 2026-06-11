@@ -54,6 +54,10 @@ pub struct ConfigInfo {
     pub fluid_type: String,
     /// Estimated particle count
     pub particle_count_estimate: usize,
+    /// True when the config needs periodic boundary conditions, which the
+    /// kernel does not implement yet — the simulation will not behave
+    /// correctly.
+    pub uses_periodic: bool,
 }
 
 /// List of available configurations
@@ -176,10 +180,12 @@ pub async fn list_configs(
         // Try to parse the config
         match orchestrator::config::SimulationConfig::load(path.to_str().unwrap()) {
             Ok(config) => {
-                // Estimate particle count from domain size and spacing
-                let dx = config.domain.max[0] - config.domain.min[0];
-                let dy = config.domain.max[1] - config.domain.min[1];
-                let dz = config.domain.max[2] - config.domain.min[2];
+                // Estimate particle count from the fluid fill region (or the
+                // whole domain when no fluid_region is set)
+                let fill = config.fluid_region.as_ref().unwrap_or(&config.domain);
+                let dx = fill.max[0] - fill.min[0];
+                let dy = fill.max[1] - fill.min[1];
+                let dz = fill.max[2] - fill.min[2];
                 let volume = dx * dy * dz;
                 let particle_volume = config.particle_spacing.powi(3);
                 let particle_count_estimate = (volume / particle_volume) as usize;
@@ -195,12 +201,21 @@ pub async fn list_configs(
                     .unwrap_or("unknown")
                     .to_string();
 
+                use orchestrator::config::{BoundaryType, SimpleBoundary};
+                let bc = &config.boundary_conditions;
+                let uses_periodic = [
+                    &bc.x_min, &bc.x_max, &bc.y_min, &bc.y_max, &bc.z_min, &bc.z_max,
+                ]
+                .iter()
+                .any(|b| matches!(b, BoundaryType::Simple(SimpleBoundary::Periodic)));
+
                 configs.push(ConfigInfo {
                     id,
                     name: config.name.clone(),
                     path: path.to_string_lossy().to_string(),
                     fluid_type: fluid_type.to_string(),
                     particle_count_estimate,
+                    uses_periodic,
                 });
             }
             Err(e) => {

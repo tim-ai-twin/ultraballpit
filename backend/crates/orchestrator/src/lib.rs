@@ -154,7 +154,20 @@ pub fn create_kernel(
         gravity, domain_min, domain_max, speed_of_sound,
     );
 
-    let use_gpu = !matches!(backend, config::BackendType::Cpu);
+    // GPU air support is broken: the shaders carry air EOS constants but
+    // produce NaN positions within a few steps (no GPU test coverage for
+    // air). Until that's fixed, air/mixed simulations run on CPU.
+    let has_air = particles
+        .fluid_type
+        .iter()
+        .any(|t| matches!(t, kernel::FluidType::Air));
+    if has_air && !matches!(backend, config::BackendType::Cpu) {
+        tracing::warn!(
+            "Simulation contains air particles; forcing CPU backend (GPU air support is broken)"
+        );
+    }
+
+    let use_gpu = !matches!(backend, config::BackendType::Cpu) && !has_air;
 
     if !use_gpu {
         tracing::info!("Creating CPU simulation kernel (solver={solver_type:?})...");

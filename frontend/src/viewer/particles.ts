@@ -64,6 +64,14 @@ function speedRamp(t: number, out: [number, number, number]): void {
   }
 }
 
+/** Speed ramp for air particles: smoke gray -> warm white (distinct from water) */
+function airSpeedRamp(t: number, out: [number, number, number]): void {
+  const u = Math.max(0, Math.min(1, t));
+  out[0] = 0.42 + (1.0 - 0.42) * u;
+  out[1] = 0.43 + (0.95 - 0.43) * u;
+  out[2] = 0.46 + (0.82 - 0.46) * u;
+}
+
 /** Diverging density ramp: blue (light) <- white -> red (dense) */
 function densityRamp(t: number, out: [number, number, number]): void {
   const u = Math.max(0, Math.min(1, t));
@@ -203,7 +211,12 @@ export class ParticleRenderer {
               particles.vy[i] * particles.vy[i] +
               particles.vz[i] * particles.vz[i],
           );
-          speedRamp(Math.min(1, speed * inv), rgb);
+          const t = Math.min(1, speed * inv);
+          if (particles.fluidType[i] === FLUID_WATER) {
+            speedRamp(t, rgb);
+          } else {
+            airSpeedRamp(t, rgb);
+          }
           colors[i * 3] = rgb[0];
           colors[i * 3 + 1] = rgb[1];
           colors[i * 3 + 2] = rgb[2];

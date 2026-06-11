@@ -202,14 +202,27 @@ impl SimulationRunner {
         loop {
             // Recompute the adaptive CFL timestep every few steps. Velocities
             // change little across a handful of steps, and on the GPU backend
-            // each `particles()` call costs a device readback.
-            if steps % 4 == 0 {
-                dt = kernel::sph::compute_timestep(
-                    kernel.particles(),
-                    self.h,
-                    self.speed_of_sound,
-                    self.cfl_number,
-                );
+            // each `particles()` call costs a device readback. A 0.9 safety
+            // factor covers velocity growth between recomputes.
+            //
+            // WCSPH is bound by the acoustic CFL (speed of sound); PCISPH's
+            // iterative pressure solve allows the much larger advective CFL.
+            if steps % 16 == 0 {
+                let particles = kernel.particles();
+                dt = 0.85
+                    * match kernel.solver_type() {
+                        kernel::SolverType::Pcisph => kernel::sph::compute_timestep_advective(
+                            particles,
+                            self.h,
+                            self.cfl_number,
+                        ),
+                        kernel::SolverType::Wcsph => kernel::sph::compute_timestep(
+                            particles,
+                            self.h,
+                            self.speed_of_sound,
+                            self.cfl_number,
+                        ),
+                    };
             }
 
             kernel.step(dt);

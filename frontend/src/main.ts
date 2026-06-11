@@ -66,6 +66,7 @@ interface ConfigInfo {
   name: string;
   fluid_type: string;
   particle_count_estimate: number;
+  uses_periodic?: boolean;
 }
 
 async function loadPresets(): Promise<void> {
@@ -80,7 +81,12 @@ async function loadPresets(): Promise<void> {
         cfg.particle_count_estimate >= 1000
           ? `${(cfg.particle_count_estimate / 1000).toFixed(1)}K`
           : `${cfg.particle_count_estimate}`;
-      btn.innerHTML = `${cfg.name}<span class="meta">${cfg.fluid_type.toLowerCase()} · ~${count} particles</span>`;
+      let meta = `${cfg.fluid_type.toLowerCase()} · ~${count} particles`;
+      if (cfg.uses_periodic) {
+        btn.classList.add('unsupported');
+        meta += ` · <span class="badge-warn">needs periodic BCs — not implemented</span>`;
+      }
+      btn.innerHTML = `${cfg.name}<span class="meta">${meta}</span>`;
       btn.addEventListener('click', () => selectPreset(cfg.id, btn));
       configListEl.appendChild(btn);
     }

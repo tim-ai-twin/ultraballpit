@@ -30,8 +30,11 @@ const CMD_RESUME: u8 = 0x02;
 const CMD_ENABLE_DIAGNOSTICS: u8 = 0x04;
 const CMD_DISABLE_DIAGNOSTICS: u8 = 0x05;
 
-/// Wall-clock budget for each stepping batch (per blocking-thread call)
-const STEP_BATCH_BUDGET: Duration = Duration::from_millis(12);
+/// Wall-clock budget for each stepping batch (per blocking-thread call).
+/// Larger batches amortize per-batch overhead (readbacks, health checks,
+/// force recording); the frame builder grabs the kernel lock in the ~1ms
+/// gaps between batches.
+const STEP_BATCH_BUDGET: Duration = Duration::from_millis(24);
 
 /// Frame streaming interval (~30 FPS; all particles are sent each frame)
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);

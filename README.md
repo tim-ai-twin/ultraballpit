@@ -56,7 +56,9 @@ geometries/       # STL geometry files
 
 ## What's Left
 
-- [ ] **Periodic boundary conditions** -- needed to unblock Poiseuille flow and standing wave benchmarks. Requires changes to neighbor grid (wrapped cell search) and boundary enforcement (position wrapping instead of clamping).
+- [ ] **Periodic boundary conditions** -- needed to unblock Poiseuille flow and standing wave benchmarks. Requires changes to neighbor grid (wrapped cell search) and boundary enforcement (position wrapping instead of clamping). The viewer badges these presets as unsupported.
+- [ ] **GPU air support** -- the WGSL shaders carry air EOS constants but air simulations produce NaN within a few steps (no GPU test coverage for air). `create_kernel` currently forces the CPU backend whenever air particles are present.
+- [ ] **Multiphase (Mixed water+air)** -- unstable even on CPU: air particles at the interface read huge densities from water-mass neighbors and the instability detector auto-pauses immediately. Needs a multiphase density/pressure formulation.
 - [ ] **Phase change model** -- liquid/gas transition with energy tracking and tabulated saturation properties (IAPWS-IF97 steam tables). Each particle carries temperature and phase state.
 - [ ] **Thermal model** -- temperature tracking, heat transfer between particles, thermal flux computation at geometry surfaces.
 - [ ] **GPU-accelerated benchmarks** -- re-run validation benchmarks using the GPU kernel for performance comparison.
