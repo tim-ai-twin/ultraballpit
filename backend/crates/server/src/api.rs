@@ -19,7 +19,11 @@ use crate::runner::ForceRecord;
 #[derive(Debug, Deserialize)]
 pub struct CreateSimulationRequest {
     /// Configuration name (e.g., "water-box-1cm")
-    pub config: String,
+    #[serde(default)]
+    pub config: Option<String>,
+    /// Inline configuration JSON (takes precedence over `config`)
+    #[serde(default)]
+    pub config_json: Option<serde_json::Value>,
 }
 
 /// Response for simulation creation
@@ -234,29 +238,55 @@ pub async fn get_config(
 }
 
 /// POST /api/simulations - Create a new simulation
+///
+/// Accepts either `{"config": "<name>"}` referencing a file in the configs
+/// directory, or `{"config_json": {...}}` with a full inline configuration.
 pub async fn create_simulation(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateSimulationRequest>,
 ) -> Result<Json<CreateSimulationResponse>, (StatusCode, String)> {
-    // Construct config path
-    let safe_name = req.config.replace("..", "").replace("/", "");
-    let config_path = state.configs_dir.join(format!("{}.json", safe_name));
+    let (config, config_dir) = if let Some(config_json) = req.config_json {
+        // Inline configuration; relative geometry paths resolve from configs dir
+        let config: orchestrator::config::SimulationConfig =
+            serde_json::from_value(config_json)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid configuration: {}", e)))?;
+        config
+            .validate()
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid configuration: {}", e)))?;
+        (config, state.configs_dir.clone())
+    } else if let Some(name) = req.config {
+        let safe_name = name.replace("..", "").replace("/", "");
+        let config_path = state.configs_dir.join(format!("{}.json", safe_name));
 
-    if !config_path.exists() {
-        return Err((StatusCode::NOT_FOUND, format!("Configuration '{}' not found", req.config)));
-    }
+        if !config_path.exists() {
+            return Err((StatusCode::NOT_FOUND, format!("Configuration '{}' not found", name)));
+        }
 
-    // Load configuration
-    let config = orchestrator::config::SimulationConfig::load(config_path.to_str().unwrap())
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid configuration: {}", e)))?;
+        let config = orchestrator::config::SimulationConfig::load(config_path.to_str().unwrap())
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid configuration: {}", e)))?;
+        let config_dir = config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        (config, config_dir)
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Request must include either 'config' or 'config_json'".to_string(),
+        ));
+    };
 
     // Create simulation ID
     let sim_id = uuid::Uuid::new_v4().to_string();
 
-    // Create simulation runner (resolve geometry paths relative to config directory)
-    let config_dir = config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let runner = crate::runner::SimulationRunner::new(config, config_dir)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create simulation: {}", e)))?;
+    // Runner creation does heavy work (SDF generation, particle placement,
+    // possible GPU init) — run it off the async runtime.
+    let runner = tokio::task::spawn_blocking(move || {
+        crate::runner::SimulationRunner::new(config, &config_dir)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Simulation setup panicked: {}", e)))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create simulation: {}", e)))?;
 
     let particle_count = runner.particle_count();
     let subsample_count = runner.subsample_count();
@@ -338,6 +368,56 @@ pub async fn resume_simulation(
 
     Ok(Json(StatusResponse {
         status: "running".to_string(),
+    }))
+}
+
+/// Obstacle mesh response: flat triangle soup for client-side rendering
+#[derive(Debug, Serialize)]
+pub struct MeshResponse {
+    /// Simulation ID
+    pub simulation_id: String,
+    /// Number of triangles
+    pub triangle_count: usize,
+    /// Vertex positions, 9 floats per triangle (x,y,z × 3 vertices)
+    pub vertices: Vec<f32>,
+}
+
+/// GET /api/simulations/{id}/mesh - Get obstacle geometry triangles
+pub async fn get_mesh(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<MeshResponse>, (StatusCode, String)> {
+    let simulations = state.simulations.lock().unwrap();
+    let runner = simulations.get(&id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Simulation '{}' not found", id)))?;
+
+    let triangles = runner.triangles();
+    let mut vertices = Vec::with_capacity(triangles.len() * 9);
+    for tri in triangles {
+        for v in tri.vertices() {
+            vertices.extend_from_slice(&[v[0], v[1], v[2]]);
+        }
+    }
+
+    Ok(Json(MeshResponse {
+        simulation_id: id,
+        triangle_count: triangles.len(),
+        vertices,
+    }))
+}
+
+/// DELETE /api/simulations/{id} - Stop and remove a simulation
+pub async fn delete_simulation(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<StatusResponse>, (StatusCode, String)> {
+    let mut simulations = state.simulations.lock().unwrap();
+    let runner = simulations.remove(&id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Simulation '{}' not found", id)))?;
+    runner.stop();
+
+    Ok(Json(StatusResponse {
+        status: "deleted".to_string(),
     }))
 }
 

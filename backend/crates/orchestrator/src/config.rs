@@ -48,6 +48,58 @@ impl ConfigSolverType {
     }
 }
 
+/// Axis selection for primitive geometry
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Axis {
+    /// X axis
+    X,
+    /// Y axis
+    Y,
+    /// Z axis
+    Z,
+}
+
+impl Default for Axis {
+    fn default() -> Self {
+        Self::Y
+    }
+}
+
+/// Procedural obstacle geometry (alternative to an STL `geometry_file`)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum GeometryPrimitive {
+    /// No obstacle
+    None,
+    /// Sphere obstacle
+    Sphere {
+        /// Sphere center [x, y, z]
+        center: [f32; 3],
+        /// Sphere radius (meters)
+        radius: f32,
+    },
+    /// Axis-aligned box obstacle
+    Box {
+        /// Minimum corner [x, y, z]
+        min: [f32; 3],
+        /// Maximum corner [x, y, z]
+        max: [f32; 3],
+    },
+    /// Cylinder obstacle along an axis
+    Cylinder {
+        /// Center of the cylinder [x, y, z]
+        center: [f32; 3],
+        /// Cylinder radius (meters)
+        radius: f32,
+        /// Cylinder height (meters)
+        height: f32,
+        /// Cylinder axis (default Y)
+        #[serde(default)]
+        axis: Axis,
+    },
+}
+
 /// Main simulation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulationConfig {
@@ -55,10 +107,17 @@ pub struct SimulationConfig {
     pub name: String,
     /// Which fluid(s) to simulate
     pub fluid_type: ConfigFluidType,
-    /// Path to STL geometry file
-    pub geometry_file: String,
+    /// Path to STL geometry file (optional; alternative to `geometry`)
+    #[serde(default)]
+    pub geometry_file: Option<String>,
+    /// Procedural obstacle geometry (optional; takes precedence over `geometry_file`)
+    #[serde(default)]
+    pub geometry: Option<GeometryPrimitive>,
     /// Simulation domain bounds
     pub domain: DomainBounds,
+    /// Region initially filled with fluid (defaults to the whole domain)
+    #[serde(default)]
+    pub fluid_region: Option<DomainBounds>,
     /// Boundary conditions per face
     #[serde(default)]
     pub boundary_conditions: BoundaryConditions,
@@ -264,6 +323,39 @@ impl SimulationConfig {
         // Validate periodic boundaries are paired
         self.validate_periodic_boundaries()?;
 
+        // Validate fluid region (must be a valid box; clamped to domain at placement)
+        if let Some(region) = &self.fluid_region {
+            for axis in 0..3 {
+                if region.min[axis] >= region.max[axis] {
+                    return Err("fluid_region min must be less than max on every axis".to_string());
+                }
+            }
+        }
+
+        // Validate primitive geometry
+        if let Some(geometry) = &self.geometry {
+            match geometry {
+                GeometryPrimitive::None => {}
+                GeometryPrimitive::Sphere { radius, .. } => {
+                    if *radius <= 0.0 {
+                        return Err("Sphere radius must be positive".to_string());
+                    }
+                }
+                GeometryPrimitive::Box { min, max } => {
+                    for axis in 0..3 {
+                        if min[axis] >= max[axis] {
+                            return Err("Box geometry min must be less than max on every axis".to_string());
+                        }
+                    }
+                }
+                GeometryPrimitive::Cylinder { radius, height, .. } => {
+                    if *radius <= 0.0 || *height <= 0.0 {
+                        return Err("Cylinder radius and height must be positive".to_string());
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -310,7 +402,9 @@ mod tests {
         let config = SimulationConfig {
             name: "test".to_string(),
             fluid_type: ConfigFluidType::Water,
-            geometry_file: "test.stl".to_string(),
+            geometry_file: Some("test.stl".to_string()),
+            geometry: None,
+            fluid_region: None,
             domain: DomainBounds {
                 min: [0.0, 0.0, 0.0],
                 max: [1.0, 1.0, 1.0],
@@ -336,7 +430,9 @@ mod tests {
         let mut config = SimulationConfig {
             name: "test".to_string(),
             fluid_type: ConfigFluidType::Water,
-            geometry_file: "test.stl".to_string(),
+            geometry_file: Some("test.stl".to_string()),
+            geometry: None,
+            fluid_region: None,
             domain: DomainBounds {
                 min: [1.0, 0.0, 0.0],
                 max: [0.0, 1.0, 1.0],
@@ -366,7 +462,9 @@ mod tests {
         let mut config = SimulationConfig {
             name: "test".to_string(),
             fluid_type: ConfigFluidType::Water,
-            geometry_file: "test.stl".to_string(),
+            geometry_file: Some("test.stl".to_string()),
+            geometry: None,
+            fluid_region: None,
             domain: DomainBounds {
                 min: [0.0, 0.0, 0.0],
                 max: [1.0, 1.0, 1.0],

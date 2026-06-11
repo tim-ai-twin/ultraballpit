@@ -1,270 +1,366 @@
-// T039: Main entry point - wire up scene, client, UI components
+// Main entry point: wires scene, transport, parameter panel and HUD.
 
 import { createScene } from './viewer/scene.js';
 import { SimulationClient } from './transport/client.js';
-import { ParticleRenderer } from './viewer/particles.js';
-import { GeometryRenderer } from './viewer/geometry.js';
-import { DiagnosticsOverlay } from './viewer/overlays.js';
-import { ConfigList } from './ui/config-list.js';
-import { SimControls } from './ui/controls.js';
-import { CMD_PAUSE, CMD_RESUME, CMD_ENABLE_DIAGNOSTICS, CMD_DISABLE_DIAGNOSTICS, STATUS_RUNNING, STATUS_PAUSED } from './types/protocol.js';
+import { ParticleRenderer, type ColorMode } from './viewer/particles.js';
+import { ContainerRenderer, type WallSpec } from './viewer/container.js';
+import { ParamPanel } from './ui/params.js';
+import {
+  CMD_PAUSE,
+  CMD_RESUME,
+  STATUS_RUNNING,
+  STATUS_PAUSED,
+  STATUS_FINISHED,
+} from './types/protocol.js';
 
-console.log('SPH Fluid Simulation Viewer initializing...');
-
-// API base URL (empty for relative URLs - works with Vite proxy and production)
 const API_BASE = '';
 
-// Application state
+// --- DOM handles -----------------------------------------------------------
+
+const $ = <T extends HTMLElement>(id: string): T => {
+  const el = document.getElementById(id);
+  if (!el) throw new Error(`Missing element #${id}`);
+  return el as T;
+};
+
+const canvas = $<HTMLCanvasElement>('viewer');
+const configListEl = $('config-list');
+const runBtn = $<HTMLButtonElement>('btn-run');
+const runStatusEl = $('run-status');
+const hudEl = $('hud');
+const legendEl = $('legend');
+const playbackEl = $('playback');
+const emptyHintEl = $('empty-hint');
+const pauseBtn = $<HTMLButtonElement>('btn-pause');
+const restartBtn = $<HTMLButtonElement>('btn-restart');
+const resetViewBtn = $<HTMLButtonElement>('btn-reset-view');
+const colorSel = $<HTMLSelectElement>('sel-color');
+const sizeRng = $<HTMLInputElement>('rng-size');
+const wallsRng = $<HTMLInputElement>('rng-walls');
+
+// --- Scene & renderers ------------------------------------------------------
+
+const sceneComponents = createScene(canvas);
+const { scene, camera, animate, fitToDomain, resetView } = sceneComponents;
+const particleRenderer = new ParticleRenderer(scene);
+const containerRenderer = new ContainerRenderer(scene);
+const paramPanel = new ParamPanel($('params'));
+
+// --- App state ---------------------------------------------------------------
+
 let currentSimulationId: string | null = null;
-let simulationClient: SimulationClient | null = null;
-let particleRenderer: ParticleRenderer | null = null;
-let diagnosticsOverlay: DiagnosticsOverlay | null = null;
+let client: SimulationClient | null = null;
+let paused = false;
+let finished = false;
 
-// Stats tracking
-let frameCount = 0;
-let lastFrameTime = performance.now();
-let fps = 0;
+// Stats
+let renderFrames = 0;
+let dataFrames = 0;
+let lastStatsTime = performance.now();
+let lastDensityVar: number | null = null;
 
-// Initialize scene
-const canvas = document.getElementById('viewer') as HTMLCanvasElement;
-if (!canvas) {
-  throw new Error('Canvas element not found');
+// --- Preset list -------------------------------------------------------------
+
+interface ConfigInfo {
+  id: string;
+  name: string;
+  fluid_type: string;
+  particle_count_estimate: number;
 }
 
-const { scene, animate } = createScene(canvas);
-console.log('Scene initialized');
-
-// Initialize UI components
-const configListContainer = document.getElementById('config-list');
-const controlsContainer = document.getElementById('controls');
-
-if (!configListContainer || !controlsContainer) {
-  throw new Error('UI containers not found');
+async function loadPresets(): Promise<void> {
+  try {
+    const response = await fetch(`${API_BASE}/api/configs`);
+    const data = (await response.json()) as { configs: ConfigInfo[] };
+    configListEl.innerHTML = '';
+    for (const cfg of data.configs) {
+      const btn = document.createElement('button');
+      btn.className = 'preset';
+      const count =
+        cfg.particle_count_estimate >= 1000
+          ? `${(cfg.particle_count_estimate / 1000).toFixed(1)}K`
+          : `${cfg.particle_count_estimate}`;
+      btn.innerHTML = `${cfg.name}<span class="meta">${cfg.fluid_type.toLowerCase()} · ~${count} particles</span>`;
+      btn.addEventListener('click', () => selectPreset(cfg.id, btn));
+      configListEl.appendChild(btn);
+    }
+  } catch (error) {
+    configListEl.innerHTML = '<div class="hint">failed to load presets — is the server running?</div>';
+    console.error('Failed to load configs:', error);
+  }
 }
 
-const configList = new ConfigList(configListContainer);
-const simControls = new SimControls(controlsContainer);
-
-// Load available configs
-configList.refresh().catch((error) => {
-  console.error('Failed to load configs:', error);
-});
-
-// Handle config selection
-configList.onSelect((configName) => {
-  console.log('Config selected:', configName);
-  simControls.setConfigName(configName);
-});
-
-// Handle start simulation
-simControls.onStart(async (configName) => {
-  console.log('Starting simulation with config:', configName);
-  simControls.setStatus('starting');
+async function selectPreset(id: string, btn: HTMLElement): Promise<void> {
+  configListEl.querySelectorAll('.preset').forEach((el) => el.classList.remove('selected'));
+  btn.classList.add('selected');
 
   try {
-    // Create simulation via REST API
+    const response = await fetch(`${API_BASE}/api/configs/${id}`);
+    const json = await response.json();
+    paramPanel.loadConfig(json);
+    runBtn.disabled = false;
+    setRunStatus(`loaded "${id}" — tune & run`);
+  } catch (error) {
+    setRunStatus('failed to load preset', true);
+    console.error(error);
+  }
+}
+
+function setRunStatus(text: string, isError = false): void {
+  runStatusEl.textContent = text;
+  runStatusEl.classList.toggle('error', isError);
+}
+
+// --- Simulation lifecycle ------------------------------------------------------
+
+async function teardownSimulation(): Promise<void> {
+  if (client) {
+    client.disconnect();
+    client = null;
+  }
+  if (currentSimulationId) {
+    fetch(`${API_BASE}/api/simulations/${currentSimulationId}`, { method: 'DELETE' }).catch(
+      () => {},
+    );
+    currentSimulationId = null;
+  }
+}
+
+async function startSimulation(): Promise<void> {
+  runBtn.disabled = true;
+  setRunStatus('building simulation…');
+  await teardownSimulation();
+
+  const config = paramPanel.buildConfig();
+
+  try {
     const response = await fetch(`${API_BASE}/api/simulations`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        config: configName,
-      }),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config_json: config }),
     });
 
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      const text = await response.text();
+      throw new Error(text || `HTTP ${response.status}`);
     }
 
     const data = await response.json();
     currentSimulationId = data.simulation_id;
+    paused = false;
+    finished = false;
+    lastDensityVar = null;
+    updatePauseButton();
 
-    // Build WebSocket URL from current location (works with Vite proxy and production)
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${wsProtocol}//${window.location.host}/ws/simulation/${data.simulation_id}`;
 
-    console.log('Simulation created:', data);
+    client = new SimulationClient();
 
-    // Connect to WebSocket
-    simulationClient = new SimulationClient();
-
-    // Initialize diagnostics overlay
-    diagnosticsOverlay = new DiagnosticsOverlay();
-
-    // Handle SimInfo (sent once on connect)
-    simulationClient.onSimInfo((simInfo) => {
-      console.log('SimInfo received:', simInfo);
-
-      // Initialize particle renderer
-      particleRenderer = new ParticleRenderer(scene);
-
-      // Initialize geometry renderer (available for future use)
-      const geometryRenderer = new GeometryRenderer(scene);
-
-      // Optionally load STL geometry (if available)
-      // geometryRenderer.loadSTL(`${API_BASE}/api/geometry/${currentSimulationId}.stl`);
-      // For now, suppress unused variable warning
-      void geometryRenderer;
-
-      updateStats({ particles: simInfo.particleCount });
-    });
-
-    // Handle Frame updates
-    simulationClient.onFrame((frame) => {
-      // Update particle renderer
-      if (particleRenderer) {
-        particleRenderer.update(frame.particles, frame.particleCount);
+    client.onSimInfo((info) => {
+      fitToDomain(info.domainMin, info.domainMax);
+      containerRenderer.build(info.domainMin, info.domainMax, paramPanel.wallSpec() as WallSpec);
+      containerRenderer.setWallOpacity(parseFloat(wallsRng.value));
+      if (currentSimulationId) {
+        containerRenderer.loadObstacle(currentSimulationId);
       }
 
-      // Update stats
-      updateStats({
-        frame: Number(frame.frameNumber),
-        time: frame.simTime.toFixed(4),
-        particles: frame.particleCount,
-      });
+      particleRenderer.setParticleRadius(info.particleSpacing * 0.5);
+      particleRenderer.setSizeScale(parseFloat(sizeRng.value));
+      particleRenderer.setColorMode(colorSel.value as ColorMode);
+      particleRenderer.updateProjection(camera, canvas.clientHeight);
 
-      // Calculate FPS
-      frameCount++;
-      const now = performance.now();
-      if (now - lastFrameTime >= 1000) {
-        fps = Math.round((frameCount * 1000) / (now - lastFrameTime));
-        frameCount = 0;
-        lastFrameTime = now;
-        updateStats({ fps });
-      }
+      hudEl.style.display = '';
+      legendEl.style.display = '';
+      playbackEl.style.display = 'flex';
+      emptyHintEl.classList.add('hidden');
+
+      $('st-particles').textContent = formatCount(info.particleCount);
+      setHudStatus('running');
+      setRunStatus(
+        `running · ${formatCount(info.particleCount)} particles · ${info.solver === 1 ? 'PCISPH' : 'WCSPH'}`,
+      );
+      runBtn.disabled = false;
     });
 
-    // Handle diagnostics updates
-    simulationClient.onDiagnostics((diagnostics) => {
-      if (diagnosticsOverlay && diagnosticsOverlay.isVisible()) {
-        diagnosticsOverlay.update(diagnostics);
-      }
+    client.onFrame((frame) => {
+      particleRenderer.update(frame.particles, frame.particleCount);
+      dataFrames++;
+
+      $('st-time').textContent = formatSimTime(frame.simTime);
+      $('st-dt').textContent = `${(frame.dt * 1e6).toFixed(1)}µs`;
+      $('st-sps').textContent = `${Math.round(frame.stepsPerSec)}/s`;
+      const rtf = frame.stepsPerSec * frame.dt;
+      $('st-rtf').textContent = rtf >= 0.095 ? `${rtf.toFixed(2)}` : `${rtf.toFixed(3)}`;
+      $('st-particles').textContent = formatCount(frame.particleCount);
+      updateLegend();
     });
 
-    // Handle status updates
-    simulationClient.onStatus((status) => {
-      console.log('SimStatus received:', status);
+    client.onDiagnostics((diag) => {
+      lastDensityVar = diag.maxDensityVariation;
+      $('st-density').textContent = `${(diag.maxDensityVariation * 100).toFixed(1)}%`;
+    });
 
+    client.onStatus((status) => {
       if (status.status === STATUS_RUNNING) {
-        simControls.setStatus('running');
+        paused = false;
+        finished = false;
+        setHudStatus('running');
       } else if (status.status === STATUS_PAUSED) {
-        simControls.setStatus('paused');
+        paused = true;
+        setHudStatus('paused');
+      } else if (status.status === STATUS_FINISHED) {
+        finished = true;
+        setHudStatus('finished');
+        setRunStatus('simulation reached max time — restart or tweak & rerun');
       } else {
-        simControls.setStatus(status.message);
+        setHudStatus('error');
+        setRunStatus(status.message, true);
       }
+      updatePauseButton();
     });
 
-    // Connect to WebSocket
-    simulationClient.connect(wsUrl);
-    simControls.setStatus('connecting');
-
-    // After connection, status will be updated via onStatus callback
-    setTimeout(() => {
-      if (simControls) {
-        simControls.setStatus('running');
-      }
-    }, 500);
+    client.connect(wsUrl);
   } catch (error) {
     console.error('Failed to start simulation:', error);
-    simControls.setStatus('error');
-    alert('Failed to start simulation: ' + (error as Error).message);
-  }
-});
-
-// Handle pause
-simControls.onPause(() => {
-  console.log('Pausing simulation');
-  if (simulationClient) {
-    simulationClient.sendCommand(CMD_PAUSE);
-    simControls.setStatus('paused');
-  }
-
-  // Also call REST API
-  if (currentSimulationId) {
-    fetch(`${API_BASE}/api/simulations/${currentSimulationId}/pause`, {
-      method: 'POST',
-    }).catch((error) => {
-      console.error('Failed to pause via REST API:', error);
-    });
-  }
-});
-
-// Handle resume
-simControls.onResume(() => {
-  console.log('Resuming simulation');
-  if (simulationClient) {
-    simulationClient.sendCommand(CMD_RESUME);
-    simControls.setStatus('running');
-  }
-
-  // Also call REST API
-  if (currentSimulationId) {
-    fetch(`${API_BASE}/api/simulations/${currentSimulationId}/resume`, {
-      method: 'POST',
-    }).catch((error) => {
-      console.error('Failed to resume via REST API:', error);
-    });
-  }
-});
-
-// Handle diagnostics toggle
-simControls.onDiagnosticsToggle((enabled) => {
-  console.log('Diagnostics toggled:', enabled);
-
-  if (diagnosticsOverlay) {
-    if (enabled) {
-      diagnosticsOverlay.show();
-    } else {
-      diagnosticsOverlay.hide();
-    }
-  }
-
-  if (simulationClient) {
-    const command = enabled ? CMD_ENABLE_DIAGNOSTICS : CMD_DISABLE_DIAGNOSTICS;
-    simulationClient.sendCommand(command);
-  }
-});
-
-// Update stats display
-function updateStats(data: {
-  fps?: number;
-  particles?: number;
-  frame?: number;
-  time?: string;
-}): void {
-  if (data.fps !== undefined) {
-    const fpsEl = document.getElementById('stats-fps');
-    if (fpsEl) fpsEl.textContent = `FPS: ${data.fps}`;
-  }
-
-  if (data.particles !== undefined) {
-    const particlesEl = document.getElementById('stats-particles');
-    if (particlesEl) {
-      const formatted = data.particles >= 1000
-        ? `${(data.particles / 1000).toFixed(1)}K`
-        : data.particles.toString();
-      particlesEl.textContent = `Particles: ${formatted}`;
-    }
-  }
-
-  if (data.frame !== undefined) {
-    const frameEl = document.getElementById('stats-frame');
-    if (frameEl) frameEl.textContent = `Frame: ${data.frame}`;
-  }
-
-  if (data.time !== undefined) {
-    const timeEl = document.getElementById('stats-time');
-    if (timeEl) timeEl.textContent = `Time: ${data.time}s`;
+    setRunStatus(`failed: ${(error as Error).message}`.slice(0, 120), true);
+    runBtn.disabled = false;
   }
 }
 
-// Animation loop
+// --- HUD helpers ---------------------------------------------------------------
+
+function setHudStatus(label: 'running' | 'paused' | 'finished' | 'error' | 'idle'): void {
+  $('hud-label').textContent = label;
+  const dot = $('hud-dot');
+  dot.className = '';
+  if (label !== 'idle') dot.classList.add(label);
+}
+
+function formatCount(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : `${n}`;
+}
+
+function formatSimTime(t: number): string {
+  if (t < 1.0) return `${(t * 1000).toFixed(1)}ms`;
+  return `${t.toFixed(3)}s`;
+}
+
+function updatePauseButton(): void {
+  pauseBtn.textContent = paused ? 'Resume' : 'Pause';
+  pauseBtn.classList.toggle('is-paused', paused);
+  pauseBtn.disabled = finished;
+}
+
+const LEGEND_GRADIENTS: Record<ColorMode, string> = {
+  speed: 'linear-gradient(90deg, #0d3a8c, #1aa6f2, #ffffff)',
+  density: 'linear-gradient(90deg, #2e73f2, #ebf0f5, #f25940)',
+  temperature: 'linear-gradient(90deg, #408cf2, #ffb854)',
+  type: 'linear-gradient(90deg, #298cf2 49%, #c7ccd6 51%)',
+};
+
+function updateLegend(): void {
+  const mode = colorSel.value as ColorMode;
+  const label = $('legend-label');
+  const min = $('legend-min');
+  const max = $('legend-max');
+  ($('legend-bar') as HTMLElement).style.background = LEGEND_GRADIENTS[mode];
+
+  switch (mode) {
+    case 'speed':
+      label.textContent = 'particle speed';
+      min.textContent = '0';
+      max.textContent = `${particleRenderer ? speedMax() : '—'}`;
+      break;
+    case 'density':
+      label.textContent = 'density / rest';
+      min.textContent = '0.95';
+      max.textContent = '1.05';
+      break;
+    case 'temperature':
+      label.textContent = 'temperature';
+      min.textContent = '283K';
+      max.textContent = '323K';
+      break;
+    case 'type':
+      label.textContent = 'fluid type';
+      min.textContent = 'water';
+      max.textContent = 'air';
+      break;
+  }
+}
+
+function speedMax(): string {
+  const v = particleRenderer.speedScale;
+  return v >= 1 ? `${v.toFixed(1)}m/s` : `${(v * 100).toFixed(0)}cm/s`;
+}
+
+// --- Wire up controls -------------------------------------------------------------
+
+runBtn.addEventListener('click', () => { void startSimulation(); });
+
+pauseBtn.addEventListener('click', () => {
+  if (!client) return;
+  if (paused) {
+    client.sendCommand(CMD_RESUME);
+    paused = false;
+    setHudStatus('running');
+  } else {
+    client.sendCommand(CMD_PAUSE);
+    paused = true;
+    setHudStatus('paused');
+  }
+  updatePauseButton();
+});
+
+restartBtn.addEventListener('click', () => { void startSimulation(); });
+resetViewBtn.addEventListener('click', () => resetView());
+
+colorSel.addEventListener('change', () => {
+  particleRenderer.setColorMode(colorSel.value as ColorMode);
+  updateLegend();
+});
+
+sizeRng.addEventListener('input', () => {
+  particleRenderer.setSizeScale(parseFloat(sizeRng.value));
+});
+
+wallsRng.addEventListener('input', () => {
+  containerRenderer.setWallOpacity(parseFloat(wallsRng.value));
+});
+
+// Keyboard: space toggles pause
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' && client && !finished && (e.target as HTMLElement).tagName !== 'INPUT' && (e.target as HTMLElement).tagName !== 'SELECT') {
+    e.preventDefault();
+    pauseBtn.click();
+  }
+});
+
+// --- Stats ticker ------------------------------------------------------------------
+
+setInterval(() => {
+  const now = performance.now();
+  const dtSec = (now - lastStatsTime) / 1000;
+  lastStatsTime = now;
+  if (hudEl.style.display !== 'none') {
+    $('st-fps').textContent = `${Math.round(renderFrames / dtSec)}`;
+    $('st-data-fps').textContent = `${Math.round(dataFrames / dtSec)}`;
+    if (lastDensityVar === null) $('st-density').textContent = '—';
+  }
+  renderFrames = 0;
+  dataFrames = 0;
+}, 1000);
+
+// --- Render loop --------------------------------------------------------------------
+
 function animationLoop(): void {
   requestAnimationFrame(animationLoop);
+  particleRenderer.updateProjection(camera, canvas.clientHeight);
   animate();
+  renderFrames++;
 }
 
-// Start animation
+void loadPresets();
 animationLoop();
-console.log('Animation loop started');
+console.log('ultraballpit viewer ready');

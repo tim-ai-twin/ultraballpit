@@ -67,7 +67,11 @@ async fn main() {
         .route("/configs", get(api::list_configs))
         .route("/configs/:name", get(api::get_config))
         .route("/simulations", post(api::create_simulation))
-        .route("/simulations/:id", get(api::get_simulation))
+        .route(
+            "/simulations/:id",
+            get(api::get_simulation).delete(api::delete_simulation),
+        )
+        .route("/simulations/:id/mesh", get(api::get_mesh))
         .route("/simulations/:id/pause", post(api::pause_simulation))
         .route("/simulations/:id/resume", post(api::resume_simulation))
         .route("/simulations/:id/forces", get(api::get_forces))

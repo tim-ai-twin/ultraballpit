@@ -2,6 +2,12 @@
 
 Particle-based fluid simulation (WCSPH) around 3D STL geometry with interactive web visualization and force reporting. Built with a Rust backend and Three.js frontend.
 
+![Dam break 3D — speed-colored particles in a boundary-condition-coded container](docs/screenshots/dam-break-3d.png)
+
+| Wave wrapping a pillar obstacle | Splash around a UI-configured sphere |
+|---|---|
+| ![Dam break against a cylinder pillar](docs/screenshots/dam-break-pillar.png) | ![Sloshing wave around a sphere obstacle](docs/screenshots/sphere-obstacle-splash.png) |
+
 ## Quick Start
 
 ```sh
@@ -39,8 +45,8 @@ geometries/       # STL geometry files
 - **SPH kernel** with adaptive timestep (CFL condition), uniform grid neighbor search, SDF-based boundary handling
 - **CPU and GPU (Metal) backends** with identical physics
 - **Orchestrator** for STL-to-SDF geometry pipeline, domain setup, simulation config
-- **HTTP server** with WebSocket streaming of particle state
-- **Three.js frontend** with orbit camera, particle rendering, diagnostic overlays
+- **HTTP server** with WebSocket streaming of full particle state (positions + velocities, 30 fps), GPU-backed simulation runner, inline config API, obstacle mesh endpoint
+- **Three.js frontend**: sphere-shaded particles at physical size with speed/density/temperature color modes, boundary-condition-coded container rendering, editable parameter panel (solver, resolution, gravity, domain size, per-wall BCs, fluid fill region, procedural obstacles), live telemetry HUD (dt, steps/s, realtime factor)
 - **Force extraction** (pressure, viscous, net forces on geometry surfaces)
 - **Distributed execution** infrastructure for multi-instance simulation
 - **Reference test suite** (gravity settling, hydrostatic pressure, pressure equalization)

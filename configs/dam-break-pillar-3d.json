@@ -1,0 +1,36 @@
+{
+  "name": "Dam Break 3D vs Pillar",
+  "fluid_type": "Water",
+  "geometry": {
+    "type": "cylinder",
+    "center": [0.075, 0.04, 0.03],
+    "radius": 0.008,
+    "height": 0.08,
+    "axis": "y"
+  },
+  "domain": {
+    "min": [0.0, 0.0, 0.0],
+    "max": [0.12, 0.08, 0.06]
+  },
+  "fluid_region": {
+    "min": [0.0, 0.0, 0.0],
+    "max": [0.036, 0.06, 0.06]
+  },
+  "boundary_conditions": {
+    "x_min": "Wall",
+    "x_max": "Wall",
+    "y_min": "Wall",
+    "y_max": "Outflow",
+    "z_min": "Wall",
+    "z_max": "Wall"
+  },
+  "particle_spacing": 0.0025,
+  "gravity": [0.0, -9.81, 0.0],
+  "speed_of_sound": 20.0,
+  "viscosity": 0.001,
+  "initial_temperature": 293.15,
+  "max_time": 2.5,
+  "cfl_number": 0.4,
+  "backend": "auto",
+  "solver": "wcsph"
+}

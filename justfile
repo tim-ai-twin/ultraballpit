@@ -19,9 +19,10 @@ serve:
 # Run all tests
 test: test-backend test-frontend
 
-# Run backend tests only
+# Run backend tests only (fast: excludes reference-tests, whose physics
+# validation sims are debug-build slow — use test-reference / test-benchmarks)
 test-backend:
-    cd backend && cargo test --workspace
+    cd backend && cargo test --workspace --exclude reference-tests
 
 # Run frontend tests only
 test-frontend:

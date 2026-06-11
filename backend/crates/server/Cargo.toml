@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "server"
 path = "src/main.rs"
 
+[features]
+default = ["gpu"]
+gpu = ["orchestrator/gpu", "kernel/gpu"]
+
 [dependencies]
 orchestrator = { path = "../orchestrator" }
 kernel = { path = "../kernel" }

@@ -62,10 +62,7 @@ fn benchmark_dam_break() {
     let config = SimulationConfig::load(&config_path).expect("Failed to load config");
     let config_file = Path::new(&config_path);
     let config_dir = config_file.parent().expect("Invalid config path");
-    let geometry_path = config_dir.join(&config.geometry_file);
-    let mesh = geometry::load_stl(
-        geometry_path.to_str().expect("Invalid geometry path"),
-    ).expect("Failed to load STL");
+    let mesh = geometry::resolve_geometry(&config, config_dir).expect("Failed to load geometry");
     let sdf = geometry::mesh_to_sdf(&mesh, &config.domain, 0.5 * config.particle_spacing);
 
     // Get boundary particles from standard setup

@@ -32,6 +32,161 @@ pub fn load_stl(path: &str) -> Result<Vec<Triangle>, String> {
     Ok(mesh.triangles().to_vec())
 }
 
+/// Generate triangles for a procedural obstacle primitive
+pub fn primitive_triangles(prim: &crate::config::GeometryPrimitive) -> Vec<Triangle> {
+    use crate::config::{Axis, GeometryPrimitive};
+
+    let mut tris: Vec<([f32; 3], [f32; 3], [f32; 3])> = Vec::new();
+
+    match prim {
+        GeometryPrimitive::None => {}
+        GeometryPrimitive::Sphere { center, radius } => {
+            // UV sphere
+            let segments = 32usize;
+            let rings = 16usize;
+            let pt = |ring: usize, seg: usize| -> [f32; 3] {
+                let theta = std::f32::consts::PI * ring as f32 / rings as f32;
+                let phi = 2.0 * std::f32::consts::PI * seg as f32 / segments as f32;
+                [
+                    center[0] + radius * theta.sin() * phi.cos(),
+                    center[1] + radius * theta.cos(),
+                    center[2] + radius * theta.sin() * phi.sin(),
+                ]
+            };
+            for ring in 0..rings {
+                for seg in 0..segments {
+                    let a = pt(ring, seg);
+                    let b = pt(ring + 1, seg);
+                    let c = pt(ring + 1, seg + 1);
+                    let d = pt(ring, seg + 1);
+                    if ring > 0 {
+                        tris.push((a, b, d));
+                    }
+                    if ring < rings - 1 {
+                        tris.push((b, c, d));
+                    }
+                }
+            }
+        }
+        GeometryPrimitive::Box { min, max } => {
+            let v = |ix: usize, iy: usize, iz: usize| -> [f32; 3] {
+                [
+                    if ix == 0 { min[0] } else { max[0] },
+                    if iy == 0 { min[1] } else { max[1] },
+                    if iz == 0 { min[2] } else { max[2] },
+                ]
+            };
+            // 6 faces, outward winding (CCW seen from outside)
+            let faces = [
+                // -X, +X
+                [v(0, 0, 0), v(0, 0, 1), v(0, 1, 1), v(0, 1, 0)],
+                [v(1, 0, 0), v(1, 1, 0), v(1, 1, 1), v(1, 0, 1)],
+                // -Y, +Y
+                [v(0, 0, 0), v(1, 0, 0), v(1, 0, 1), v(0, 0, 1)],
+                [v(0, 1, 0), v(0, 1, 1), v(1, 1, 1), v(1, 1, 0)],
+                // -Z, +Z
+                [v(0, 0, 0), v(0, 1, 0), v(1, 1, 0), v(1, 0, 0)],
+                [v(0, 0, 1), v(1, 0, 1), v(1, 1, 1), v(0, 1, 1)],
+            ];
+            for f in faces {
+                tris.push((f[0], f[1], f[2]));
+                tris.push((f[0], f[2], f[3]));
+            }
+        }
+        GeometryPrimitive::Cylinder {
+            center,
+            radius,
+            height,
+            axis,
+        } => {
+            let segments = 32usize;
+            let half = height * 0.5;
+            // Build in local coords (axis = Y), then swizzle
+            let swizzle = |p: [f32; 3]| -> [f32; 3] {
+                let local = match axis {
+                    Axis::X => [p[1], p[0], p[2]],
+                    Axis::Y => p,
+                    Axis::Z => [p[0], p[2], p[1]],
+                };
+                [
+                    center[0] + local[0],
+                    center[1] + local[1],
+                    center[2] + local[2],
+                ]
+            };
+            let rim = |seg: usize, y: f32| -> [f32; 3] {
+                let phi = 2.0 * std::f32::consts::PI * seg as f32 / segments as f32;
+                swizzle([radius * phi.cos(), y, radius * phi.sin()])
+            };
+            let top_center = swizzle([0.0, half, 0.0]);
+            let bottom_center = swizzle([0.0, -half, 0.0]);
+            for seg in 0..segments {
+                let a0 = rim(seg, -half);
+                let a1 = rim(seg + 1, -half);
+                let b0 = rim(seg, half);
+                let b1 = rim(seg + 1, half);
+                // Side
+                tris.push((a0, b0, b1));
+                tris.push((a0, b1, a1));
+                // Caps
+                tris.push((bottom_center, a1, a0));
+                tris.push((top_center, b0, b1));
+            }
+        }
+    }
+
+    tris.into_iter()
+        .map(|(a, b, c)| {
+            // Face normal from the cross product of two edges
+            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let w = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let mut n = [
+                u[1] * w[2] - u[2] * w[1],
+                u[2] * w[0] - u[0] * w[2],
+                u[0] * w[1] - u[1] * w[0],
+            ];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            if len > 1e-12 {
+                n = [n[0] / len, n[1] / len, n[2] / len];
+            }
+            Triangle::new(n, [a, b, c])
+        })
+        .collect()
+}
+
+/// Create an "empty" SDF (no geometry anywhere): all distances far positive.
+///
+/// Used when a simulation has no obstacle, avoiding degenerate SDF generation
+/// from an empty triangle list.
+pub fn empty_sdf(domain_min: [f32; 3], domain_max: [f32; 3], cell_size: f32) -> GridSDF {
+    let nx = ((domain_max[0] - domain_min[0]) / cell_size).ceil() as u32 + 1;
+    let ny = ((domain_max[1] - domain_min[1]) / cell_size).ceil() as u32 + 1;
+    let nz = ((domain_max[2] - domain_min[2]) / cell_size).ceil() as u32 + 1;
+    GridSDF {
+        origin: domain_min,
+        cell_size,
+        dimensions: [nx, ny, nz],
+        distances: vec![1e9; (nx * ny * nz) as usize],
+    }
+}
+
+/// Resolve a config's obstacle geometry to a triangle list.
+///
+/// Priority: `geometry` primitive > `geometry_file` STL > no obstacle (empty).
+pub fn resolve_geometry(
+    config: &crate::config::SimulationConfig,
+    config_dir: &std::path::Path,
+) -> Result<Vec<Triangle>, String> {
+    if let Some(prim) = &config.geometry {
+        return Ok(primitive_triangles(prim));
+    }
+    if let Some(file) = &config.geometry_file {
+        let path = config_dir.join(file);
+        return load_stl(path.to_str().ok_or("Invalid geometry path")?);
+    }
+    Ok(Vec::new())
+}
+
 /// Generate a signed distance field from a mesh
 pub fn mesh_to_sdf(
     triangles: &[Triangle],
@@ -48,6 +203,10 @@ pub fn generate_sdf(
     domain_max: [f32; 3],
     cell_size: f32,
 ) -> GridSDF {
+    if triangles.is_empty() {
+        return empty_sdf(domain_min, domain_max, cell_size);
+    }
+
     // Calculate grid dimensions
     let nx = ((domain_max[0] - domain_min[0]) / cell_size).ceil() as u32 + 1;
     let ny = ((domain_max[1] - domain_min[1]) / cell_size).ceil() as u32 + 1;

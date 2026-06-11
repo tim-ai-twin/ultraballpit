@@ -22,6 +22,10 @@ export const FLUID_WATER = 0;
 export const FLUID_AIR = 1;
 export const FLUID_MIXED = 2;
 
+// Solver types
+export const SOLVER_WCSPH = 0;
+export const SOLVER_PCISPH = 1;
+
 // Simulation status
 export const STATUS_RUNNING = 0;
 export const STATUS_PAUSED = 1;
@@ -35,22 +39,29 @@ export interface SimInfo {
   domainMin: [number, number, number];  // f32x3
   domainMax: [number, number, number];  // f32x3
   fluidType: number;        // u8 (0=Water, 1=Air, 2=Mixed)
-  subsampleRate: number;    // u8 (percentage, e.g. 5 = 5%)
+  subsampleRate: number;    // u8 (1 = all particles)
+  particleSpacing: number;  // f32 (meters)
+  solver: number;           // u8 (0=WCSPH, 1=PCISPH)
 }
 
 export interface ParticleData {
   x: Float32Array;          // positions
   y: Float32Array;
   z: Float32Array;
+  vx: Float32Array;         // velocities
+  vy: Float32Array;
+  vz: Float32Array;
   temperature: Float32Array;
   fluidType: Uint8Array;    // 0=Water, 1=Air
   densityRatio: Uint16Array; // fixed-point, density/rho0 * 1000
 }
 
 export interface Frame {
-  frameNumber: bigint;      // u64
+  frameNumber: bigint;      // u64 (simulation timestep count)
   particleCount: number;    // u32
-  simTime: number;          // f64
+  simTime: number;          // f64 (seconds)
+  dt: number;               // f32 (current adaptive timestep, seconds)
+  stepsPerSec: number;      // f32 (measured solver throughput)
   particles: ParticleData;
 }
 
@@ -79,6 +90,8 @@ export interface SimStatus {
  * - f32x3 domain_max
  * - u8 fluid_type
  * - u8 subsample_rate
+ * - f32 particle_spacing
+ * - u8 solver
  */
 export function parseSimInfo(buffer: ArrayBuffer): SimInfo {
   const view = new DataView(buffer);
@@ -110,6 +123,12 @@ export function parseSimInfo(buffer: ArrayBuffer): SimInfo {
   const subsampleRate = view.getUint8(offset);
   offset += 1;
 
+  const particleSpacing = view.getFloat32(offset, true);
+  offset += 4;
+
+  const solver = view.getUint8(offset);
+  offset += 1;
+
   return {
     particleCount,
     surfaceCount,
@@ -117,6 +136,8 @@ export function parseSimInfo(buffer: ArrayBuffer): SimInfo {
     domainMax,
     fluidType,
     subsampleRate,
+    particleSpacing,
+    solver,
   };
 }
 
@@ -127,16 +148,21 @@ export function parseSimInfo(buffer: ArrayBuffer): SimInfo {
  * - u64 frame_number
  * - u32 particle_count
  * - f64 sim_time
- * - [particle_data] (20 bytes each)
+ * - f32 dt
+ * - f32 steps_per_sec
+ * - [particle_data] (32 bytes each)
  *
- * Per-particle data layout (20 bytes):
- * - offset 0: f32 x
- * - offset 4: f32 y
- * - offset 8: f32 z
- * - offset 12: f32 temperature
- * - offset 16: u8 fluid_type
- * - offset 17: u16 density_ratio (little-endian)
- * - offset 19: u8 reserved
+ * Per-particle data layout (32 bytes):
+ * - offset 0:  f32 x
+ * - offset 4:  f32 y
+ * - offset 8:  f32 z
+ * - offset 12: f32 vx
+ * - offset 16: f32 vy
+ * - offset 20: f32 vz
+ * - offset 24: f32 temperature
+ * - offset 28: u8 fluid_type
+ * - offset 29: u16 density_ratio (little-endian)
+ * - offset 31: u8 reserved
  */
 export function parseFrame(buffer: ArrayBuffer): Frame {
   const view = new DataView(buffer);
@@ -151,46 +177,50 @@ export function parseFrame(buffer: ArrayBuffer): Frame {
   const simTime = view.getFloat64(offset, true);
   offset += 8;
 
+  const dt = view.getFloat32(offset, true);
+  offset += 4;
+
+  const stepsPerSec = view.getFloat32(offset, true);
+  offset += 4;
+
   // Allocate arrays for particle data
   const x = new Float32Array(particleCount);
   const y = new Float32Array(particleCount);
   const z = new Float32Array(particleCount);
+  const vx = new Float32Array(particleCount);
+  const vy = new Float32Array(particleCount);
+  const vz = new Float32Array(particleCount);
   const temperature = new Float32Array(particleCount);
   const fluidType = new Uint8Array(particleCount);
   const densityRatio = new Uint16Array(particleCount);
 
-  // Parse particle data (20 bytes per particle)
+  // Parse particle data (32 bytes per particle)
   for (let i = 0; i < particleCount; i++) {
     x[i] = view.getFloat32(offset, true);
-    offset += 4;
-
-    y[i] = view.getFloat32(offset, true);
-    offset += 4;
-
-    z[i] = view.getFloat32(offset, true);
-    offset += 4;
-
-    temperature[i] = view.getFloat32(offset, true);
-    offset += 4;
-
-    fluidType[i] = view.getUint8(offset);
-    offset += 1;
-
-    densityRatio[i] = view.getUint16(offset, true);
-    offset += 2;
-
-    // Skip reserved byte
-    offset += 1;
+    y[i] = view.getFloat32(offset + 4, true);
+    z[i] = view.getFloat32(offset + 8, true);
+    vx[i] = view.getFloat32(offset + 12, true);
+    vy[i] = view.getFloat32(offset + 16, true);
+    vz[i] = view.getFloat32(offset + 20, true);
+    temperature[i] = view.getFloat32(offset + 24, true);
+    fluidType[i] = view.getUint8(offset + 28);
+    densityRatio[i] = view.getUint16(offset + 29, true);
+    offset += 32;
   }
 
   return {
     frameNumber,
     particleCount,
     simTime,
+    dt,
+    stepsPerSec,
     particles: {
       x,
       y,
       z,
+      vx,
+      vy,
+      vz,
       temperature,
       fluidType,
       densityRatio,

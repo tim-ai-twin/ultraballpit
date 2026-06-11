@@ -136,12 +136,7 @@ impl ReferenceTest {
         // Resolve geometry path relative to config directory
         let config_path = Path::new(&self.config_path);
         let config_dir = config_path.parent().ok_or("Invalid config path")?;
-        let geometry_path = config_dir.join(&config.geometry_file);
-        let mesh = geometry::load_stl(
-            geometry_path
-                .to_str()
-                .ok_or("Invalid geometry path")?,
-        )?;
+        let mesh = geometry::resolve_geometry(&config, config_dir)?;
         let sdf = geometry::mesh_to_sdf(&mesh, &config.domain, 0.5 * config.particle_spacing);
 
         // Setup domain
@@ -497,10 +492,7 @@ pub fn run_simulation_to_time(
     let config = SimulationConfig::load(config_path)?;
     let config_file = Path::new(config_path);
     let config_dir = config_file.parent().ok_or("Invalid config path")?;
-    let geometry_path = config_dir.join(&config.geometry_file);
-    let mesh = geometry::load_stl(
-        geometry_path.to_str().ok_or("Invalid geometry path")?,
-    )?;
+    let mesh = geometry::resolve_geometry(&config, config_dir)?;
     let sdf = geometry::mesh_to_sdf(&mesh, &config.domain, 0.5 * config.particle_spacing);
 
     let (fluid_particles, boundary_data) = domain::setup_domain(&config, &sdf);

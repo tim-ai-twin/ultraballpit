@@ -3,63 +3,477 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SPH Fluid Simulation Viewer</title>
+  <title>ultraballpit — SPH fluid lab</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
+    :root {
+      --bg0: #070b11;
+      --bg1: #0c121b;
+      --bg2: #111927;
+      --line: #1b2939;
+      --line-bright: #28394e;
+      --text: #d8e4f0;
+      --muted: #67798e;
+      --faint: #41546a;
+      --accent: #45cdff;
+      --accent-dim: #1c6f96;
+      --amber: #ffb454;
+      --green: #2fbf71;
+      --red: #ff5470;
+      --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+      --sans: 'Archivo', -apple-system, 'Helvetica Neue', sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
     body {
       margin: 0;
       padding: 0;
       overflow: hidden;
-      font-family: system-ui, -apple-system, sans-serif;
-      background: #1a1a1a;
-      color: #fff;
+      font-family: var(--sans);
+      background: var(--bg0);
+      color: var(--text);
+      font-size: 13px;
+      -webkit-font-smoothing: antialiased;
     }
-    #app {
-      display: flex;
-      width: 100vw;
-      height: 100vh;
-    }
+
+    #app { display: flex; width: 100vw; height: 100vh; }
+
+    /* ============ Sidebar ============ */
     #sidebar {
-      width: 240px;
-      background: #222;
-      padding: 12px;
-      overflow-y: auto;
-      border-right: 1px solid #333;
+      width: 304px;
+      min-width: 304px;
+      background: var(--bg1);
+      border-right: 1px solid var(--line);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
     }
+
+    #brand {
+      padding: 18px 18px 14px;
+      border-bottom: 1px solid var(--line);
+      flex-shrink: 0;
+    }
+    #brand h1 {
+      margin: 0;
+      font-size: 17px;
+      font-weight: 800;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+    #brand h1 .dot { color: var(--accent); }
+    #brand .sub {
+      margin-top: 3px;
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    #sidebar-scroll {
+      flex: 1;
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding-bottom: 12px;
+    }
+    #sidebar-scroll::-webkit-scrollbar { width: 8px; }
+    #sidebar-scroll::-webkit-scrollbar-thumb { background: var(--line-bright); border-radius: 4px; }
+    #sidebar-scroll::-webkit-scrollbar-track { background: transparent; }
+
+    .section {
+      border-bottom: 1px solid var(--line);
+      padding: 12px 18px 14px;
+    }
+    .section-title {
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin: 0 0 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .section-title::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--line);
+    }
+
+    /* Presets */
+    .preset {
+      display: block;
+      width: 100%;
+      text-align: left;
+      background: transparent;
+      border: 1px solid transparent;
+      border-left: 2px solid var(--line-bright);
+      color: var(--text);
+      padding: 7px 10px;
+      margin-bottom: 4px;
+      cursor: pointer;
+      font-family: var(--sans);
+      font-size: 12.5px;
+      font-weight: 500;
+      border-radius: 0 3px 3px 0;
+      transition: background 0.12s, border-color 0.12s;
+    }
+    .preset:hover { background: var(--bg2); }
+    .preset.selected {
+      background: rgba(69, 205, 255, 0.07);
+      border-left-color: var(--accent);
+    }
+    .preset .meta {
+      display: block;
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+
+    /* Form controls */
+    .field-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .field-row label {
+      flex: 0 0 86px;
+      font-size: 11.5px;
+      color: var(--muted);
+      font-weight: 500;
+    }
+    .field-row .value {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--accent);
+      min-width: 52px;
+      text-align: right;
+    }
+
+    input[type="range"] {
+      flex: 1;
+      -webkit-appearance: none;
+      appearance: none;
+      height: 2px;
+      background: var(--line-bright);
+      border-radius: 1px;
+      outline: none;
+      margin: 0;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: var(--accent);
+      cursor: pointer;
+      border: 2px solid var(--bg1);
+      box-shadow: 0 0 0 1px var(--accent-dim);
+    }
+
+    select, input[type="number"] {
+      background: var(--bg2);
+      border: 1px solid var(--line-bright);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 4px 6px;
+      border-radius: 3px;
+      outline: none;
+      width: 100%;
+    }
+    select:focus, input[type="number"]:focus { border-color: var(--accent-dim); }
+    input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
+    input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; }
+
+    .triple { display: flex; gap: 6px; flex: 1; }
+    .triple input { flex: 1; min-width: 0; }
+
+    .walls-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
+    }
+    .wall-cell label {
+      display: block;
+      font-family: var(--mono);
+      font-size: 9.5px;
+      letter-spacing: 0.08em;
+      color: var(--faint);
+      margin-bottom: 3px;
+      text-transform: uppercase;
+    }
+
+    .hint {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--faint);
+      margin: 2px 0 8px;
+    }
+    .hint .warn { color: var(--amber); }
+
+    /* Run button */
+    #run-section {
+      padding: 14px 18px;
+      border-top: 1px solid var(--line);
+      flex-shrink: 0;
+      background: var(--bg1);
+    }
+    #btn-run {
+      width: 100%;
+      padding: 11px;
+      background: var(--accent);
+      color: #04222e;
+      font-family: var(--sans);
+      font-weight: 800;
+      font-size: 13px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: filter 0.12s, transform 0.05s;
+    }
+    #btn-run:hover:not(:disabled) { filter: brightness(1.12); }
+    #btn-run:active:not(:disabled) { transform: translateY(1px); }
+    #btn-run:disabled { background: var(--line-bright); color: var(--muted); cursor: default; }
+    #run-status {
+      margin-top: 8px;
+      font-family: var(--mono);
+      font-size: 10.5px;
+      color: var(--muted);
+      min-height: 14px;
+      text-align: center;
+    }
+    #run-status.error { color: var(--red); }
+
+    /* ============ Viewport ============ */
     #viewer-container {
       flex: 1;
       position: relative;
+      background:
+        radial-gradient(120% 90% at 60% 30%, #101b2c 0%, #0a121f 45%, #060a10 100%);
     }
-    #viewer {
-      display: block;
-      width: 100%;
-      height: 100%;
-    }
-    #stats {
+    #viewer { display: block; width: 100%; height: 100%; }
+
+    /* HUD */
+    #hud {
       position: absolute;
-      top: 12px;
-      right: 12px;
-      background: rgba(0, 0, 0, 0.7);
-      padding: 8px 12px;
-      border-radius: 4px;
+      top: 14px;
+      right: 14px;
+      background: rgba(8, 13, 20, 0.82);
+      backdrop-filter: blur(6px);
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      padding: 10px 14px;
+      font-family: var(--mono);
       font-size: 11px;
-      font-family: monospace;
-      color: #aaa;
+      line-height: 1.75;
+      color: var(--muted);
+      min-width: 200px;
+      pointer-events: none;
     }
+    #hud .row { display: flex; justify-content: space-between; gap: 18px; }
+    #hud .row b { color: var(--text); font-weight: 500; }
+    #hud .row b.accent { color: var(--accent); }
+    #hud-status {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 10px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      padding-bottom: 6px;
+      margin-bottom: 6px;
+      border-bottom: 1px solid var(--line);
+      color: var(--text);
+    }
+    #hud-dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--faint);
+    }
+    #hud-dot.running { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    #hud-dot.paused { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
+    #hud-dot.finished { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+    #hud-dot.error { background: var(--red); box-shadow: 0 0 6px var(--red); }
+
+    /* Legend */
+    #legend {
+      position: absolute;
+      left: 14px;
+      bottom: 14px;
+      background: rgba(8, 13, 20, 0.82);
+      backdrop-filter: blur(6px);
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      padding: 8px 12px;
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--muted);
+      pointer-events: none;
+    }
+    #legend-bar {
+      width: 150px;
+      height: 6px;
+      border-radius: 3px;
+      margin: 5px 0 3px;
+      background: linear-gradient(90deg, #0d3a8c, #1aa6f2, #ffffff);
+    }
+    #legend-range { display: flex; justify-content: space-between; }
+
+    /* Playback bar */
+    #playback {
+      position: absolute;
+      bottom: 14px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: rgba(8, 13, 20, 0.85);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 12px;
+    }
+    #playback button {
+      background: var(--bg2);
+      border: 1px solid var(--line-bright);
+      color: var(--text);
+      font-family: var(--sans);
+      font-weight: 600;
+      font-size: 11.5px;
+      padding: 6px 13px;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: border-color 0.12s, background 0.12s;
+      white-space: nowrap;
+    }
+    #playback button:hover:not(:disabled) { border-color: var(--accent-dim); background: #16202e; }
+    #playback button:disabled { opacity: 0.35; cursor: default; }
+    #btn-pause.is-paused { border-color: var(--amber); color: var(--amber); }
+
+    #playback .divider { width: 1px; height: 22px; background: var(--line); }
+
+    #playback .ctl {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    #playback select {
+      width: auto;
+      padding: 4px 5px;
+      font-size: 10.5px;
+    }
+    #playback input[type="range"] { width: 76px; }
+
+    /* Empty-state prompt */
+    #empty-hint {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      text-align: center;
+      color: var(--faint);
+      pointer-events: none;
+      transition: opacity 0.4s;
+    }
+    #empty-hint .glyph {
+      font-size: 42px;
+      font-family: var(--mono);
+      color: var(--line-bright);
+      margin-bottom: 10px;
+    }
+    #empty-hint .line1 { font-size: 14px; font-weight: 600; color: var(--muted); }
+    #empty-hint .line2 { font-family: var(--mono); font-size: 11px; margin-top: 5px; }
+    #empty-hint.hidden { opacity: 0; }
   </style>
 </head>
 <body>
   <div id="app">
     <div id="sidebar">
-      <div id="config-list"></div>
-      <div id="controls"></div>
+      <div id="brand">
+        <h1>ultraballpit<span class="dot">.</span></h1>
+        <div class="sub">SPH fluid laboratory</div>
+      </div>
+
+      <div id="sidebar-scroll">
+        <div class="section">
+          <div class="section-title">Presets</div>
+          <div id="config-list"></div>
+        </div>
+        <div id="params"></div>
+      </div>
+
+      <div id="run-section">
+        <button id="btn-run" disabled>Run simulation</button>
+        <div id="run-status">select a preset to begin</div>
+      </div>
     </div>
+
     <div id="viewer-container">
       <canvas id="viewer"></canvas>
-      <div id="stats">
-        <div id="stats-fps">FPS: --</div>
-        <div id="stats-particles">Particles: --</div>
-        <div id="stats-frame">Frame: --</div>
-        <div id="stats-time">Time: --</div>
+
+      <div id="empty-hint">
+        <div class="glyph">◦◦◦</div>
+        <div class="line1">No simulation loaded</div>
+        <div class="line2">pick a preset, tune parameters, hit run</div>
+      </div>
+
+      <div id="hud" style="display:none">
+        <div id="hud-status"><span id="hud-dot"></span><span id="hud-label">idle</span></div>
+        <div class="row"><span>sim time</span><b id="st-time" class="accent">—</b></div>
+        <div class="row"><span>timestep dt</span><b id="st-dt">—</b></div>
+        <div class="row"><span>solver rate</span><b id="st-sps">—</b></div>
+        <div class="row"><span>realtime ×</span><b id="st-rtf">—</b></div>
+        <div class="row"><span>particles</span><b id="st-particles">—</b></div>
+        <div class="row"><span>render fps</span><b id="st-fps">—</b></div>
+        <div class="row"><span>stream fps</span><b id="st-data-fps">—</b></div>
+        <div class="row"><span>ρ variation</span><b id="st-density">—</b></div>
+      </div>
+
+      <div id="legend" style="display:none">
+        <span id="legend-label">particle speed</span>
+        <div id="legend-bar"></div>
+        <div id="legend-range"><span id="legend-min">0</span><span id="legend-max">—</span></div>
+      </div>
+
+      <div id="playback" style="display:none">
+        <button id="btn-pause">Pause</button>
+        <button id="btn-restart">Restart</button>
+        <button id="btn-reset-view">Reset view</button>
+        <div class="divider"></div>
+        <div class="ctl">
+          <span>color</span>
+          <select id="sel-color">
+            <option value="speed">speed</option>
+            <option value="density">density</option>
+            <option value="temperature">temp</option>
+            <option value="type">fluid</option>
+          </select>
+        </div>
+        <div class="ctl">
+          <span>size</span>
+          <input type="range" id="rng-size" min="0.4" max="2.5" step="0.05" value="1">
+        </div>
+        <div class="ctl">
+          <span>walls</span>
+          <input type="range" id="rng-walls" min="0" max="0.5" step="0.01" value="0.16">
+        </div>
       </div>
     </div>
   </div>

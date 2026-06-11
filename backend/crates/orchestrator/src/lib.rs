@@ -54,19 +54,12 @@ pub fn create_simulation(config_path: &str) -> Result<SimulationRunner, Box<dyn 
     let config = SimulationConfig::load(config_path)?;
     tracing::info!("Configuration loaded: {}", config.name);
 
-    // 2. Find and load STL geometry file
-    // Resolve geometry file path relative to config file directory
+    // 2. Resolve obstacle geometry (primitive, STL file, or none)
     let config_dir = Path::new(config_path)
         .parent()
         .unwrap_or_else(|| Path::new("."));
-    let geometry_path = config_dir.join(&config.geometry_file);
-    let geometry_path_str = geometry_path
-        .to_str()
-        .ok_or("Invalid geometry file path")?;
-
-    tracing::info!("Loading STL geometry: {}", geometry_path_str);
-    let triangles = geometry::load_stl(geometry_path_str)?;
-    tracing::info!("Loaded {} triangles", triangles.len());
+    let triangles = geometry::resolve_geometry(&config, config_dir)?;
+    tracing::info!("Loaded {} geometry triangles", triangles.len());
 
     // 3. Generate SDF
     tracing::info!("Generating signed distance field...");

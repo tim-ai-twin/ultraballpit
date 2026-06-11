@@ -10,8 +10,10 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use kernel::FluidType;
 use std::sync::Arc;
-use tokio::time::{interval, Duration};
+use std::time::Duration;
+use tokio::time::interval;
 
+use crate::runner::SimulationRunner;
 use crate::state::{AppState, SimStatus};
 
 // ---------------------------------------------------------------------------
@@ -27,6 +29,12 @@ const CMD_PAUSE: u8 = 0x01;
 const CMD_RESUME: u8 = 0x02;
 const CMD_ENABLE_DIAGNOSTICS: u8 = 0x04;
 const CMD_DISABLE_DIAGNOSTICS: u8 = 0x05;
+
+/// Wall-clock budget for each stepping batch (per blocking-thread call)
+const STEP_BATCH_BUDGET: Duration = Duration::from_millis(12);
+
+/// Frame streaming interval (~30 FPS; all particles are sent each frame)
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 // ---------------------------------------------------------------------------
 // WebSocket Handler
@@ -49,116 +57,92 @@ pub async fn ws_simulation_handler(
 
 /// Handle WebSocket connection
 async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, sim_id: String) {
-    use futures_util::stream::SplitSink;
-    use futures_util::stream::SplitStream;
+    let (mut sender, mut receiver) = socket.split();
 
-    let (mut sender, mut receiver): (SplitSink<WebSocket, Message>, SplitStream<WebSocket>) = socket.split();
-
-    // Per-connection diagnostics state
-    let mut diagnostics_enabled = false;
-
-    // Verify simulation exists
-    {
+    // Clone the runner out of the state map: all runner state is shared via
+    // Arcs, so this clone observes (and controls) the same simulation without
+    // holding the AppState lock.
+    let runner = {
         let sims = state.simulations.lock().unwrap();
-        if !sims.contains_key(&sim_id) {
-            tracing::error!("Simulation {} not found", sim_id);
-            return;
+        match sims.get(&sim_id) {
+            Some(r) => r.clone(),
+            None => {
+                tracing::error!("Simulation {} not found", sim_id);
+                return;
+            }
         }
-    }
-
-    // Send initial SimInfo
-    let sim_info = {
-        let sims = state.simulations.lock().unwrap();
-        let runner = match sims.get(&sim_id) {
-            Some(r) => r,
-            None => return,
-        };
-
-        build_sim_info(runner)
     };
 
-    if let Err(e) = sender.send(Message::Binary(sim_info)).await {
+    // Per-connection diagnostics state (on by default; the HUD decides display)
+    let mut diagnostics_enabled = true;
+
+    // Send initial SimInfo
+    if let Err(e) = sender.send(Message::Binary(build_sim_info(&runner))).await {
         tracing::error!("Failed to send SimInfo: {}", e);
         return;
     }
 
-    // Start the simulation
-    {
-        let sims = state.simulations.lock().unwrap();
-        if let Some(runner) = sims.get(&sim_id) {
-            runner.start();
+    // Start the simulation and its dedicated stepping task. Stepping runs in
+    // spawn_blocking batches so the async runtime is never starved, and the
+    // kernel lock is released between batches for frame snapshots.
+    runner.start();
+    let stepper = tokio::spawn({
+        let runner = runner.clone();
+        async move {
+            loop {
+                let r = runner.clone();
+                let status = tokio::task::spawn_blocking(move || {
+                    r.step_batch(STEP_BATCH_BUDGET);
+                    r.status()
+                })
+                .await
+                .unwrap_or(SimStatus::Stopped);
+
+                match status {
+                    SimStatus::Running | SimStatus::Created => {
+                        // Brief yield so frame builds can grab the kernel lock
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    SimStatus::Paused => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    SimStatus::Stopped => break,
+                }
+            }
         }
-    }
+    });
 
-    // Frame buffer for flow control (max 5 pending frames)
-    let mut pending_frames = Vec::new();
-    const MAX_PENDING: usize = 5;
-
-    // Frame generation interval (~60 FPS)
-    let mut frame_timer = interval(Duration::from_millis(16));
-
-    // Simulation step interval (run simulation faster than frame rate)
-    let mut sim_timer = interval(Duration::from_millis(1));
+    let mut frame_timer = interval(FRAME_INTERVAL);
+    frame_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_status = runner.status();
 
     loop {
         tokio::select! {
-            // Simulation step
-            _ = sim_timer.tick() => {
-                let sims = state.simulations.lock().unwrap();
-                if let Some(runner) = sims.get(&sim_id) {
-                    runner.step();
-                }
-            }
-
             // Frame generation and sending
             _ = frame_timer.tick() => {
-                // Build frame and diagnostics (scoped lock)
-                let (frame_data, diagnostics_data) = {
-                    let sims = state.simulations.lock().unwrap();
-                    let runner = match sims.get(&sim_id) {
-                        Some(r) => r,
-                        None => break,
-                    };
-                    let frame = build_frame(runner);
-                    let diag = if diagnostics_enabled {
-                        Some(build_diagnostics(runner))
-                    } else {
-                        None
-                    };
-                    (frame, diag)
-                    // Lock is dropped here
-                };
-
-                // Flow control: if buffer is full, drop intermediate frames
-                if pending_frames.len() >= MAX_PENDING {
-                    // Drop all but the last frame
-                    pending_frames.clear();
-                    tracing::debug!("Flow control: dropped intermediate frames for simulation {}", sim_id);
+                let frame_data = build_frame(&runner);
+                if sender.send(Message::Binary(frame_data)).await.is_err() {
+                    break;
                 }
 
-                // Try to send immediately if buffer is getting full
-                if pending_frames.is_empty() {
-                    if let Err(e) = sender.send(Message::Binary(frame_data)).await {
-                        tracing::error!("Failed to send frame: {}", e);
+                if diagnostics_enabled {
+                    let diag = build_diagnostics(&runner);
+                    if sender.send(Message::Binary(diag)).await.is_err() {
                         break;
                     }
-
-                    // Send diagnostics if enabled
-                    if let Some(diag) = diagnostics_data {
-                        if let Err(e) = sender.send(Message::Binary(diag)).await {
-                            tracing::error!("Failed to send diagnostics: {}", e);
-                            break;
-                        }
-                    }
-                } else {
-                    pending_frames.push(frame_data);
                 }
 
-                // Try to flush pending frames
-                while !pending_frames.is_empty() {
-                    let frame = pending_frames.remove(0);
-                    if let Err(e) = sender.send(Message::Binary(frame)).await {
-                        tracing::error!("Failed to send pending frame: {}", e);
+                // Push status transitions (e.g. auto-pause on instability,
+                // auto-finish at max_time) to the client.
+                let status = runner.status();
+                if status != last_status {
+                    last_status = status;
+                    let msg = match status {
+                        SimStatus::Running | SimStatus::Created => build_sim_status(status, "Simulation running"),
+                        SimStatus::Paused => build_sim_status(status, "Simulation paused"),
+                        SimStatus::Stopped => build_sim_status(status, "Simulation finished"),
+                    };
+                    if sender.send(Message::Binary(msg)).await.is_err() {
                         break;
                     }
                 }
@@ -168,7 +152,7 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, sim_id: Strin
             msg = receiver.next() => {
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
-                        if let Err(e) = handle_client_command(&state, &sim_id, &data, &mut sender, &mut diagnostics_enabled).await {
+                        if let Err(e) = handle_client_command(&runner, &sim_id, &data, &mut sender, &mut diagnostics_enabled).await {
                             tracing::error!("Error handling command: {}", e);
                         }
                     }
@@ -186,9 +170,9 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, sim_id: Strin
         }
     }
 
-    // Cleanup: pause simulation when client disconnects
-    let sims = state.simulations.lock().unwrap();
-    if let Some(runner) = sims.get(&sim_id) {
+    // Cleanup: stop stepping and pause simulation when client disconnects
+    stepper.abort();
+    if runner.status() != SimStatus::Stopped {
         runner.pause();
     }
 }
@@ -198,20 +182,18 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, sim_id: Strin
 // ---------------------------------------------------------------------------
 
 /// Build SimInfo message (tag 0x01)
-/// Format: tag(u8) + particle_count(u32) + surface_count(u32) + domain_min(f32x3) + domain_max(f32x3) + fluid_type(u8) + subsample_rate(u8)
-fn build_sim_info(runner: &crate::runner::SimulationRunner) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(35);
+/// Format: tag(u8) + particle_count(u32) + subsample_count(u32) +
+///         domain_min(f32x3) + domain_max(f32x3) + fluid_type(u8) +
+///         subsample_rate(u8) + particle_spacing(f32) + solver(u8)
+fn build_sim_info(runner: &SimulationRunner) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(40);
 
-    // Tag
     buf.push(TAG_SIM_INFO);
 
-    // Particle counts
     let particle_count = runner.particle_count() as u32;
-    let subsample_count = runner.subsample_count() as u32;
     buf.extend_from_slice(&particle_count.to_le_bytes());
-    buf.extend_from_slice(&subsample_count.to_le_bytes());
+    buf.extend_from_slice(&particle_count.to_le_bytes()); // all particles streamed
 
-    // Domain bounds
     for &v in &runner.domain_min() {
         buf.extend_from_slice(&v.to_le_bytes());
     }
@@ -219,77 +201,57 @@ fn build_sim_info(runner: &crate::runner::SimulationRunner) -> Vec<u8> {
         buf.extend_from_slice(&v.to_le_bytes());
     }
 
-    // Fluid type (0 = Water, 1 = Air, 2 = Mixed)
     buf.push(runner.fluid_type());
+    buf.push(1); // subsample rate 1:1
 
-    // Subsample rate (~5% = 20:1)
-    let subsample_rate = (particle_count / subsample_count).max(1) as u8;
-    buf.push(subsample_rate);
+    buf.extend_from_slice(&runner.particle_spacing().to_le_bytes());
+    buf.push(runner.solver());
 
     buf
 }
 
-/// Build Frame message (tag 0x02) with particle subsampling
-/// Format: tag(u8) + frame_number(u64) + particle_count(u32) + sim_time(f64) + [particles...]
-/// Each particle: x(f32) + y(f32) + z(f32) + temperature(f32) + fluid_type(u8) + density_ratio(u16) + reserved(u8)
-fn build_frame(runner: &crate::runner::SimulationRunner) -> Vec<u8> {
+/// Build Frame message (tag 0x02) with all particles
+/// Format: tag(u8) + frame_number(u64) + particle_count(u32) + sim_time(f64) +
+///         dt(f32) + steps_per_sec(f32) + [particles...]
+/// Each particle (32 bytes): x,y,z(f32) + vx,vy,vz(f32) + temperature(f32) +
+///         fluid_type(u8) + density_ratio(u16) + reserved(u8)
+fn build_frame(runner: &SimulationRunner) -> Vec<u8> {
     let particles = runner.particles();
     let n = particles.len();
-    let subsample_count = runner.subsample_count();
 
-    // Calculate stride for deterministic subsampling
-    let stride = if subsample_count > 0 {
-        (n / subsample_count).max(1)
-    } else {
-        1
-    };
+    let mut buf = Vec::with_capacity(1 + 8 + 4 + 8 + 4 + 4 + n * 32);
 
-    let actual_count = (n / stride).min(subsample_count);
-
-    // Allocate buffer
-    let mut buf = Vec::with_capacity(1 + 8 + 4 + 8 + actual_count * 20);
-
-    // Tag
     buf.push(TAG_FRAME);
+    buf.extend_from_slice(&runner.timestep_count().to_le_bytes());
+    buf.extend_from_slice(&(n as u32).to_le_bytes());
+    buf.extend_from_slice(&runner.sim_time().to_le_bytes());
+    buf.extend_from_slice(&runner.dt().to_le_bytes());
+    buf.extend_from_slice(&runner.steps_per_sec().to_le_bytes());
 
-    // Frame number
-    let frame_number = runner.timestep_count();
-    buf.extend_from_slice(&frame_number.to_le_bytes());
-
-    // Particle count (subsampled)
-    buf.extend_from_slice(&(actual_count as u32).to_le_bytes());
-
-    // Simulation time
-    let sim_time = runner.sim_time();
-    buf.extend_from_slice(&sim_time.to_le_bytes());
-
-    // Serialize subsampled particles
-    for i in (0..n).step_by(stride).take(actual_count) {
-        // Position
+    for i in 0..n {
         buf.extend_from_slice(&particles.x[i].to_le_bytes());
         buf.extend_from_slice(&particles.y[i].to_le_bytes());
         buf.extend_from_slice(&particles.z[i].to_le_bytes());
-
-        // Temperature
+        buf.extend_from_slice(&particles.vx[i].to_le_bytes());
+        buf.extend_from_slice(&particles.vy[i].to_le_bytes());
+        buf.extend_from_slice(&particles.vz[i].to_le_bytes());
         buf.extend_from_slice(&particles.temperature[i].to_le_bytes());
 
-        // Fluid type
         let fluid_type_byte = match particles.fluid_type[i] {
             FluidType::Water => 0u8,
             FluidType::Air => 1u8,
         };
         buf.push(fluid_type_byte);
 
-        // Density ratio (fixed-point: (density / rho0) * 1000 as u16)
         let rest_density = match particles.fluid_type[i] {
             FluidType::Water => kernel::eos::WATER_REST_DENSITY,
             FluidType::Air => kernel::eos::AIR_REST_DENSITY,
         };
-        let density_ratio = ((particles.density[i] / rest_density) * 1000.0).clamp(0.0, 65535.0) as u16;
+        let density_ratio =
+            ((particles.density[i] / rest_density) * 1000.0).clamp(0.0, 65535.0) as u16;
         buf.extend_from_slice(&density_ratio.to_le_bytes());
 
-        // Reserved byte
-        buf.push(0);
+        buf.push(0); // reserved
     }
 
     buf
@@ -300,7 +262,6 @@ fn build_frame(runner: &crate::runner::SimulationRunner) -> Vec<u8> {
 fn build_sim_status(status: SimStatus, message: &str) -> Vec<u8> {
     let mut buf = Vec::new();
 
-    // Tag
     buf.push(TAG_SIM_STATUS);
 
     // Status byte (matches frontend: 0=Running, 1=Paused, 2=Finished, 3=Error)
@@ -311,7 +272,6 @@ fn build_sim_status(status: SimStatus, message: &str) -> Vec<u8> {
     };
     buf.push(status_byte);
 
-    // Message length (u16) and content
     let msg_bytes = message.as_bytes();
     buf.extend_from_slice(&(msg_bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(msg_bytes);
@@ -322,39 +282,23 @@ fn build_sim_status(status: SimStatus, message: &str) -> Vec<u8> {
 /// Build Diagnostics message (tag 0x03)
 /// Format: tag(u8) + frame_number(u64) + frame_time_ms(f32) + max_density_var(f32) +
 ///         energy_conservation(f32) + mass_conservation(f32) + dt(f32) + particle_count(u32)
-fn build_diagnostics(runner: &crate::runner::SimulationRunner) -> Vec<u8> {
+fn build_diagnostics(runner: &SimulationRunner) -> Vec<u8> {
     let mut buf = Vec::with_capacity(33);
 
-    // Tag
     buf.push(TAG_DIAGNOSTICS);
+    buf.extend_from_slice(&runner.timestep_count().to_le_bytes());
 
-    // Frame number
-    let frame_number = runner.timestep_count();
-    buf.extend_from_slice(&frame_number.to_le_bytes());
-
-    // Frame time (measured as 0 for now; could be enhanced with actual timing)
-    let frame_time_ms = 0.0_f32;
+    // Frame time: wall-clock ms per simulation step (derived from throughput)
+    let sps = runner.steps_per_sec();
+    let frame_time_ms = if sps > 0.0 { 1000.0 / sps } else { 0.0 };
     buf.extend_from_slice(&frame_time_ms.to_le_bytes());
 
-    // Get error metrics
     let metrics = runner.error_metrics();
-
-    // Max density variation
     buf.extend_from_slice(&metrics.max_density_variation.to_le_bytes());
-
-    // Energy conservation error
     buf.extend_from_slice(&metrics.energy_conservation.to_le_bytes());
-
-    // Mass conservation error
     buf.extend_from_slice(&metrics.mass_conservation.to_le_bytes());
-
-    // Timestep dt
-    let dt = runner.dt();
-    buf.extend_from_slice(&dt.to_le_bytes());
-
-    // Particle count
-    let particle_count = runner.particle_count() as u32;
-    buf.extend_from_slice(&particle_count.to_le_bytes());
+    buf.extend_from_slice(&runner.dt().to_le_bytes());
+    buf.extend_from_slice(&(runner.particle_count() as u32).to_le_bytes());
 
     buf
 }
@@ -365,13 +309,12 @@ fn build_diagnostics(runner: &crate::runner::SimulationRunner) -> Vec<u8> {
 
 /// Handle incoming command from client
 async fn handle_client_command(
-    state: &Arc<AppState>,
+    runner: &SimulationRunner,
     sim_id: &str,
     data: &[u8],
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     diagnostics_enabled: &mut bool,
 ) -> Result<(), String> {
-
     if data.len() < 2 {
         return Err("Command too short".to_string());
     }
@@ -383,45 +326,33 @@ async fn handle_client_command(
 
     let command = data[1];
 
-    // Handle diagnostics commands locally (no status message needed)
-    match command {
+    let status_msg = match command {
         CMD_ENABLE_DIAGNOSTICS => {
             *diagnostics_enabled = true;
-            tracing::info!("Diagnostics enabled for simulation {}", sim_id);
             return Ok(());
         }
         CMD_DISABLE_DIAGNOSTICS => {
             *diagnostics_enabled = false;
-            tracing::info!("Diagnostics disabled for simulation {}", sim_id);
             return Ok(());
         }
-        _ => {}
-    }
-
-    // Handle simulation control commands and build response (scoped lock)
-    let status_msg = {
-        let sims = state.simulations.lock().unwrap();
-        let runner = sims.get(sim_id)
-            .ok_or_else(|| "Simulation not found".to_string())?;
-
-        match command {
-            CMD_PAUSE => {
-                runner.pause();
-                build_sim_status(SimStatus::Paused, "Simulation paused")
-            }
-            CMD_RESUME => {
-                runner.resume();
-                build_sim_status(SimStatus::Running, "Simulation resumed")
-            }
-            _ => {
-                return Err(format!("Unknown command: 0x{:02x}", command));
-            }
+        CMD_PAUSE => {
+            runner.pause();
+            tracing::info!("Simulation {} paused by client", sim_id);
+            build_sim_status(SimStatus::Paused, "Simulation paused")
         }
-        // Lock is dropped here
+        CMD_RESUME => {
+            runner.resume();
+            tracing::info!("Simulation {} resumed by client", sim_id);
+            build_sim_status(runner.status(), "Simulation resumed")
+        }
+        _ => {
+            return Err(format!("Unknown command: 0x{:02x}", command));
+        }
     };
 
-    // Send response
-    sender.send(Message::Binary(status_msg)).await
+    sender
+        .send(Message::Binary(status_msg))
+        .await
         .map_err(|e| format!("Failed to send status: {}", e))?;
 
     Ok(())

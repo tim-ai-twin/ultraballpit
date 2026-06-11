@@ -36,6 +36,7 @@ export class SimulationClient {
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 5;
   private reconnectDelay = 1000;
+  private intentionalClose = false;
 
   private simInfoCallbacks: SimInfoCallback[] = [];
   private frameCallbacks: FrameCallback[] = [];
@@ -48,6 +49,7 @@ export class SimulationClient {
   connect(wsUrl: string): void {
     this.wsUrl = wsUrl;
     this.reconnectAttempts = 0;
+    this.intentionalClose = false;
     this._connect();
   }
 
@@ -84,17 +86,20 @@ export class SimulationClient {
    * Disconnect from simulation
    */
   disconnect(): void {
+    this.intentionalClose = true;
     if (this.ws) {
       this.ws.close();
       this.ws = null;
     }
-    this.reconnectAttempts = this.maxReconnectAttempts; // Prevent reconnection
   }
 
   /**
    * Attempt to reconnect with exponential backoff
    */
   private attemptReconnect(): void {
+    if (this.intentionalClose) {
+      return;
+    }
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       console.error('Max reconnection attempts reached');
       return;

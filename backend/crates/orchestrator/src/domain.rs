@@ -96,8 +96,14 @@ fn place_fluid_particles(
     let domain_min = config.domain.min;
     let domain_max = config.domain.max;
 
-    // Calculate domain center Y for Mixed fluid type
-    let domain_center_y = (domain_min[1] + domain_max[1]) * 0.5;
+    // Fluid fill region (defaults to the whole domain)
+    let (fill_min, fill_max) = match &config.fluid_region {
+        Some(region) => (region.min, region.max),
+        None => (domain_min, domain_max),
+    };
+
+    // Calculate fill-region center Y for Mixed fluid type
+    let domain_center_y = (fill_min[1] + fill_max[1]) * 0.5;
 
     // Grid dimensions
     let nx = ((domain_max[0] - domain_min[0]) / spacing).ceil() as usize;
@@ -119,6 +125,14 @@ fn place_fluid_particles(
                 if x < domain_min[0] || x > domain_max[0]
                     || y < domain_min[1] || y > domain_max[1]
                     || z < domain_min[2] || z > domain_max[2]
+                {
+                    continue;
+                }
+
+                // Check if position is inside the fluid fill region
+                if x < fill_min[0] || x > fill_max[0]
+                    || y < fill_min[1] || y > fill_max[1]
+                    || z < fill_min[2] || z > fill_max[2]
                 {
                     continue;
                 }
@@ -881,7 +895,9 @@ mod tests {
         let config = SimulationConfig {
             name: "test".to_string(),
             fluid_type: ConfigFluidType::Water,
-            geometry_file: "test.stl".to_string(),
+            geometry_file: Some("test.stl".to_string()),
+            geometry: None,
+            fluid_region: None,
             domain: DomainBounds {
                 min: [0.0, 0.0, 0.0],
                 max: [0.01, 0.01, 0.01],
@@ -925,7 +941,9 @@ mod tests {
         let config = SimulationConfig {
             name: "test".to_string(),
             fluid_type: ConfigFluidType::Mixed,
-            geometry_file: "test.stl".to_string(),
+            geometry_file: Some("test.stl".to_string()),
+            geometry: None,
+            fluid_region: None,
             domain: DomainBounds {
                 min: [0.0, 0.0, 0.0],
                 max: [0.01, 0.02, 0.01], // Taller domain
