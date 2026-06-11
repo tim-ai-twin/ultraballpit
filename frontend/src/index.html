@@ -39,7 +39,10 @@
       -webkit-font-smoothing: antialiased;
     }
 
-    #app { display: flex; width: 100vw; height: 100vh; }
+    /* 100dvh tracks the *visible* viewport (excludes browser/OS chrome that
+       static 100vh can overshoot), so the pinned run button can never fall
+       below the fold. 100vh is the fallback for older engines. */
+    #app { display: flex; width: 100vw; height: 100vh; height: 100dvh; }
 
     /* ============ Sidebar ============ */
     #sidebar {
@@ -50,6 +53,7 @@
       display: flex;
       flex-direction: column;
       overflow: hidden;
+      min-height: 0; /* allow the column to shrink to the viewport */
     }
 
     #brand {
@@ -75,7 +79,8 @@
     }
 
     #sidebar-scroll {
-      flex: 1;
+      flex: 1 1 0;
+      min-height: 0; /* the scroll area absorbs overflow; run button stays pinned */
       overflow-y: auto;
       overflow-x: hidden;
       padding-bottom: 12px;
@@ -340,6 +345,9 @@
       transform: translateX(-50%);
       display: flex;
       align-items: center;
+      justify-content: center;
+      flex-wrap: wrap;
+      max-width: calc(100% - 28px);
       gap: 10px;
       background: rgba(8, 13, 20, 0.85);
       backdrop-filter: blur(8px);
@@ -403,6 +411,56 @@
     #empty-hint .line1 { font-size: 14px; font-weight: 600; color: var(--muted); }
     #empty-hint .line2 { font-family: var(--mono); font-size: 11px; margin-top: 5px; }
     #empty-hint.hidden { opacity: 0; }
+
+    /* ============ Responsive: short laptop screens ============
+       The run button is pinned by the flex column at any height, but on a
+       short 13" panel the scroll area gets cramped. These rules tighten
+       vertical rhythm so more of the form is visible before scrolling and
+       the run button keeps clear breathing room. */
+    @media (max-height: 780px) {
+      #brand { padding: 13px 18px 11px; }
+      #brand h1 { font-size: 15px; }
+      .section { padding: 10px 18px 11px; }
+      .section-title { margin-bottom: 8px; }
+      .field-row { margin-bottom: 6px; }
+      #run-section { padding: 11px 18px; }
+      #btn-run { padding: 9px; }
+      #run-status { margin-top: 6px; }
+    }
+    @media (max-height: 640px) {
+      #brand { padding: 9px 18px 8px; }
+      #brand .sub { display: none; }
+      .section { padding: 8px 18px 9px; }
+      .field-row { margin-bottom: 5px; }
+      .preset { padding: 5px 10px; margin-bottom: 3px; }
+      #run-section { padding: 9px 18px; }
+      #btn-run { padding: 8px; font-size: 12px; }
+      /* helper line is non-essential when vertical space is tight */
+      #run-status:not(.error) { display: none; }
+    }
+
+    /* ============ Responsive: narrow windows ============
+       Reclaim canvas width when the window is small; keep the sidebar usable. */
+    @media (max-width: 1180px) {
+      #sidebar { width: 264px; min-width: 264px; }
+      .field-row label { flex-basis: 74px; }
+    }
+
+    /* Floating overlays shrink so they never crowd a small canvas. */
+    @media (max-height: 700px), (max-width: 1180px) {
+      #hud { font-size: 10px; line-height: 1.5; padding: 8px 11px; min-width: 168px; }
+      #hud .row { gap: 12px; }
+      #legend { padding: 6px 10px; }
+      #legend-bar { width: 120px; }
+      #playback { gap: 7px; padding: 6px 9px; bottom: 10px; }
+      #playback button { padding: 5px 10px; font-size: 11px; }
+      #playback input[type="range"] { width: 60px; }
+    }
+    /* On very short screens the HUD can collide with the playback bar;
+       drop the two least-critical rows. */
+    @media (max-height: 560px) {
+      #hud .row-optional { display: none; }
+    }
   </style>
 </head>
 <body>
@@ -443,8 +501,8 @@
         <div class="row"><span>solver rate</span><b id="st-sps">—</b></div>
         <div class="row"><span>realtime ×</span><b id="st-rtf">—</b></div>
         <div class="row"><span>particles</span><b id="st-particles">—</b></div>
-        <div class="row"><span>render fps</span><b id="st-fps">—</b></div>
-        <div class="row"><span>stream fps</span><b id="st-data-fps">—</b></div>
+        <div class="row row-optional"><span>render fps</span><b id="st-fps">—</b></div>
+        <div class="row row-optional"><span>stream fps</span><b id="st-data-fps">—</b></div>
         <div class="row"><span>ρ variation</span><b id="st-density">—</b></div>
       </div>
 
