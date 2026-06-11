@@ -121,10 +121,18 @@ fn place_fluid_particles(
                 let y = domain_min[1] + (j as f32 + 0.5) * spacing;
                 let z = domain_min[2] + (k as f32 + 0.5) * spacing;
 
-                // Check if position is inside domain
-                if x < domain_min[0] || x > domain_max[0]
-                    || y < domain_min[1] || y > domain_max[1]
-                    || z < domain_min[2] || z > domain_max[2]
+                // Keep at least half a spacing from the max domain faces.
+                // When the extent isn't an exact multiple of the spacing, the
+                // ceil-grid would otherwise place the last layer closer than
+                // 0.5 * spacing to the wall's boundary-particle mirror plane,
+                // over-densifying the initial state there — the pressure
+                // spike ejects the whole face of particles within the first
+                // few steps. (The min faces are safe by construction: the
+                // grid starts at min + 0.5 * spacing.)
+                let margin = 0.499 * spacing;
+                if x < domain_min[0] || x > domain_max[0] - margin
+                    || y < domain_min[1] || y > domain_max[1] - margin
+                    || z < domain_min[2] || z > domain_max[2] - margin
                 {
                     continue;
                 }
