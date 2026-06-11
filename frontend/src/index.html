@@ -28,9 +28,10 @@
 
     * { box-sizing: border-box; }
 
-    body {
+    html, body {
       margin: 0;
       padding: 0;
+      height: 100%;
       overflow: hidden;
       font-family: var(--sans);
       background: var(--bg0);
@@ -39,10 +40,12 @@
       -webkit-font-smoothing: antialiased;
     }
 
-    /* 100dvh tracks the *visible* viewport (excludes browser/OS chrome that
-       static 100vh can overshoot), so the pinned run button can never fall
-       below the fold. 100vh is the fallback for older engines. */
-    #app { display: flex; width: 100vw; height: 100vh; height: 100dvh; }
+    /* Pin to the real visual viewport with position:fixed + inset:0 rather
+       than viewport units. 100vh/100dvh can resolve TALLER than the visible
+       window on some browsers (browser chrome, OS scaling, resize timing),
+       which pushes the flex-pinned run button below the fold. inset:0 always
+       fills exactly the visible area, so the footer can never clip. */
+    #app { position: fixed; inset: 0; display: flex; }
 
     /* ============ Sidebar ============ */
     #sidebar {
