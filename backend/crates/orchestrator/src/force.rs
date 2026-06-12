@@ -47,6 +47,7 @@ pub fn compute_surface_forces(
     // Sample surface at SDF grid points that are close to the surface
     // (distance within ~2h of the surface)
     let surface_threshold = 2.0 * h;
+    let support = 2.0 * h;
 
     // Grid cell size and dimensions
     let cell_size = sdf.cell_size;
@@ -54,6 +55,32 @@ pub fn compute_surface_forces(
 
     // Area element for each sample point
     let d_area = cell_size * cell_size;
+
+    // Bin fluid particles into a uniform spatial grid (cell = support radius)
+    // so each surface sample only tests fluid in its 27 neighbouring cells.
+    // Previously every surface sample looped over ALL fluid particles, making
+    // this O(surface_samples * n_fluid); for a real obstacle that is hundreds
+    // of millions of ops per call and dominated the runner's per-batch time
+    // (the SPH step itself is unaffected). The grid makes it O(surface * local).
+    let n_fluid = particles.len();
+    if n_fluid == 0 {
+        return SurfaceForce { net_force, net_moment };
+    }
+    let inv_support = 1.0 / support;
+    let cell_of = |x: f32, y: f32, z: f32| -> (i32, i32, i32) {
+        (
+            (x * inv_support).floor() as i32,
+            (y * inv_support).floor() as i32,
+            (z * inv_support).floor() as i32,
+        )
+    };
+    let mut grid: std::collections::HashMap<(i32, i32, i32), Vec<u32>> =
+        std::collections::HashMap::new();
+    for p in 0..n_fluid {
+        grid.entry(cell_of(particles.x[p], particles.y[p], particles.z[p]))
+            .or_default()
+            .push(p as u32);
+    }
 
     // Iterate over SDF grid points
     for i in 0..nx {
@@ -80,22 +107,28 @@ pub fn compute_surface_forces(
                     continue;
                 }
 
-                // Accumulate pressure forces from nearby fluid particles
+                // Accumulate pressure forces from nearby fluid particles, testing
+                // only the 27 grid cells around this surface sample.
                 let mut local_pressure = 0.0;
                 let mut weight_sum = 0.0;
-
-                // Search for nearby particles within smoothing radius
-                for p_idx in 0..particles.len() {
-                    let dx = particles.x[p_idx] - px;
-                    let dy = particles.y[p_idx] - py;
-                    let dz = particles.z[p_idx] - pz;
-                    let r = (dx*dx + dy*dy + dz*dz).sqrt();
-
-                    // Only include particles within kernel support (2h)
-                    if r < 2.0 * h {
-                        let w = wendland_c2(r, h);
-                        local_pressure += particles.pressure[p_idx] * w;
-                        weight_sum += w;
+                let (scx, scy, scz) = cell_of(px, py, pz);
+                for cz in (scz - 1)..=(scz + 1) {
+                    for cy in (scy - 1)..=(scy + 1) {
+                        for cx in (scx - 1)..=(scx + 1) {
+                            let Some(bucket) = grid.get(&(cx, cy, cz)) else { continue };
+                            for &p_idx in bucket {
+                                let p_idx = p_idx as usize;
+                                let dx = particles.x[p_idx] - px;
+                                let dy = particles.y[p_idx] - py;
+                                let dz = particles.z[p_idx] - pz;
+                                let r = (dx*dx + dy*dy + dz*dz).sqrt();
+                                if r < support {
+                                    let w = wendland_c2(r, h);
+                                    local_pressure += particles.pressure[p_idx] * w;
+                                    weight_sum += w;
+                                }
+                            }
+                        }
                     }
                 }
 
