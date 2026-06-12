@@ -380,14 +380,23 @@ fn generate_geometry_boundary_particles(
     let domain_min = config.domain.min;
     let domain_max = config.domain.max;
 
-    // Sample geometry surface at particle spacing resolution
-    // Look for zero-crossings in the SDF
     let nx = ((domain_max[0] - domain_min[0]) / spacing).ceil() as usize;
     let ny = ((domain_max[1] - domain_min[1]) / spacing).ceil() as usize;
     let nz = ((domain_max[2] - domain_min[2]) / spacing).ceil() as usize;
 
-    let surface_threshold = spacing * 0.5; // Within half a particle spacing of surface
+    // Fill the near-surface INTERIOR of the solid on the same regular lattice
+    // as the fluid: place a boundary particle at every lattice point inside the
+    // obstacle (sdf < 0) within `n_layers` of the surface.
+    //
+    // The previous approach detected lattice points in a thin shell OUTSIDE the
+    // surface and scattered three layers along the interpolated normal. On a
+    // curved surface (cylinder, sphere) the surface weaves between lattice
+    // points, so only a sparse dotted set was caught and the normal-offset
+    // scatter left holes — fluid leaked straight through obstacles under
+    // impact pressure. Filling interior lattice points instead gives a dense,
+    // gapless wall aligned with the fluid grid, exactly like the domain walls.
     let n_layers: usize = 3;
+    let band = (n_layers as f32) * spacing;
 
     for i in 0..nx {
         for j in 0..ny {
@@ -398,25 +407,20 @@ fn generate_geometry_boundary_particles(
 
                 let dist = sdf.sample([x, y, z]);
 
-                // If near the surface (small positive distance), place boundary particles
-                // in 3 layers along the inward normal (into the solid)
-                if dist > 0.0 && dist < surface_threshold {
+                // Inside the solid and within `band` of the surface
+                if dist < 0.0 && dist > -band {
+                    // Gradient points toward increasing distance, i.e. outward
+                    // into the fluid — the outward boundary normal we want.
                     let normal = sdf.gradient([x, y, z]);
-
-                    for layer in 0..n_layers {
-                        // Offset each layer by (layer + 0.5) * spacing along the
-                        // inward normal, mirroring the fluid grid across the surface.
-                        let offset = (layer as f32 + 0.5) * spacing;
-                        boundary_particles.push(BoundaryParticleData {
-                            x: x - normal[0] * offset,
-                            y: y - normal[1] * offset,
-                            z: z - normal[2] * offset,
-                            mass,
-                            nx: normal[0],
-                            ny: normal[1],
-                            nz: normal[2],
-                        });
-                    }
+                    boundary_particles.push(BoundaryParticleData {
+                        x,
+                        y,
+                        z,
+                        mass,
+                        nx: normal[0],
+                        ny: normal[1],
+                        nz: normal[2],
+                    });
                 }
             }
         }
