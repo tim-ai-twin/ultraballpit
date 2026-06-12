@@ -47,7 +47,7 @@ geometries/       # STL geometry files
 - **Orchestrator** for STL-to-SDF geometry pipeline, domain setup, simulation config
 - **HTTP server** with WebSocket streaming of full particle state (positions + velocities, 30 fps), GPU-backed simulation runner, inline config API, obstacle mesh endpoint
 - **Three.js frontend**: sphere-shaded particles at physical size with speed/density/temperature color modes, boundary-condition-coded container rendering, editable parameter panel (solver, resolution, gravity, domain size, per-wall BCs, fluid fill region, procedural obstacles), live telemetry HUD (dt, steps/s, realtime factor)
-- **Force extraction** (pressure, viscous, net forces on geometry surfaces)
+- **Force extraction** (pressure, viscous, net forces on geometry surfaces; grid-accelerated)
 - **Distributed execution** infrastructure for multi-instance simulation
 - **Reference test suite** (gravity settling, hydrostatic pressure, pressure equalization)
 - **Validation benchmarks:**
@@ -78,3 +78,19 @@ cd backend && cargo test --features gpu -p reference-tests -- gpu_tests
 ```
 
 See [`specs/001-sph-fluid-sim/benchmark-results.md`](specs/001-sph-fluid-sim/benchmark-results.md) for detailed benchmark results.
+
+## Diagnostics
+
+Standalone GPU diagnostic examples (require a Metal-capable GPU):
+
+```sh
+# Print the GPU adapter's features and compute limits
+cargo run --release -p kernel --example gpu_features --features gpu
+
+# Per-pass GPU step timing for an obstacle vs obstacle-free dam break
+# (grid build / density / boundary pressure / forces / integrate / readback).
+# Useful for telling whether a slow scene is GPU-bound or CPU-bound: the SPH
+# step is the same with or without an obstacle, so obstacle slowdowns are
+# almost always in the runner's per-batch CPU work, not the kernel.
+cargo run --release -p orchestrator --example profile_obstacle --features gpu
+```

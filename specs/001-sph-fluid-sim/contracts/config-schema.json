@@ -3,7 +3,7 @@
   "title": "SimulationConfig",
   "description": "Configuration for an ultraballpit SPH fluid simulation",
   "type": "object",
-  "required": ["name", "fluid_type", "geometry_file", "domain", "particle_spacing"],
+  "required": ["name", "fluid_type", "domain", "particle_spacing"],
   "properties": {
     "name": {
       "type": "string",
@@ -12,11 +12,50 @@
     "fluid_type": {
       "type": "string",
       "enum": ["Water", "Air", "Mixed"],
-      "description": "Which fluid(s) to simulate. Mixed = both water and air particles in the same domain."
+      "description": "Which fluid(s) to simulate. Mixed = both water and air particles in the same domain. Note: Air/Mixed run on the CPU backend only (GPU air support is unimplemented)."
     },
     "geometry_file": {
       "type": "string",
-      "description": "Path to STL geometry file (relative to configs dir)"
+      "description": "Optional path to an STL obstacle mesh (relative to configs dir). Superseded by `geometry` when both are present. Omit both for no obstacle."
+    },
+    "geometry": {
+      "description": "Optional procedural obstacle, generated in-engine (no STL needed). Takes precedence over `geometry_file`.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type"],
+          "properties": { "type": { "const": "none" } }
+        },
+        {
+          "type": "object",
+          "required": ["type", "center", "radius"],
+          "properties": {
+            "type": { "const": "sphere" },
+            "center": { "$ref": "#/$defs/vec3" },
+            "radius": { "type": "number", "exclusiveMinimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "min", "max"],
+          "properties": {
+            "type": { "const": "box" },
+            "min": { "$ref": "#/$defs/vec3" },
+            "max": { "$ref": "#/$defs/vec3" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "center", "radius", "height"],
+          "properties": {
+            "type": { "const": "cylinder" },
+            "center": { "$ref": "#/$defs/vec3" },
+            "radius": { "type": "number", "exclusiveMinimum": 0 },
+            "height": { "type": "number", "exclusiveMinimum": 0 },
+            "axis": { "type": "string", "enum": ["x", "y", "z"], "default": "y" }
+          }
+        }
+      ]
     },
     "domain": {
       "type": "object",
@@ -26,6 +65,15 @@
         "max": { "$ref": "#/$defs/vec3" }
       },
       "description": "Axis-aligned bounding box for simulation domain"
+    },
+    "fluid_region": {
+      "type": "object",
+      "required": ["min", "max"],
+      "properties": {
+        "min": { "$ref": "#/$defs/vec3" },
+        "max": { "$ref": "#/$defs/vec3" }
+      },
+      "description": "Optional sub-box (clamped to `domain`) initially filled with fluid. Defaults to the whole domain. Used for dam-break-style columns."
     },
     "boundary_conditions": {
       "type": "object",
@@ -88,6 +136,18 @@
       "maximum": 1.0,
       "default": 0.4,
       "description": "CFL condition for adaptive timestep"
+    },
+    "backend": {
+      "type": "string",
+      "enum": ["cpu", "gpu", "auto"],
+      "default": "auto",
+      "description": "Compute backend. auto = GPU if available, else CPU. Forced to CPU when the fluid contains air particles."
+    },
+    "solver": {
+      "type": "string",
+      "enum": ["wcsph", "pcisph"],
+      "default": "wcsph",
+      "description": "SPH solver. wcsph = weakly compressible (acoustic CFL); pcisph = predictive-corrective incompressible (advective CFL, larger timesteps)."
     }
   },
   "$defs": {
