@@ -109,10 +109,16 @@ pub struct GpuBuffers {
     pub pcisph_np_acc_y: wgpu::Buffer,
     pub pcisph_np_acc_z: wgpu::Buffer,
     pub pcisph_delta: wgpu::Buffer,
-    /// Convergence counter: [0]=sum of density errors (fixed-point), [1]=count of over-compressed
+    /// Convergence state: [0]=sum of density errors (fixed-point),
+    /// [1]=count of over-compressed, [2]=correction iterations run this step.
     pub pcisph_convergence: wgpu::Buffer,
-    /// Staging buffer for convergence readback (2 × u32)
+    /// Staging buffer for convergence readback (4 × u32)
     pub staging_convergence: wgpu::Buffer,
+    /// Indirect dispatch args for the PCISPH correction loop, 3 × (x, y, z):
+    /// [particles, boundary particles, single workgroup]. Reset to full
+    /// counts every step and zeroed on-device once the solve converges, so
+    /// the remaining iterations dispatch nothing.
+    pub pcisph_args: wgpu::Buffer,
 
     /// Number of fluid particles
     pub n_particles: u32,
@@ -124,6 +130,9 @@ pub struct GpuBuffers {
 
 /// Minimum buffer size (wgpu requires non-zero buffers).
 const MIN_BUF_SIZE: u64 = 4;
+
+/// Size of `GpuBuffers::pcisph_args`: three (x, y, z) indirect dispatches.
+pub const PCISPH_ARGS_BYTES: u64 = 3 * 3 * 4;
 
 /// Number of per-particle arrays permuted into cell order after each grid
 /// build (see `GpuBuffers::sorted_arrays`).
@@ -285,8 +294,16 @@ impl GpuBuffers {
         let pcisph_np_acc_y = create_storage_buf(device, "pcisph_np_acc_y", &zeros_f32_n);
         let pcisph_np_acc_z = create_storage_buf(device, "pcisph_np_acc_z", &zeros_f32_n);
         let pcisph_delta = create_storage_buf(device, "pcisph_delta", &zeros_f32_n);
-        let pcisph_convergence = create_storage_buf_u32(device, "pcisph_convergence", &[0u32, 0u32]);
-        let staging_convergence = create_staging_buf(device, "staging_convergence", 8); // 2 × u32
+        let pcisph_convergence = create_storage_buf_u32(device, "pcisph_convergence", &[0u32; 4]);
+        let staging_convergence = create_staging_buf(device, "staging_convergence", 16); // 4 × u32
+        let pcisph_args = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pcisph_args"),
+            size: PCISPH_ARGS_BYTES,
+            usage: wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             params_buffer,
@@ -330,6 +347,7 @@ impl GpuBuffers {
             pcisph_delta,
             pcisph_convergence,
             staging_convergence,
+            pcisph_args,
             staging_density,
             staging_pos_x,
             staging_pos_y,
@@ -489,17 +507,17 @@ impl GpuBuffers {
         ]
     }
 
-    /// Read back the PCISPH convergence counters (2 × u32) from GPU.
-    /// Returns (sum_density_error_fixed_point, count_over_compressed).
+    /// Read back the PCISPH convergence state (see `pcisph_convergence`):
+    /// (sum_density_error_fixed_point, count_over_compressed, iterations).
     pub fn readback_convergence(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-    ) -> [u32; 2] {
+    ) -> [u32; 3] {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("readback_convergence"),
         });
-        encoder.copy_buffer_to_buffer(&self.pcisph_convergence, 0, &self.staging_convergence, 0, 8);
+        encoder.copy_buffer_to_buffer(&self.pcisph_convergence, 0, &self.staging_convergence, 0, 16);
         queue.submit(std::iter::once(encoder.finish()));
 
         let slice = self.staging_convergence.slice(..);
@@ -512,7 +530,7 @@ impl GpuBuffers {
 
         let data = slice.get_mapped_range();
         let vals: &[u32] = bytemuck::cast_slice(&data);
-        let result = [vals[0], vals[1]];
+        let result = [vals[0], vals[1], vals[2]];
         drop(data);
         self.staging_convergence.unmap();
         result

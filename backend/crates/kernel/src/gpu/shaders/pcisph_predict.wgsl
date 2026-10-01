@@ -9,7 +9,7 @@
 // - correct_pressure_pcisph:   correct pressure from density error
 // - update_pred_vel_pcisph:    update predicted velocity with pressure acceleration
 // - final_integrate_pcisph:    commit final velocity/position with domain clamping
-// - clear_convergence:         zero out convergence counters
+// - clear_convergence:         zero out convergence counters, count the iteration
 
 const PI: f32 = 3.14159265358979323846;
 const WENDLAND_C2_NORM_3D: f32 = 0.41780189; // 21 / (16 * PI)
@@ -109,6 +109,11 @@ fn save_and_init_pcisph(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Warm-start pressure: retain 50% from previous step
     pressure[i] = pressure[i] * 0.5;
+
+    // Reset the per-step correction-iteration counter.
+    if i == 0u {
+        atomicStore(&convergence[2], 0u);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -261,10 +266,12 @@ fn final_integrate_pcisph(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ---------------------------------------------------------------------------
-// Entry point: Clear convergence counters (dispatch with 1 thread)
+// Entry point: Clear convergence counters at the start of a correction
+// iteration and count the iteration (dispatch with 1 thread)
 // ---------------------------------------------------------------------------
 @compute @workgroup_size(1)
 fn clear_convergence(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&convergence[0], 0u);
     atomicStore(&convergence[1], 0u);
+    atomicAdd(&convergence[2], 1u);
 }

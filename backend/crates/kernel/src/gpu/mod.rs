@@ -136,6 +136,9 @@ pub struct GpuKernel {
     pipeline_pcisph_final_integrate: wgpu::ComputePipeline,
     pipeline_pcisph_clear_convergence: wgpu::ComputePipeline,
     pipeline_pcisph_pressure_force: wgpu::ComputePipeline,
+    // On-device convergence check (zeroes `bufs.pcisph_args` once converged).
+    pipeline_pcisph_check: wgpu::ComputePipeline,
+    pcisph_check_bg: wgpu::BindGroup,
 
     // Empty bind group layout for unused group slots in pipeline layouts
     bgl_empty: wgpu::BindGroupLayout,
@@ -210,6 +213,11 @@ pub struct GpuKernel {
 /// CELLS_PER_SUPPORT cells on each side, so smaller cells trade more rows
 /// for fewer out-of-range candidates.
 const CELLS_PER_SUPPORT: u32 = 2;
+
+/// PCISPH correction iterations: always at least the minimum, then until the
+/// mean over-compression is below 1% or the maximum is reached.
+const PCISPH_MIN_ITERATIONS: u32 = 3;
+const PCISPH_MAX_ITERATIONS: u32 = 10;
 
 /// Maximum number of step submissions queued ahead of the GPU in `step()`.
 const MAX_IN_FLIGHT: usize = 2;
@@ -816,6 +824,34 @@ impl GpuKernel {
             cache: None,
         });
 
+        // PCISPH convergence check: convergence counters + indirect args.
+        let pcisph_converge_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pcisph_converge"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/pcisph_converge.wgsl").into()),
+        });
+        let bgl_pcisph_check = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("pcisph_check_bgl"),
+            entries: &[bgl_storage_rw(0), bgl_storage_rw(1)],
+        });
+        let pipeline_pcisph_check = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("pcisph_check"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("pcisph_check_pl"),
+                bind_group_layouts: &[&bgl_pcisph_check],
+                push_constant_ranges: &[],
+            })),
+            module: &pcisph_converge_shader,
+            entry_point: Some("check_convergence"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let pcisph_check_bg = bind_buffers(
+            &device,
+            "pcisph_check_bg",
+            &bgl_pcisph_check,
+            &[&bufs.pcisph_convergence, &bufs.pcisph_args],
+        );
+
         // Reorder params uniform buffer
         let count_params = CountParams {
             n_particles: particles.len() as u32,
@@ -950,6 +986,8 @@ impl GpuKernel {
             pipeline_pcisph_final_integrate,
             pipeline_pcisph_clear_convergence,
             pipeline_pcisph_pressure_force,
+            pipeline_pcisph_check,
+            pcisph_check_bg,
             bgl_empty,
             solver_type,
             bufs,
@@ -1290,6 +1328,12 @@ impl GpuKernel {
         if n_particles == 0 {
             return;
         }
+        if self.solver_type == SolverType::Pcisph {
+            // The integration below is WCSPH's; PCISPH's step() never waits
+            // on the GPU (beyond the in-flight cap) anyway.
+            self.step(dt);
+            return;
+        }
 
         let params = self.make_params(dt);
         let wg_particles = dispatch_size(n_particles, 256);
@@ -1578,10 +1622,6 @@ impl GpuKernel {
     fn create_forces_bg3(&self) -> wgpu::BindGroup { self.bg_cache().forces_bg3.clone() }
     fn create_integrate_bg0(&self) -> wgpu::BindGroup { self.bg_cache().integrate_bg0.clone() }
     fn create_integrate_bg1(&self) -> wgpu::BindGroup { self.bg_cache().integrate_bg1.clone() }
-    fn create_pcisph_predict_bg0(&self) -> wgpu::BindGroup { self.bg_cache().pcisph_predict_bg0.clone() }
-    fn create_pcisph_predict_bg1(&self) -> wgpu::BindGroup { self.bg_cache().pcisph_predict_bg1.clone() }
-    fn create_pcisph_predict_bg2(&self) -> wgpu::BindGroup { self.bg_cache().pcisph_predict_bg2.clone() }
-    fn create_pcisph_bg3(&self) -> wgpu::BindGroup { self.bg_cache().pcisph_bg3.clone() }
 
     /// Create an empty bind group for unused group slots.
     fn build_empty_bind_group(&self) -> wgpu::BindGroup {
@@ -1876,278 +1916,117 @@ impl GpuKernel {
         self.upload_pcisph_delta(&deltas);
     }
 
-    /// Execute a full PCISPH step, managing its own command encoder lifecycle.
+    /// Encode a full PCISPH step (after any grid rebuild) into `encoder`.
     ///
     /// PCISPH step structure:
-    /// 1. Non-pressure forces (reuse WCSPH density + forces pipeline)
+    /// 1. Non-pressure forces (reuse WCSPH density + forces pipelines, pressure = 0)
     /// 2. Save state + init prediction
-    /// 3. Correction loop: predict positions → density → correct pressure → pressure forces → update vel
+    /// 3. Correction loop: predict positions → density → correct pressure →
+    ///    pressure forces → update vel, PCISPH_MIN_ITERATIONS..=PCISPH_MAX_ITERATIONS
+    ///    times, stopping once the mean over-compression is below 1%
     /// 4. Final integration
     ///
-    /// Each iteration batch gets its own encoder since convergence checks require
-    /// GPU→CPU readback (submit + poll + map) between iterations.
-    fn step_pcisph(&mut self, params: &GpuSimParams) {
+    /// Everything is encoded into one compute pass of one submission; the CPU
+    /// never waits. Convergence is decided on the GPU: from the minimum
+    /// iteration on, `pcisph_converge.wgsl` zeroes the indirect dispatch args
+    /// of the remaining iterations once an iteration converges, so they run no
+    /// work (same break semantics as a CPU loop with a readback per iteration).
+    ///
+    /// `params` must have `pass_index = 1` (density-only summation, no EOS):
+    /// it is the only shader setting that differs between phases, and only the
+    /// density shader reads it, so one params state serves the whole step.
+    fn encode_pcisph(&self, encoder: &mut wgpu::CommandEncoder) {
         let n_particles = self.bufs.n_particles;
         let n_boundary = self.bufs.n_boundary;
         let wg = self.workgroup_size;
         let wg_particles = dispatch_size(n_particles, wg);
         let wg_boundary = dispatch_size(n_boundary.max(1), wg);
 
-        let min_iterations = 3u32;
-        let max_iterations = 10u32;
+        // Full-size dispatch args for this step's correction loop. One write
+        // per submission, so it lands between the previous step and this one.
+        let args: [u32; 9] = [wg_particles, 1, 1, wg_boundary, 1, 1, 1, 1, 1];
+        self.queue.write_buffer(&self.bufs.pcisph_args, 0, bytemuck::cast_slice(&args));
+        const ARGS_PARTICLES: u64 = 0;
+        const ARGS_BOUNDARY: u64 = 12;
+        const ARGS_SINGLE: u64 = 24;
 
-        // --- Phase A: Non-pressure forces + save/init ---
-        // For PCISPH, we compute density WITHOUT Tait EOS (pass_index=1) so pressure
-        // stays at 0. The forces shader then produces only non-pressure forces
-        // (viscous + gravity + boundary repulsion) since pressure gradient = 0.
-        //
-        // IMPORTANT: Each encoder submission must use a single params state because
-        // queue.write_buffer calls are all applied BEFORE the command buffer executes.
-        // Multiple writes to the same buffer in one submit → only the last value is seen.
+        // Non-pressure forces see pressure = 0 (also zeroes the 0.5x warm start).
+        encoder.clear_buffer(&self.bufs.pressure, 0, None);
 
-        // Sub-phase A1: Clear pressure + density-only (pass_index=1)
-        {
-            let mut density_params = *params;
-            density_params.pass_index = 1;
-            self.bufs.update_params(&self.queue, &density_params);
+        let c = self.bg_cache();
+        let empty_bg = &c.empty_bind_group;
+        let density_bgs = [&c.density_bg0, empty_bg, &c.density_bg2, &c.density_forces_bg3];
+        let forces_bgs = [&c.forces_bg0, &c.forces_bg1, &c.forces_bg2, &c.forces_bg3];
+        let pcisph_bgs = [&c.pcisph_predict_bg0, &c.pcisph_predict_bg1, &c.pcisph_predict_bg2, &c.pcisph_bg3];
 
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("pcisph_density_init"),
-            });
-            encoder.clear_buffer(&self.bufs.pressure, 0, None);
+        // Dispatches within one compute pass execute in order with storage
+        // writes visible to later dispatches, so the whole step is one pass.
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("pcisph_step"), timestamp_writes: None,
+        });
 
-            let density_bg0 = self.create_density_bg0();
-            let density_bg2 = self.create_density_bg2();
-            let density_bg3 = self.create_density_forces_bg3();
-            let empty_bg = self.create_empty_bind_group();
-
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("pcisph_density"), timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipeline_density);
-                pass.set_bind_group(0, &density_bg0, &[]); pass.set_bind_group(1, &empty_bg, &[]);
-                pass.set_bind_group(2, &density_bg2, &[]); pass.set_bind_group(3, &density_bg3, &[]);
-                pass.dispatch_workgroups(wg_particles, 1, 1);
+        // `gated` dispatches indirectly from the convergence-gated args.
+        enum Groups { Particles, Boundary, Single }
+        let run = |pass: &mut wgpu::ComputePass, pipeline: &wgpu::ComputePipeline,
+                   bgs: &[&wgpu::BindGroup], groups: Groups, gated: bool| {
+            pass.set_pipeline(pipeline);
+            for (g, bg) in bgs.iter().enumerate() {
+                pass.set_bind_group(g as u32, *bg, &[]);
             }
+            let (count, offset) = match groups {
+                Groups::Particles => (wg_particles, ARGS_PARTICLES),
+                Groups::Boundary => (wg_boundary, ARGS_BOUNDARY),
+                Groups::Single => (1, ARGS_SINGLE),
+            };
+            if gated {
+                pass.dispatch_workgroups_indirect(&self.bufs.pcisph_args, offset);
+            } else {
+                pass.dispatch_workgroups(count, 1, 1);
+            }
+        };
+        let p = &mut pass;
 
-            self.queue.submit(std::iter::once(encoder.finish()));
-            self.device.poll(wgpu::Maintain::Wait);
-        }
-
-        // Sub-phase A2: Forces (pass_index=0, pressure=0) + save/init
-        {
-            self.bufs.update_params(&self.queue, params);
-
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("pcisph_forces_init"),
-            });
-
-            let forces_bg0 = self.create_forces_bg0();
-            let forces_bg1 = self.create_forces_bg1();
-            let forces_bg2 = self.create_forces_bg2();
-            let forces_bg3 = self.create_forces_bg3();
-
+        // --- Phase A: non-pressure forces + save/init ---
+        // Density only (pass_index=1: no delta-SPH, no EOS), so pressure stays 0
+        // and the forces pass yields only viscous + gravity + boundary repulsion.
+        run(p, &self.pipeline_density, &density_bgs, Groups::Particles, false);
+        if n_boundary > 0 {
             // Boundary pressure mirroring (pressure=0 → boundary pressure=0)
+            run(p, &self.pipeline_boundary_pressure, &forces_bgs, Groups::Boundary, false);
+        }
+        run(p, &self.pipeline_forces, &forces_bgs, Groups::Particles, false);
+        run(p, &self.pipeline_pcisph_save_init, &pcisph_bgs, Groups::Particles, false);
+
+        // --- Phase B: correction iterations ---
+        for iter in 0..PCISPH_MAX_ITERATIONS {
+            // Iterations before the minimum always run; later ones are skipped
+            // on-device once an earlier one converged.
+            let gated = iter >= PCISPH_MIN_ITERATIONS;
+            run(p, &self.pipeline_pcisph_clear_convergence, &pcisph_bgs, Groups::Single, gated);
+            run(p, &self.pipeline_pcisph_predict_pos, &pcisph_bgs, Groups::Particles, gated);
+            run(p, &self.pipeline_density, &density_bgs, Groups::Particles, gated);
+            run(p, &self.pipeline_pcisph_correct_pressure, &pcisph_bgs, Groups::Particles, gated);
             if n_boundary > 0 {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("pcisph_bnd_init"), timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipeline_boundary_pressure);
-                pass.set_bind_group(0, &forces_bg0, &[]); pass.set_bind_group(1, &forces_bg1, &[]);
-                pass.set_bind_group(2, &forces_bg2, &[]); pass.set_bind_group(3, &forces_bg3, &[]);
-                pass.dispatch_workgroups(wg_boundary, 1, 1);
+                run(p, &self.pipeline_boundary_pressure, &forces_bgs, Groups::Boundary, gated);
             }
+            run(p, &self.pipeline_pcisph_pressure_force, &forces_bgs, Groups::Particles, gated);
+            run(p, &self.pipeline_pcisph_update_vel, &pcisph_bgs, Groups::Particles, gated);
 
-            // Forces: only non-pressure forces (viscous + gravity + boundary repulsion)
-            // since pressure=0 → pressure gradient term = 0
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("pcisph_forces"), timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipeline_forces);
-                pass.set_bind_group(0, &forces_bg0, &[]); pass.set_bind_group(1, &forces_bg1, &[]);
-                pass.set_bind_group(2, &forces_bg2, &[]); pass.set_bind_group(3, &forces_bg3, &[]);
-                pass.dispatch_workgroups(wg_particles, 1, 1);
-            }
-
-            // Save state and initialize prediction
-            let pcisph_bg0 = self.create_pcisph_predict_bg0();
-            let pcisph_bg1 = self.create_pcisph_predict_bg1();
-            let pcisph_bg2 = self.create_pcisph_predict_bg2();
-            let pcisph_bg3 = self.create_pcisph_bg3();
-
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("pcisph_save_init"), timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipeline_pcisph_save_init);
-                pass.set_bind_group(0, &pcisph_bg0, &[]);
-                pass.set_bind_group(1, &pcisph_bg1, &[]);
-                pass.set_bind_group(2, &pcisph_bg2, &[]);
-                pass.set_bind_group(3, &pcisph_bg3, &[]);
-                pass.dispatch_workgroups(wg_particles, 1, 1);
-            }
-
-            self.queue.submit(std::iter::once(encoder.finish()));
-            self.device.poll(wgpu::Maintain::Wait);
-        }
-
-        // --- Phase B: Correction iterations ---
-        // Use pass_index=1 for all iteration passes (only density shader checks it;
-        // other shaders ignore it). This avoids the queue.write_buffer race condition
-        // where multiple writes to the same buffer before submit cause the last one to win.
-        let mut iter_params = *params;
-        iter_params.pass_index = 1;
-
-        for iter in 0..max_iterations {
-            self.bufs.update_params(&self.queue, &iter_params);
-
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("pcisph_iter"),
-            });
-
-            let pcisph_bg0 = self.create_pcisph_predict_bg0();
-            let pcisph_bg1 = self.create_pcisph_predict_bg1();
-            let pcisph_bg2 = self.create_pcisph_predict_bg2();
-            let pcisph_bg3 = self.create_pcisph_bg3();
-            let forces_bg0 = self.create_forces_bg0();
-            let forces_bg1 = self.create_forces_bg1();
-            let forces_bg2 = self.create_forces_bg2();
-            let forces_bg3 = self.create_forces_bg3();
-            let density_bg0 = self.create_density_bg0();
-            let density_bg2 = self.create_density_bg2();
-            let density_bg3 = self.create_density_forces_bg3();
-            let empty_bg = self.create_empty_bind_group();
-
-            // Clear convergence
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("pcisph_clear_conv"), timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipeline_pcisph_clear_convergence);
-                pass.set_bind_group(0, &pcisph_bg0, &[]);
-                pass.set_bind_group(1, &pcisph_bg1, &[]);
-                pass.set_bind_group(2, &pcisph_bg2, &[]);
-                pass.set_bind_group(3, &pcisph_bg3, &[]);
-                pass.dispatch_workgroups(1, 1, 1);
-            }
-
-            // Predict positions
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("pcisph_predict_pos"), timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipeline_pcisph_predict_pos);
-                pass.set_bind_group(0, &pcisph_bg0, &[]);
-                pass.set_bind_group(1, &pcisph_bg1, &[]);
-                pass.set_bind_group(2, &pcisph_bg2, &[]);
-                pass.set_bind_group(3, &pcisph_bg3, &[]);
-                pass.dispatch_workgroups(wg_particles, 1, 1);
-            }
-
-            // Density summation (density-only mode: pass_index=1, set above)
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("pcisph_density"), timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipeline_density);
-                pass.set_bind_group(0, &density_bg0, &[]);
-                pass.set_bind_group(1, &empty_bg, &[]);
-                pass.set_bind_group(2, &density_bg2, &[]);
-                pass.set_bind_group(3, &density_bg3, &[]);
-                pass.dispatch_workgroups(wg_particles, 1, 1);
-            }
-
-            // Correct pressure from density error
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("pcisph_correct_pressure"), timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipeline_pcisph_correct_pressure);
-                pass.set_bind_group(0, &pcisph_bg0, &[]);
-                pass.set_bind_group(1, &pcisph_bg1, &[]);
-                pass.set_bind_group(2, &pcisph_bg2, &[]);
-                pass.set_bind_group(3, &pcisph_bg3, &[]);
-                pass.dispatch_workgroups(wg_particles, 1, 1);
-            }
-
-            // Boundary pressure mirroring
-            if n_boundary > 0 {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("pcisph_bnd_pressure"), timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipeline_boundary_pressure);
-                pass.set_bind_group(0, &forces_bg0, &[]); pass.set_bind_group(1, &forces_bg1, &[]);
-                pass.set_bind_group(2, &forces_bg2, &[]); pass.set_bind_group(3, &forces_bg3, &[]);
-                pass.dispatch_workgroups(wg_boundary, 1, 1);
-            }
-
-            // Pressure-only forces
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("pcisph_pressure_force"), timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipeline_pcisph_pressure_force);
-                pass.set_bind_group(0, &forces_bg0, &[]); pass.set_bind_group(1, &forces_bg1, &[]);
-                pass.set_bind_group(2, &forces_bg2, &[]); pass.set_bind_group(3, &forces_bg3, &[]);
-                pass.dispatch_workgroups(wg_particles, 1, 1);
-            }
-
-            // Update predicted velocity
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("pcisph_update_vel"), timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipeline_pcisph_update_vel);
-                pass.set_bind_group(0, &pcisph_bg0, &[]);
-                pass.set_bind_group(1, &pcisph_bg1, &[]);
-                pass.set_bind_group(2, &pcisph_bg2, &[]);
-                pass.set_bind_group(3, &pcisph_bg3, &[]);
-                pass.dispatch_workgroups(wg_particles, 1, 1);
-            }
-
-            self.queue.submit(std::iter::once(encoder.finish()));
-            self.device.poll(wgpu::Maintain::Wait);
-
-            // Check convergence after minimum iterations
-            if iter >= min_iterations - 1 {
-                let conv = self.bufs.readback_convergence(&self.device, &self.queue);
-                let sum_error = conv[0] as f64 / 1_000_000.0;
-                let count = conv[1];
-                let mean_error = if count > 0 { sum_error / count as f64 } else { 0.0 };
-                if mean_error < 0.01 {
-                    break;
-                }
+            // Convergence check after each iteration from the minimum on (the
+            // last iteration needs none: the loop ends regardless).
+            if iter + 1 >= PCISPH_MIN_ITERATIONS && iter + 1 < PCISPH_MAX_ITERATIONS {
+                run(p, &self.pipeline_pcisph_check, &[&self.pcisph_check_bg], Groups::Single, false);
             }
         }
 
-        // --- Phase C: Final integration ---
-        {
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("pcisph_final"),
-            });
+        // --- Phase C: final integration ---
+        run(p, &self.pipeline_pcisph_final_integrate, &pcisph_bgs, Groups::Particles, false);
+    }
 
-            let pcisph_bg0 = self.create_pcisph_predict_bg0();
-            let pcisph_bg1 = self.create_pcisph_predict_bg1();
-            let pcisph_bg2 = self.create_pcisph_predict_bg2();
-            let pcisph_bg3 = self.create_pcisph_bg3();
-
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("pcisph_final_integrate"), timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.pipeline_pcisph_final_integrate);
-                pass.set_bind_group(0, &pcisph_bg0, &[]);
-                pass.set_bind_group(1, &pcisph_bg1, &[]);
-                pass.set_bind_group(2, &pcisph_bg2, &[]);
-                pass.set_bind_group(3, &pcisph_bg3, &[]);
-                pass.dispatch_workgroups(wg_particles, 1, 1);
-            }
-
-            self.queue.submit(std::iter::once(encoder.finish()));
-            self.device.poll(wgpu::Maintain::Wait);
-        }
+    /// Correction iterations run by the most recent PCISPH step (waits for the
+    /// GPU; diagnostics/tests only).
+    pub fn pcisph_last_iterations(&self) -> u32 {
+        self.bufs.readback_convergence(&self.device, &self.queue)[2]
     }
 
     /// Record a submission and block until at most MAX_IN_FLIGHT remain queued.
@@ -2257,11 +2136,9 @@ impl SimulationKernel for GpuKernel {
             self.needs_init = false;
         }
 
-        // Update params buffer with current dt
-        self.bufs.update_params(&self.queue, &params);
-
         match self.solver_type {
             SolverType::Wcsph => {
+                self.bufs.update_params(&self.queue, &params);
                 let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("step_wcsph"),
                 });
@@ -2276,19 +2153,24 @@ impl SimulationKernel for GpuKernel {
                 self.track_submission(idx);
             }
             SolverType::Pcisph => {
-                // Grid rebuild if needed (PCISPH manages its own encoders)
-                let needs_grid = self.verlet_displacement >= self.verlet_skin * 0.5;
-                if needs_grid {
-                    let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("pcisph_grid"),
-                    });
+                // Density-only summation for every density pass of the step
+                // (the only params field that differs between PCISPH phases).
+                let mut pcisph_params = params;
+                pcisph_params.pass_index = 1;
+                self.bufs.update_params(&self.queue, &pcisph_params);
+
+                let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("step_pcisph"),
+                });
+                if self.verlet_displacement >= self.verlet_skin * 0.5 {
                     self.encode_grid(&mut encoder);
-                    self.queue.submit(std::iter::once(encoder.finish()));
-                    self.device.poll(wgpu::Maintain::Wait);
                     self.verlet_displacement = 0.0;
                 }
-                // PCISPH: non-pressure forces + iterative correction + final integrate
-                self.step_pcisph(&params);
+                // Non-pressure forces + iterative correction + final integrate,
+                // pipelined like WCSPH (no CPU wait).
+                self.encode_pcisph(&mut encoder);
+                let idx = self.queue.submit(std::iter::once(encoder.finish()));
+                self.track_submission(idx);
             }
         }
 

@@ -235,7 +235,9 @@ fn kernel_only(name: &str) {
         config.solver.to_kernel_solver_type(),
     )
     .unwrap();
-    let dt = 0.85 * config.cfl_number * h / config.speed_of_sound;
+    let pcisph = config.solver.to_kernel_solver_type() == kernel::SolverType::Pcisph;
+    // PCISPH: a typical dam-break dt (iteration counts depend on dt).
+    let dt = if pcisph { 4.0e-4 } else { 0.85 * config.cfl_number * h / config.speed_of_sound };
     for _ in 0..100 {
         k.step(dt);
     }
@@ -251,8 +253,9 @@ fn kernel_only(name: &str) {
     }
     k.sync();
     let async_sps = n as f64 / t.elapsed().as_secs_f64();
-    let _ = k.particles();
-    println!("{name:<10} n={:>7} kernel step(): {sync_sps:>8.1} steps/s   step_no_sync(): {async_sps:>8.1} steps/s", k.particle_count());
+    let p = k.particles();
+    let bad = (0..p.len()).filter(|&i| !p.x[i].is_finite()).count();
+    println!("{name:<10} n={:>7} kernel step(): {sync_sps:>8.1} steps/s   step_no_sync(): {async_sps:>8.1} steps/s  nonfinite={bad}", k.particle_count());
 }
 
 fn main() {
