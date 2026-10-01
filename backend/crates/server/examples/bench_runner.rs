@@ -14,6 +14,7 @@
 //!   kernel      kernel-only step() vs step_no_sync() rate
 //!
 //! Scenarios: dam25 dam15 dam10 pillar25 pillar15 pcisph25 tank25 (hydrostatic, at rest)
+//!   or a path to a config JSON file (throughput/quality modes)
 //!   (default: dam25 dam15 dam10 pillar25)
 //! Env: BENCH_SECS (default 6), BENCH_FRAMES=0 to disable the snapshot thread,
 //!      BENCH_SIMT (quality mode, default 0.4), BENCH_CFL to override cfl_number.
@@ -59,8 +60,21 @@ fn scenario(name: &str) -> SimulationConfig {
     serde_json::from_value(cfg).unwrap()
 }
 
+/// Runner for a built-in scenario name or a path to a config JSON file.
+fn make_runner(name: &str) -> SimulationRunner {
+    if !name.ends_with(".json") {
+        return SimulationRunner::new(scenario(name), std::path::Path::new(".")).unwrap();
+    }
+    let mut config = SimulationConfig::load(name).unwrap();
+    if let Some(cfl) = std::env::var("BENCH_CFL").ok().and_then(|s| s.parse().ok()) {
+        config.cfl_number = cfl;
+    }
+    let dir = std::path::Path::new(name).parent().unwrap_or(std::path::Path::new("."));
+    SimulationRunner::new(config, dir).unwrap()
+}
+
 fn throughput(name: &str, secs: f64, frames: bool) {
-    let runner = SimulationRunner::new(scenario(name), std::path::Path::new(".")).unwrap();
+    let runner = make_runner(name);
     let n = runner.particle_count();
     runner.start();
 
@@ -133,7 +147,7 @@ fn density_stats(p: &kernel::ParticleArrays) -> (f32, f32, f32) {
 /// `sim_end` simulated seconds, sampling density deviation and the dam-break
 /// front position after every batch.
 fn quality(name: &str, sim_end: f64) {
-    let runner = SimulationRunner::new(scenario(name), std::path::Path::new(".")).unwrap();
+    let runner = make_runner(name);
     runner.start();
     let x0 = runner.particles().x.iter().copied().fold(0.0f32, f32::max);
 
