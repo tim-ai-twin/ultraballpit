@@ -129,6 +129,45 @@ fn cell_hash(cx: u32, cy: u32, cz: u32) -> u32 {
     return cx + cy * params.grid_dim_x + cz * params.grid_dim_x * params.grid_dim_y;
 }
 
+// Index range of the cells in grid row (ny, nz) that can hold points within
+// sqrt(r2) of p: the row is skipped if its y/z extent is out of reach, and
+// its x extent is clipped to the sphere's chord. Returned as
+// (start_cell, end_cell) inclusive, or start > end when empty.
+fn culled_row_cells(p: vec3<f32>, ny: i32, nz: i32, r2: f32) -> vec2<i32> {
+    let cs = params.cell_size;
+    let y0 = params.domain_min_y + f32(ny) * cs;
+    let z0 = params.domain_min_z + f32(nz) * cs;
+    let dy = max(max(y0 - p.y, p.y - (y0 + cs)), 0.0);
+    let dz = max(max(z0 - p.z, p.z - (z0 + cs)), 0.0);
+    let rem = r2 - dy * dy - dz * dz;
+    if rem < 0.0 {
+        return vec2<i32>(1, 0);
+    }
+    let rx = sqrt(rem);
+    let gx = i32(params.grid_dim_x) - 1;
+    let x0 = clamp(i32(floor((p.x - rx - params.domain_min_x) / cs)), 0, gx);
+    let x1 = clamp(i32(floor((p.x + rx - params.domain_min_x) / cs)), 0, gx);
+    return vec2<i32>(x0, x1);
+}
+
+fn cells_to_range(cells: vec2<i32>, ny: i32, nz: i32) -> vec2<u32> {
+    if cells.x > cells.y {
+        return vec2<u32>(0u, 0u);
+    }
+    let c0 = cell_hash(u32(cells.x), u32(ny), u32(nz));
+    let c1 = cell_hash(u32(cells.y), u32(ny), u32(nz));
+    return vec2<u32>(cell_offsets[c0], cell_offsets[c1] + cell_counts[c1]);
+}
+
+fn bnd_cells_to_range(cells: vec2<i32>, ny: i32, nz: i32) -> vec2<u32> {
+    if cells.x > cells.y {
+        return vec2<u32>(0u, 0u);
+    }
+    let c0 = cell_hash(u32(cells.x), u32(ny), u32(nz));
+    let c1 = cell_hash(u32(cells.y), u32(ny), u32(nz));
+    return vec2<u32>(bnd_cell_offsets[c0], bnd_cell_offsets[c1] + bnd_cell_counts[c1]);
+}
+
 // Contiguous particle index range covering cells [cell.x - search, cell.x + search]
 // of grid row (ny, nz). Valid because particles are stored in cell order.
 fn row_range(cell: vec3<i32>, ny: i32, nz: i32) -> vec2<u32> {
@@ -173,6 +212,9 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px = pos_x[i];
     let py = pos_y[i];
     let pz = pos_z[i];
+    let p = vec3<f32>(px, py, pz);
+    // Row culling radius, padded so rounding can't drop a pair at r ~ 2h.
+    let cull_r2 = support_radius_sq * 1.0001;
 
     // Read old density for delta-SPH diffusion (before overwrite)
     let old_rho_i = density[i];
@@ -198,7 +240,7 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
             {
                 // The row's cells are adjacent in hash order and particles are
                 // stored in cell order, so the whole row is one index range.
-                let j_range = row_range(cell, ny, nz);
+                let j_range = cells_to_range(culled_row_cells(p, ny, nz, cull_r2), ny, nz);
                 for (var j = j_range.x; j < j_range.y; j = j + 1u) {
                     if j == i { continue; }
 
@@ -240,7 +282,7 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
                 {
                     // The row's cells are adjacent in hash order and particles are
                     // stored in cell order, so the whole row is one index range.
-                    let b_range = bnd_row_range(cell, bny, bnz);
+                    let b_range = bnd_cells_to_range(culled_row_cells(p, bny, bnz, cull_r2), bny, bnz);
                     for (var b = b_range.x; b < b_range.y; b = b + 1u) {
                         let ddx = px - bnd_x[b];
                         let ddy = py - bnd_y[b];
