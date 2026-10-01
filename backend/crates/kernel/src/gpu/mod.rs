@@ -352,7 +352,7 @@ impl GpuKernel {
         let workgroup_size = 256u32;
         let wg_str = format!("@workgroup_size({})", workgroup_size);
 
-        let grid_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let grid_shader = shader_module(&device, wgpu::ShaderModuleDescriptor {
             label: Some("neighbor_grid"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("shaders/neighbor_grid.wgsl").into(),
@@ -361,33 +361,33 @@ impl GpuKernel {
 
         let density_src: String = include_str!("shaders/density.wgsl")
             .replace("@workgroup_size(256)", &wg_str);
-        let density_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let density_shader = shader_module(&device, wgpu::ShaderModuleDescriptor {
             label: Some("density"),
             source: wgpu::ShaderSource::Wgsl(density_src.into()),
         });
 
         let forces_src: String = include_str!("shaders/forces.wgsl")
             .replace("@workgroup_size(256)", &wg_str);
-        let forces_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let forces_shader = shader_module(&device, wgpu::ShaderModuleDescriptor {
             label: Some("forces"),
             source: wgpu::ShaderSource::Wgsl(forces_src.into()),
         });
 
-        let integrate_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let integrate_shader = shader_module(&device, wgpu::ShaderModuleDescriptor {
             label: Some("integrate"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("shaders/integrate.wgsl").into(),
             ),
         });
 
-        let xsph_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let xsph_shader = shader_module(&device, wgpu::ShaderModuleDescriptor {
             label: Some("xsph"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("shaders/xsph.wgsl").into(),
             ),
         });
 
-        let sort_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let sort_shader = shader_module(&device, wgpu::ShaderModuleDescriptor {
             label: Some("sort_gather"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/sort_gather.wgsl").into()),
         });
@@ -702,14 +702,14 @@ impl GpuKernel {
         // --- PCISPH shaders and pipelines ---
         let pcisph_predict_src: String = include_str!("shaders/pcisph_predict.wgsl")
             .replace("@workgroup_size(256)", &wg_str);
-        let pcisph_predict_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let pcisph_predict_shader = shader_module(&device, wgpu::ShaderModuleDescriptor {
             label: Some("pcisph_predict"),
             source: wgpu::ShaderSource::Wgsl(pcisph_predict_src.into()),
         });
 
         let pcisph_pforce_src: String = include_str!("shaders/pcisph_pressure_force.wgsl")
             .replace("@workgroup_size(256)", &wg_str);
-        let pcisph_pforce_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let pcisph_pforce_shader = shader_module(&device, wgpu::ShaderModuleDescriptor {
             label: Some("pcisph_pressure_force"),
             source: wgpu::ShaderSource::Wgsl(pcisph_pforce_src.into()),
         });
@@ -870,7 +870,7 @@ impl GpuKernel {
         let timestamp_period = queue.get_timestamp_period();
 
         // --- Stats reduction resources ---
-        let stats_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let stats_shader = shader_module(&device, wgpu::ShaderModuleDescriptor {
             label: Some("stats"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/stats.wgsl").into()),
         });
@@ -1020,14 +1020,14 @@ impl GpuKernel {
 
         let density_src: String = include_str!("shaders/density.wgsl")
             .replace("@workgroup_size(256)", &wg_str);
-        let density_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let density_shader = shader_module(&self.device, wgpu::ShaderModuleDescriptor {
             label: Some("density"),
             source: wgpu::ShaderSource::Wgsl(density_src.into()),
         });
 
         let forces_src: String = include_str!("shaders/forces.wgsl")
             .replace("@workgroup_size(256)", &wg_str);
-        let forces_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let forces_shader = shader_module(&self.device, wgpu::ShaderModuleDescriptor {
             label: Some("forces"),
             source: wgpu::ShaderSource::Wgsl(forces_src.into()),
         });
@@ -2413,6 +2413,24 @@ fn compute_total_energy(particles: &ParticleArrays, gravity: [f32; 3]) -> f64 {
         energy -= m * (gravity[0] as f64 * x + gravity[1] as f64 * y + gravity[2] as f64 * z);
     }
     energy
+}
+
+/// Compile a WGSL module without naga's forced loop bounding.
+///
+/// On Metal, naga wraps every loop body in a `volatile bool` guard so a
+/// non-terminating loop can't be optimized into UB. The volatile local costs
+/// a stack store/load per iteration (it roughly doubled the boundary-pressure
+/// pass). Every loop in these shaders is a counted `for` over a bounded range,
+/// so the guard buys nothing. Array bounds checks stay enabled.
+fn shader_module(device: &wgpu::Device, desc: wgpu::ShaderModuleDescriptor) -> wgpu::ShaderModule {
+    // SAFETY: all shader loops have finite trip counts (see above); bounds
+    // checks remain on, so out-of-range indexing is still clamped.
+    unsafe {
+        device.create_shader_module_trusted(
+            desc,
+            wgpu::ShaderRuntimeChecks { bounds_checks: true, force_loop_bounding: false },
+        )
+    }
 }
 
 /// Bind group whose binding `i` is the whole of `bufs[i]`.
