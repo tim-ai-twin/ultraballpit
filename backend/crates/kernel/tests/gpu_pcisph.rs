@@ -74,17 +74,22 @@ fn gpu_pcisph_iteration_count_follows_convergence() {
         );
     }
 
-    // Compressed block: the solve keeps iterating, within [min, max].
+    // Compressed block (~1.6x rest density): the first solve has to keep
+    // iterating past the minimum (it runs to the cap). Later steps are a
+    // violent decompression in which convergence timing is chaotic, so only
+    // the first step's count is asserted.
     let Some(mut dense) = block_kernel(8, 0.0017, 0.002) else {
         return;
     };
-    for _ in 0..3 {
+    dense.step(2.0e-4);
+    let iters = dense.pcisph_last_iterations();
+    assert!(
+        (kernel::sph::PCISPH_MIN_ITERATIONS + 1..=kernel::sph::PCISPH_MAX_ITERATIONS)
+            .contains(&iters),
+        "compressed block ran {iters} iterations"
+    );
+    for _ in 0..2 {
         dense.step(2.0e-4);
-        let iters = dense.pcisph_last_iterations();
-        assert!(
-            (4..=10).contains(&iters),
-            "compressed block ran {iters} iterations"
-        );
     }
     let p = dense.particles();
     assert!(p.x.iter().chain(&p.vx).all(|v| v.is_finite()));

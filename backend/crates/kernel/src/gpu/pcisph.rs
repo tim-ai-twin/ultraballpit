@@ -28,9 +28,10 @@ use crate::sph::{AdvectiveDtPolicy, ADVECTIVE_V_FLOOR, MAX_DT, MIN_DT};
 use crate::AdaptiveProgress;
 
 /// Correction iterations: always at least the minimum, then until the mean
-/// over-compression is below 1% or the maximum is reached.
-const MIN_ITERATIONS: u32 = 3;
-const MAX_ITERATIONS: u32 = 10;
+/// over-compression is below 1% or the maximum is reached (same limits as the
+/// CPU solver).
+const MIN_ITERATIONS: u32 = crate::sph::PCISPH_MIN_ITERATIONS;
+const MAX_ITERATIONS: u32 = crate::sph::PCISPH_MAX_ITERATIONS;
 
 /// Neighbor-list radius in units of h: the 2h support plus a 0.5h skin for the
 /// displacement of a pair during the prediction.
@@ -195,7 +196,11 @@ impl PcisphGpu {
                 (&b.acc_z, RW),
             ],
         );
-        let (g2, bg2) = group(device, "pcisph_predict_g2", &[(&b.pressure, RW)]);
+        let (g2, bg2) = group(
+            device,
+            "pcisph_predict_g2",
+            &[(&b.pressure, RW), (&b.pcisph_p_prev, RO)],
+        );
         let (g3, bg3) = group(
             device,
             "pcisph_predict_g3",
@@ -477,8 +482,15 @@ impl GpuKernel {
         self.queue
             .write_buffer(&self.bufs.pcisph_args, 0, bytemuck::cast_slice(&args));
 
-        // Non-pressure forces see pressure = 0 (this also zeroes the 0.5x
-        // warm start in save_and_init_pcisph, as before).
+        // Non-pressure forces see pressure = 0; stash the previous step's
+        // final pressure first for the 0.5x warm start in save_and_init_pcisph.
+        encoder.copy_buffer_to_buffer(
+            &self.bufs.pressure,
+            0,
+            &self.bufs.pcisph_p_prev,
+            0,
+            n as u64 * 4,
+        );
         encoder.clear_buffer(&self.bufs.pressure, 0, None);
 
         // Dispatches within one compute pass execute in order with storage

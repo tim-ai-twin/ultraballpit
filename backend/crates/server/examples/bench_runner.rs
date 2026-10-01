@@ -172,7 +172,9 @@ fn quality(name: &str, sim_end: f64) {
     let mut t_front: [Option<f64>; 2] = [None, None];
     let mut vmax = 0.0f32;
     println!("{name}: t[s]    dt         max|dev|  max_comp  p99_comp  front_x[m]  vmax[m/s]");
-    while runner.sim_time() < sim_end {
+    // Wall-clock cap so a run whose dt collapses still reports.
+    let max_wall: f64 = std::env::var("BENCH_MAXWALL").ok().and_then(|s| s.parse().ok()).unwrap_or(60.0);
+    while runner.sim_time() < sim_end && start.elapsed().as_secs_f64() < max_wall {
         let t = Instant::now();
         runner.step_batch(Duration::from_millis(24));
         stepping += t.elapsed();

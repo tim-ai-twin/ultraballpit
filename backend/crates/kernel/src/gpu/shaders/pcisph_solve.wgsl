@@ -93,6 +93,8 @@ struct SimParams {
 @group(0) @binding(14) var<storage, read> bnd_cell_offsets: array<u32>;
 @group(0) @binding(15) var<storage, read> cell_counts: array<u32>;
 @group(0) @binding(16) var<storage, read> cell_offsets: array<u32>;
+// PCISPH scaling factor (dt-independent prototype value, uploaded at init;
+// see sph::compute_pcisph_prototype_delta).
 @group(0) @binding(17) var<storage, read> pcisph_delta: array<f32>;
 @group(0) @binding(18) var<storage, read_write> convergence: array<atomic<u32>>;
 @group(0) @binding(19) var<storage, read_write> counts: array<u32>;
@@ -532,10 +534,13 @@ fn density_correct(
         if fluid_type[i] != 0u {
             rho0 = AIR_REST_DENSITY;
         }
+        // Same update as the CPU solver: p += delta * (rho* - rho0), with the
+        // absolute error (delta is in Pa per kg/m^3) and both signs, so an
+        // under-dense particle relaxes its pressure; clamped at 0 (no tension).
         let density_error = (total - rho0) / rho0;
         let dt = params.dt;
         let effective_delta = pcisph_delta[i] / (dt * dt);
-        let correction = effective_delta * max(density_error, 0.0);
+        let correction = effective_delta * (total - rho0);
         let p_new = max(pressure[i] + correction, 0.0);
         pressure[i] = p_new;
         p_rho2[i] = p_new / (total * total);

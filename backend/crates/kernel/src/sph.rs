@@ -593,76 +593,54 @@ pub const PCISPH_MIN_ITERATIONS: u32 = 3;
 /// Maximum PCISPH correction iterations (safety cap).
 pub const PCISPH_MAX_ITERATIONS: u32 = 20;
 
-/// Compute per-particle PCISPH scaling factors (delta_i).
-///
-/// Each particle gets its own delta based on its actual neighborhood:
+/// PCISPH pressure-correction scaling factor `delta` (Solenthaler & Pajarola
+/// 2009), evaluated for a prototype particle with a filled rest-lattice
+/// neighborhood:
 /// ```text
-/// denom_i = -(|sum_j grad_W_ij|^2 + sum_j |grad_W_ij|^2)
-/// beta = dt^2 * m^2 * 2 / rho_0^2
-/// delta_i = -1 / (beta * denom_i)
+/// delta = -1 / (beta * -(|sum_j grad W_ij|^2 + sum_j |grad W_ij|^2))
+/// beta  = dt^2 * m^2 * 2 / rho_0^2
 /// ```
-///
-/// Surface particles with fewer neighbors get weaker corrections,
-/// preventing the over-correction artifacts of global delta.
-pub fn compute_pcisph_per_particle_delta(
-    particles: &ParticleArrays,
-    grid: &NeighborGrid,
-    h: f32,
-    dt: f32,
-) -> Vec<f32> {
-    let n = particles.len();
-    let support_radius = 2.0 * h;
-    let mass = if n > 0 { particles.mass[0] } else { return Vec::new() };
-    let rest_density = if n > 0 {
-        match particles.fluid_type[0] {
-            FluidType::Water => WATER_REST_DENSITY,
-            FluidType::Air => AIR_REST_DENSITY,
-        }
-    } else {
-        return Vec::new();
-    };
+/// The lattice spacing follows from the particle mass and rest density, so
+/// the factor adapts to any fluid. Using the prototype rather than each
+/// particle's actual neighborhood is what keeps the correction stable: a
+/// particle with a deficient neighborhood (free surface, or next to boundary
+/// particles, which add density but don't appear in the sums) gets a
+/// several-fold larger delta and over-corrects. The per-particle variant
+/// diverged on the thin-slab 2D dam break on both the CPU and GPU solvers.
+pub fn compute_pcisph_prototype_delta(mass: f32, rest_density: f32, h: f32, dt: f32) -> f32 {
+    let mass = mass as f64;
+    let rest_density = rest_density as f64;
+    let spacing = (mass / rest_density).cbrt();
+    let support = 2.0 * h as f64;
+    let reach = (support / spacing).ceil() as i32;
 
-    let beta = (dt as f64) * (dt as f64) * (mass as f64) * (mass as f64) * 2.0
-        / ((rest_density as f64) * (rest_density as f64));
-
-    let mut deltas = vec![0.0f32; n];
-
-    for i in 0..n {
-        let mut sum_grad_x = 0.0_f64;
-        let mut sum_grad_y = 0.0_f64;
-        let mut sum_grad_z = 0.0_f64;
-        let mut sum_dot = 0.0_f64;
-
-        grid.for_each_neighbor(
-            i,
-            &particles.x,
-            &particles.y,
-            &particles.z,
-            support_radius,
-            |j| {
-                let dx = particles.x[i] - particles.x[j];
-                let dy = particles.y[i] - particles.y[j];
-                let dz = particles.z[i] - particles.z[j];
-                let r = (dx * dx + dy * dy + dz * dz).sqrt();
-                let (gx, gy, gz) = wendland_c2_gradient(dx, dy, dz, r, h);
-                sum_grad_x += gx as f64;
-                sum_grad_y += gy as f64;
-                sum_grad_z += gz as f64;
-                sum_dot += (gx * gx + gy * gy + gz * gz) as f64;
-            },
-        );
-
-        let sum_grad_sq = sum_grad_x * sum_grad_x
-            + sum_grad_y * sum_grad_y
-            + sum_grad_z * sum_grad_z;
-        let denom = -(sum_grad_sq + sum_dot);
-
-        if denom.abs() > 1.0e-30 && beta.abs() > 1.0e-30 {
-            deltas[i] = (-1.0 / (beta * denom)) as f32;
+    let (mut sum_grad, mut sum_dot) = ([0.0_f64; 3], 0.0_f64);
+    for ix in -reach..=reach {
+        for iy in -reach..=reach {
+            for iz in -reach..=reach {
+                let d = [ix as f64 * spacing, iy as f64 * spacing, iz as f64 * spacing];
+                let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                if r == 0.0 || r >= support {
+                    continue;
+                }
+                let (gx, gy, gz) =
+                    wendland_c2_gradient(d[0] as f32, d[1] as f32, d[2] as f32, r as f32, h);
+                let g = [gx as f64, gy as f64, gz as f64];
+                for k in 0..3 {
+                    sum_grad[k] += g[k];
+                }
+                sum_dot += g[0] * g[0] + g[1] * g[1] + g[2] * g[2];
+            }
         }
     }
-
-    deltas
+    let sum_grad_sq = sum_grad.iter().map(|v| v * v).sum::<f64>();
+    let denom = -(sum_grad_sq + sum_dot);
+    let beta = (dt as f64) * (dt as f64) * mass * mass * 2.0 / (rest_density * rest_density);
+    if denom.abs() > 1.0e-30 && beta.abs() > 1.0e-30 {
+        (-1.0 / (beta * denom)) as f32
+    } else {
+        0.0
+    }
 }
 
 /// Compute an adaptive timestep using the advective CFL condition (PCISPH).

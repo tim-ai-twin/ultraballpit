@@ -279,12 +279,17 @@ buffers). PCISPH reuses the WCSPH forces pass, which consumes the density
 pass's lists and caches; PCISPH runs `prepare_forces_fallback` first.
 
 Open issues:
-- GPU PCISPH applies its pressure correction to the relative density
-  error where the CPU solver uses the absolute error (1000x weaker for
-  water), so it never converges (~15% mean over-compression). Simply
-  switching to the absolute error made the 2D PCISPH preset diverge while
-  the CPU solver stays stable there, so the discrepancy is larger than the
-  units; reverted pending investigation.
+- ~~GPU PCISPH never converged~~ (fixed). The GPU solver differed from the
+  CPU one in five ways: it corrected with the relative density error (1000x
+  too weak for water), ignored negative errors, froze each particle's delta
+  at init, lost the 0.5x pressure warm start to a buffer clear, and capped at
+  10 iterations instead of 20. With those aligned, both solvers diverged on
+  the thin-slab 2D PCISPH preset: per-particle delta (fluid neighbors only)
+  over-corrects particles with deficient neighborhoods, e.g. next to walls.
+  Both now use the original paper's prototype delta (filled rest lattice,
+  `sph::compute_pcisph_prototype_delta`). 3D dam break: mean
+  over-compression ~15% -> 0.3%, 0.078 -> 0.165 sim s / wall s; the 2D
+  preset is stable (mean compression 1.1%).
 - Surface-force recording reads back all particles every batch when an
   obstacle is present (~20% of the pillar scene's throughput).
 

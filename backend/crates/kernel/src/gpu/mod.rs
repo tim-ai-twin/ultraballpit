@@ -1190,9 +1190,9 @@ impl GpuKernel {
             return;
         }
         if self.solver_type == SolverType::Pcisph {
-            // PCISPH: upload delta scaling factors; each step builds its own
-            // grid and forces.
-            self.upload_pcisph_delta_from_cpu();
+            // PCISPH builds its own grid and forces each step; it only needs
+            // the scaling factor, dt-independent (the shader divides by dt^2).
+            self.upload_pcisph_delta();
         } else {
             self.compute_forces_gpu(params);
         }
@@ -1695,40 +1695,19 @@ impl GpuKernel {
         })
     }
 
-    /// Upload per-particle delta scaling factors from CPU.
-    fn upload_pcisph_delta(&self, delta: &[f32]) {
-        self.queue.write_buffer(
-            &self.bufs.pcisph_delta,
-            0,
-            bytemuck::cast_slice(delta),
-        );
-    }
-
-    /// Compute PCISPH per-particle delta on CPU and upload to GPU.
-    /// Called once at initialization.
-    fn upload_pcisph_delta_from_cpu(&self) {
-        let particles = self.bufs.readback_particles(&self.device, &self.queue);
-        let n = particles.len();
-        if n == 0 {
+    /// Fill the PCISPH scaling-factor buffer with the prototype delta (dt = 1).
+    fn upload_pcisph_delta(&self) {
+        let p = self.particles();
+        if p.len() == 0 {
             return;
         }
-
-        // Build neighbor grid on CPU
-        let mut grid = crate::neighbor::NeighborGrid::new(
-            self.h * 2.0, // cell_size = support_radius
-            self.domain_min,
-            self.domain_max,
-        );
-        grid.update(&particles.x, &particles.y, &particles.z);
-
-        // Compute dt-independent delta (using dt=1.0). The shader applies the
-        // actual dt scaling: effective_delta = delta_base / (dt * dt).
-        // This avoids recomputing deltas when dt changes (adaptive timestep).
-        let deltas = crate::sph::compute_pcisph_per_particle_delta(
-            &particles, &grid, self.h, 1.0,
-        );
-
-        self.upload_pcisph_delta(&deltas);
+        let rest_density = match p.fluid_type[0] {
+            FluidType::Water => eos::WATER_REST_DENSITY,
+            FluidType::Air => eos::AIR_REST_DENSITY,
+        };
+        let delta = crate::sph::compute_pcisph_prototype_delta(p.mass[0], rest_density, self.h, 1.0);
+        let deltas = vec![delta; p.len()];
+        self.queue.write_buffer(&self.bufs.pcisph_delta, 0, bytemuck::cast_slice(&deltas));
     }
 
     /// Record a submission and block until at most MAX_IN_FLIGHT remain queued.

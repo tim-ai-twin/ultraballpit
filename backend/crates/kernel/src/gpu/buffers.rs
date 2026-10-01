@@ -122,6 +122,8 @@ pub struct GpuBuffers {
     /// Current predicted position + mass (x, y, z, m): one 16-byte gather per
     /// neighbor candidate in the correction loop.
     pub pcisph_pos4: wgpu::Buffer,
+    /// Previous step's final pressure, read by the PCISPH warm start.
+    pub pcisph_p_prev: wgpu::Buffer,
     /// pressure / density² per particle, written with the pressure correction.
     pub pcisph_p_rho2: wgpu::Buffer,
     /// Per-step neighbor-list counts: fluid particles, then boundary particles.
@@ -368,6 +370,13 @@ impl GpuBuffers {
         let pcisph_np4 = pcisph_buf("pcisph_np4", 4 * n1);
         let pcisph_pacc4 = pcisph_buf("pcisph_pacc4", 4 * n1);
         let pcisph_pos4 = pcisph_buf("pcisph_pos4", 4 * n1);
+        // Copy target for the previous step's pressure (warm start).
+        let pcisph_p_prev = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pcisph_p_prev"),
+            size: if pcisph { (n1 * 4) as u64 } else { 0 }.max(16),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let pcisph_p_rho2 = pcisph_buf("pcisph_p_rho2", n1);
         let pcisph_counts = pcisph_buf("pcisph_counts", n + n_bnd + 1);
         let pcisph_lists = pcisph_buf(
@@ -418,6 +427,7 @@ impl GpuBuffers {
             pcisph_np4,
             pcisph_pacc4,
             pcisph_pos4,
+            pcisph_p_prev,
             pcisph_p_rho2,
             pcisph_counts,
             pcisph_lists,
@@ -575,12 +585,13 @@ impl GpuBuffers {
 
     /// Per-particle arrays that persist across steps and must be permuted
     /// together when particles are sorted into cell order. Arrays recomputed
-    /// every step before use (acc, pressure, PCISPH scratch) are omitted.
+    /// every step before use (acc, PCISPH scratch incl. delta) are omitted;
+    /// pressure is kept for the PCISPH warm start.
     pub fn sorted_arrays(&self) -> [&wgpu::Buffer; SORTED_ARRAY_COUNT] {
         [
             &self.pos_x, &self.pos_y, &self.pos_z,
             &self.vel_x, &self.vel_y, &self.vel_z,
-            &self.density, &self.mass, &self.fluid_type, &self.pcisph_delta,
+            &self.density, &self.mass, &self.fluid_type, &self.pressure,
         ]
     }
 

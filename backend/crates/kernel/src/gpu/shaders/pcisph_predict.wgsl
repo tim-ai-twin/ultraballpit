@@ -56,8 +56,10 @@ struct SimParams {
 @group(1) @binding(4) var<storage, read_write> acc_y: array<f32>;
 @group(1) @binding(5) var<storage, read_write> acc_z: array<f32>;
 
-// Group 2: pressure (warm start)
+// Group 2: pressure + the previous step's final pressure (warm start; the
+// pressure buffer itself is zeroed for the non-pressure force pass)
 @group(2) @binding(0) var<storage, read_write> pressure: array<f32>;
+@group(2) @binding(1) var<storage, read> pressure_prev: array<f32>;
 
 // Group 3: packed PCISPH state + convergence counters
 @group(3) @binding(0) var<storage, read_write> orig4: array<vec4<f32>>;
@@ -87,8 +89,9 @@ fn save_and_init_pcisph(@builtin(global_invocation_id) gid: vec3<u32>) {
     // No pressure acceleration yet: the first prediction uses v + a_np * dt.
     pacc4[i] = vec4<f32>(0.0);
 
-    // Warm-start pressure: retain 50% from previous step
-    pressure[i] = pressure[i] * 0.5;
+    // Warm-start pressure: retain 50% of the previous step's final pressure
+    // (as the CPU solver does).
+    pressure[i] = pressure_prev[i] * 0.5;
 
     // Reset the per-step correction-iteration counter.
     if i == 0u {

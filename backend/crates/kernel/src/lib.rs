@@ -473,11 +473,14 @@ impl CpuKernel {
             self.particles.pressure[i] *= 0.5;
         }
 
-        // Compute per-particle PCISPH scaling factors (delta_i) for this timestep.
-        // Per-particle delta ensures surface particles (fewer neighbors) get
-        // appropriately weaker corrections than interior particles.
-        let delta_per_particle = sph::compute_pcisph_per_particle_delta(
-            &self.particles, &self.grid, self.h, dt,
+        // PCISPH scaling factor from a prototype (filled) neighborhood; see
+        // sph::compute_pcisph_prototype_delta for why not per particle.
+        let rest_density0 = match self.particles.fluid_type[0] {
+            FluidType::Water => eos::WATER_REST_DENSITY,
+            FluidType::Air => eos::AIR_REST_DENSITY,
+        };
+        let delta = sph::compute_pcisph_prototype_delta(
+            self.particles.mass[0], rest_density0, self.h, dt,
         );
         // Save original positions for prediction
         let orig_x: Vec<f32> = self.particles.x.clone();
@@ -526,10 +529,10 @@ impl CpuKernel {
                 };
                 let rho_err = self.particles.density[i] - rest_density;
 
-                // Update pressure: p += delta_i * rho_err
+                // Update pressure: p += delta * rho_err
                 // Clamp pressure >= 0 (no tension)
                 self.particles.pressure[i] =
-                    (self.particles.pressure[i] + delta_per_particle[i] * rho_err).max(0.0);
+                    (self.particles.pressure[i] + delta * rho_err).max(0.0);
 
                 // Track convergence using over-compression only
                 if rho_err > 0.0 {
