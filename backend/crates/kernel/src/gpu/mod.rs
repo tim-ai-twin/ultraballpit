@@ -93,6 +93,7 @@ pub struct GpuKernel {
     pipeline_grid_prefix: wgpu::ComputePipeline,
     pipeline_density: wgpu::ComputePipeline,
     pipeline_boundary_pressure: wgpu::ComputePipeline,
+    bnd_pressure_bg: wgpu::BindGroup,
     pipeline_forces: wgpu::ComputePipeline,
     pipeline_half_kick: wgpu::ComputePipeline,
     pipeline_drift: wgpu::ComputePipeline,
@@ -208,6 +209,7 @@ pub struct GpuKernel {
 /// CELLS_PER_SUPPORT cells on each side, so smaller cells trade more rows
 /// for fewer out-of-range candidates.
 const CELLS_PER_SUPPORT: u32 = 2;
+
 
 /// Maximum number of step submissions queued ahead of the GPU in `step()`.
 const MAX_IN_FLIGHT: usize = 2;
@@ -354,6 +356,9 @@ impl GpuKernel {
                 include_str!("shaders/neighbor_grid.wgsl").into(),
             ),
         });
+
+        let boundary_pressure_shader =
+            create_bounded_loop_shader(&device, "boundary_pressure", include_str!("shaders/boundary_pressure.wgsl"));
 
         let grid_scan_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("grid_scan"),
@@ -607,14 +612,38 @@ impl GpuKernel {
             cache: None,
         });
 
+        // Boundary pressure: one group with params, fluid state, grid and
+        // boundary arrays (see boundary_pressure.wgsl for the binding order).
+        let bgl_bnd_pressure = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bnd_pressure_bgl"),
+            entries: &[
+                bgl_uniform(0),
+                bgl_storage_ro(1), bgl_storage_ro(2), bgl_storage_ro(3), // pos_x/y/z
+                bgl_storage_ro(4), bgl_storage_ro(5),                    // density, pressure
+                bgl_storage_ro(6), bgl_storage_ro(7),                    // cell_offsets, cell_counts
+                bgl_storage_ro(8), bgl_storage_ro(9), bgl_storage_ro(10), // bnd_x/y/z
+                bgl_storage_rw(11),                                      // bnd_pressure
+            ],
+        });
         let pipeline_boundary_pressure = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("boundary_pressure"),
-            layout: Some(&pl_layout_forces),
-            module: &forces_shader,
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("bnd_pressure_pl"),
+                bind_group_layouts: &[&bgl_bnd_pressure],
+                push_constant_ranges: &[],
+            })),
+            module: &boundary_pressure_shader,
             entry_point: Some("update_boundary_pressures"),
             compilation_options: Default::default(),
             cache: None,
         });
+        let bnd_pressure_bg = {
+            let b = &bufs;
+            bind_buffers(&device, "bnd_pressure_bg", &bgl_bnd_pressure, &[
+                &b.params_buffer, &b.pos_x, &b.pos_y, &b.pos_z, &b.density, &b.pressure,
+                &b.cell_offsets, &b.cell_counts, &b.bnd_x, &b.bnd_y, &b.bnd_z, &b.bnd_pressure,
+            ])
+        };
 
         let pipeline_forces = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("forces"),
@@ -912,6 +941,7 @@ impl GpuKernel {
             pipeline_grid_prefix,
             pipeline_density,
             pipeline_boundary_pressure,
+            bnd_pressure_bg,
             pipeline_forces,
             pipeline_half_kick,
             pipeline_drift,
@@ -1020,14 +1050,6 @@ impl GpuKernel {
             compilation_options: Default::default(),
             cache: None,
         });
-        self.pipeline_boundary_pressure = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("boundary_pressure"),
-            layout: Some(&pl_layout_forces),
-            module: &forces_shader,
-            entry_point: Some("update_boundary_pressures"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
         self.pipeline_forces = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("forces"),
             layout: Some(&pl_layout_forces),
@@ -1100,6 +1122,13 @@ impl GpuKernel {
         pass.dispatch_workgroups(wg_grid_particles, 1, 1);
     }
 
+    /// Dispatch boundary pressure mirroring (one thread per boundary particle).
+    fn dispatch_boundary_pressure(&self, pass: &mut wgpu::ComputePass) {
+        pass.set_pipeline(&self.pipeline_boundary_pressure);
+        pass.set_bind_group(0, &self.bnd_pressure_bg, &[]);
+        pass.dispatch_workgroups(dispatch_size(self.bufs.n_boundary.max(1), 256), 1, 1);
+    }
+
     /// Encode density + boundary pressure + forces passes into a command encoder.
     fn encode_density_forces(&self, encoder: &mut wgpu::CommandEncoder, params: &GpuSimParams) {
         let n_particles = self.bufs.n_particles;
@@ -1107,7 +1136,6 @@ impl GpuKernel {
         let wg = self.workgroup_size;
 
         let wg_particles = dispatch_size(n_particles, wg);
-        let wg_boundary = dispatch_size(n_boundary.max(1), wg);
 
         self.bufs.update_params(&self.queue, params);
 
@@ -1136,10 +1164,7 @@ impl GpuKernel {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("boundary_pressure"), timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline_boundary_pressure);
-            pass.set_bind_group(0, &forces_bg0, &[]); pass.set_bind_group(1, &forces_bg1, &[]);
-            pass.set_bind_group(2, &forces_bg2, &[]); pass.set_bind_group(3, &forces_bg3, &[]);
-            pass.dispatch_workgroups(wg_boundary, 1, 1);
+            self.dispatch_boundary_pressure(&mut pass);
         }
 
         // All forces
@@ -1374,7 +1399,6 @@ impl GpuKernel {
         let n_total = self.bufs.n_particles;
         let n_boundary = self.bufs.n_boundary;
         let wg_particles = dispatch_size(n_total, wg);
-        let wg_boundary = dispatch_size(n_boundary.max(1), wg);
 
         // Create all bind groups upfront
         let empty_bg = self.create_empty_bind_group();
@@ -1458,10 +1482,7 @@ impl GpuKernel {
                 }),
             });
             if n_boundary > 0 {
-                pass.set_pipeline(&self.pipeline_boundary_pressure);
-                pass.set_bind_group(0, &forces_bg0, &[]); pass.set_bind_group(1, &forces_bg1, &[]);
-                pass.set_bind_group(2, &forces_bg2, &[]); pass.set_bind_group(3, &forces_bg3, &[]);
-                pass.dispatch_workgroups(wg_boundary, 1, 1);
+                self.dispatch_boundary_pressure(&mut pass);
             }
             // Empty dispatch if no boundary — timestamps still written
         }
@@ -1918,7 +1939,6 @@ impl GpuKernel {
         let n_boundary = self.bufs.n_boundary;
         let wg = self.workgroup_size;
         let wg_particles = dispatch_size(n_particles, wg);
-        let wg_boundary = dispatch_size(n_boundary.max(1), wg);
 
         let min_iterations = 3u32;
         let max_iterations = 10u32;
@@ -1980,10 +2000,7 @@ impl GpuKernel {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("pcisph_bnd_init"), timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.pipeline_boundary_pressure);
-                pass.set_bind_group(0, &forces_bg0, &[]); pass.set_bind_group(1, &forces_bg1, &[]);
-                pass.set_bind_group(2, &forces_bg2, &[]); pass.set_bind_group(3, &forces_bg3, &[]);
-                pass.dispatch_workgroups(wg_boundary, 1, 1);
+                self.dispatch_boundary_pressure(&mut pass);
             }
 
             // Forces: only non-pressure forces (viscous + gravity + boundary repulsion)
@@ -2104,10 +2121,7 @@ impl GpuKernel {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("pcisph_bnd_pressure"), timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.pipeline_boundary_pressure);
-                pass.set_bind_group(0, &forces_bg0, &[]); pass.set_bind_group(1, &forces_bg1, &[]);
-                pass.set_bind_group(2, &forces_bg2, &[]); pass.set_bind_group(3, &forces_bg3, &[]);
-                pass.dispatch_workgroups(wg_boundary, 1, 1);
+                self.dispatch_boundary_pressure(&mut pass);
             }
 
             // Pressure-only forces
@@ -2463,6 +2477,26 @@ fn bind_buffers(
         .map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() })
         .collect();
     device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout, entries: &entries })
+}
+
+/// Create a WGSL module without naga's forced loop bounding.
+///
+/// By default naga wraps every loop body in a `volatile` dummy-break guard
+/// (so the Metal compiler can't treat an infinite loop as UB). The volatile
+/// local lives on the per-thread stack and costs a stack store and load on
+/// every iteration, plus scratch setup for every thread launched; it roughly
+/// doubled the boundary-pressure pass. Bounds checks stay on.
+///
+/// Only use for shaders whose loops all have finite trip counts.
+fn create_bounded_loop_shader(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ShaderModule {
+    let desc = wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(source.into()) };
+    // SAFETY: callers pass shaders whose loops all terminate.
+    unsafe {
+        device.create_shader_module_trusted(
+            desc,
+            wgpu::ShaderRuntimeChecks { bounds_checks: true, force_loop_bounding: false },
+        )
+    }
 }
 
 /// Calculate dispatch workgroup count: ceil(total / workgroup_size).
