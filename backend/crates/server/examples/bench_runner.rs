@@ -4,10 +4,18 @@
 //! (24 ms batches), with an optional 30 fps snapshot thread standing in for the
 //! frame builder. Reports steps/s and simulated seconds per wall second.
 //!
-//!   cargo run --release -p server --example bench_runner -- [throughput|fingerprint] [scenario...]
+//!   cargo run --release -p server --example bench_runner -- [mode] [scenario...]
+//!
+//! Modes:
+//!   throughput  steps/s and sim_s/wall_s over BENCH_SECS of wall time
+//!   quality     run to BENCH_SIMT simulated seconds through the runner's own
+//!               dt logic; print a density-deviation / dam-front time series
+//!   fingerprint fixed step count physics fingerprint
+//!   kernel      kernel-only step() vs step_no_sync() rate
 //!
 //! Scenarios: dam25 dam15 dam10 pillar25 pcisph25 (default: dam25 dam15 dam10 pillar25)
-//! Env: BENCH_SECS (default 6), BENCH_FRAMES=0 to disable the snapshot thread.
+//! Env: BENCH_SECS (default 6), BENCH_FRAMES=0 to disable the snapshot thread,
+//!      BENCH_SIMT (quality mode, default 0.4), BENCH_CFL to override cfl_number.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -35,6 +43,9 @@ fn scenario(name: &str) -> SimulationConfig {
         "speed_of_sound": 20.0, "viscosity": 0.001, "cfl_number": 0.4,
         "backend": "gpu", "solver": solver
     });
+    if let Some(cfl) = std::env::var("BENCH_CFL").ok().and_then(|s| s.parse::<f64>().ok()) {
+        cfg["cfl_number"] = serde_json::json!(cfl);
+    }
     if pillar {
         cfg["geometry"] = serde_json::json!({
             "type": "cylinder", "center": [0.075,0.04,0.03],
@@ -94,6 +105,96 @@ fn throughput(name: &str, secs: f64, frames: bool) {
     );
 }
 
+/// Water density deviation statistics from a particle snapshot:
+/// (max |rho/rho0 - 1|, max compression rho/rho0 - 1, 99th-percentile compression).
+///
+/// Free-surface particles are always under-dense with summation density, so
+/// the compression side is what reflects EOS stiffness and time integration.
+fn density_stats(p: &kernel::ParticleArrays) -> (f32, f32, f32) {
+    let rho0 = kernel::eos::WATER_REST_DENSITY;
+    let mut max_abs = 0.0f32;
+    let mut comp: Vec<f32> = Vec::with_capacity(p.len());
+    for &rho in &p.density {
+        let d = rho / rho0 - 1.0;
+        max_abs = max_abs.max(d.abs());
+        comp.push(d.max(0.0));
+    }
+    comp.sort_unstable_by(|a, b| a.total_cmp(b));
+    let max_c = comp.last().copied().unwrap_or(0.0);
+    let p99 = comp.get(comp.len() * 99 / 100).copied().unwrap_or(0.0);
+    (max_abs, max_c, p99)
+}
+
+/// Physics quality through the runner's own adaptive-dt loop: run to
+/// `sim_end` simulated seconds, sampling density deviation and the dam-break
+/// front position after every batch.
+fn quality(name: &str, sim_end: f64) {
+    let runner = SimulationRunner::new(scenario(name), std::path::Path::new(".")).unwrap();
+    runner.start();
+    let x0 = runner.particles().x.iter().copied().fold(0.0f32, f32::max);
+
+    let start = Instant::now();
+    let mut stepping = Duration::ZERO;
+    let mut next_print = 0.0f64;
+    let (mut peak_abs, mut peak_c, mut peak_p99) = (0.0f32, 0.0f32, 0.0f32);
+    let (mut sum_c, mut sum_p99, mut sum_dt, mut samples) = (0.0f64, 0.0f64, 0.0f64, 0u32);
+    let mut t_front: [Option<f64>; 2] = [None, None];
+    println!("{name}: t[s]    dt         max|dev|  max_comp  p99_comp  front_x[m]");
+    while runner.sim_time() < sim_end {
+        let t = Instant::now();
+        runner.step_batch(Duration::from_millis(24));
+        stepping += t.elapsed();
+        if runner.status() != server::state::SimStatus::Running {
+            break;
+        }
+        let p = runner.particles();
+        let (abs, c, p99) = density_stats(&p);
+        let front = p.x.iter().copied().fold(0.0f32, f32::max);
+        let sim_t = runner.sim_time();
+        // Surge-front arrival times (resolution: one 24 ms batch).
+        if front >= 0.06 && t_front[0].is_none() {
+            t_front[0] = Some(sim_t);
+        }
+        if front >= 0.09 && t_front[1].is_none() {
+            t_front[1] = Some(sim_t);
+        }
+        // Skip the first 20 ms (initial settling transient) in the aggregates.
+        if sim_t > 0.02 {
+            peak_abs = peak_abs.max(abs);
+            peak_c = peak_c.max(c);
+            peak_p99 = peak_p99.max(p99);
+            sum_c += c as f64;
+            sum_p99 += p99 as f64;
+            sum_dt += runner.dt() as f64;
+            samples += 1;
+        }
+        if sim_t >= next_print {
+            println!(
+                "{name}: {sim_t:.4}  {:.3e}  {abs:.4}    {c:.4}    {p99:.4}    {front:.4}",
+                runner.dt()
+            );
+            next_print += 0.05;
+        }
+    }
+    let n = samples.max(1) as f64;
+    println!(
+        "{name} SUMMARY t={:.4} steps={} status={:?} sim_s/stepping_wall_s={:.5} wall={:.1}s \
+         mean_dt={:.3e} peak|dev|={peak_abs:.4} peak_comp={peak_c:.4} mean_comp={:.4} \
+         peak_p99={peak_p99:.4} mean_p99={:.4} front_x0={x0:.4} t(front>=0.06)={:.4} \
+         t(front>=0.09)={:.4}",
+        runner.sim_time(),
+        runner.timestep_count(),
+        runner.status(),
+        runner.sim_time() / stepping.as_secs_f64(),
+        start.elapsed().as_secs_f64(),
+        sum_dt / n,
+        sum_c / n,
+        sum_p99 / n,
+        t_front[0].unwrap_or(f64::NAN),
+        t_front[1].unwrap_or(f64::NAN),
+    );
+}
+
 /// Deterministic-ish physics fingerprint: fixed step count, dt recomputed every
 /// 16 steps like the runner. Compare before/after a change for sanity.
 fn fingerprint(name: &str, steps: usize) {
@@ -112,13 +213,14 @@ fn fingerprint(name: &str, steps: usize) {
         boundary.push(b.x, b.y, b.z, b.mass, b.nx, b.ny, b.nz);
     }
     let h = config.smoothing_length();
+    let cs = config.effective_speed_of_sound();
     let mut k = orchestrator::create_kernel(
         &config.backend,
         fluid,
         boundary,
         h,
         config.gravity,
-        config.speed_of_sound,
+        cs,
         config.cfl_number,
         config.viscosity,
         config.domain.min,
@@ -134,7 +236,7 @@ fn fingerprint(name: &str, steps: usize) {
                 * kernel::sph::compute_timestep(
                     k.particles(),
                     h,
-                    config.speed_of_sound,
+                    cs,
                     config.cfl_number,
                 );
         }
@@ -179,12 +281,7 @@ fn kernel_only(name: &str) {
         boundary.push(b.x, b.y, b.z, b.mass, b.nx, b.ny, b.nz);
     }
     let h = config.smoothing_length();
-    let cs = kernel::sph::auto_tune_speed_of_sound(
-        config.gravity,
-        config.domain.min,
-        config.domain.max,
-        config.speed_of_sound,
-    );
+    let cs = config.effective_speed_of_sound();
     let mut k = kernel::GpuKernel::new(
         fluid,
         boundary,
@@ -241,7 +338,14 @@ fn main() {
             "throughput" => throughput(name, secs, frames),
             "fingerprint" => fingerprint(name, 3000),
             "kernel" => kernel_only(name),
-            _ => panic!("mode must be throughput or fingerprint"),
+            "quality" => quality(
+                name,
+                std::env::var("BENCH_SIMT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.4),
+            ),
+            _ => panic!("mode must be throughput, quality, fingerprint or kernel"),
         }
     }
 }
