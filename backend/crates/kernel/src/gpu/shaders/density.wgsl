@@ -222,6 +222,12 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Row culling radius, padded so rounding can't drop a pair at r ~ 2h.
     let cull_r2 = support_radius_sq * 1.0001;
 
+    // Loop-invariant Wendland C2 factors: W = w_norm (1-q/2)^4 (1+2q),
+    // dW/dr = dw_norm q (1-q/2)^3.
+    let inv_h = 1.0 / h;
+    let w_norm = WENDLAND_C2_NORM_3D / (h * h * h);
+    let dw_norm = -5.0 * WENDLAND_C2_NORM_3D / (h * h * h * h);
+
     // Read old density for delta-SPH diffusion (before overwrite)
     let old_rho_i = density[i];
 
@@ -260,14 +266,19 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
                             nbr_list[n_nbr * params.n_particles + i] = j;
                         }
                         n_nbr = n_nbr + 1u;
+                        // Wendland C2 value and radial derivative from shared terms.
                         let r = dist_sq * inverseSqrt(max(dist_sq, 1.0e-24));
-                        rho = rho + read_mass(j) * wendland_c2(r, h);
+                        let q = r * inv_h;
+                        let t = 1.0 - 0.5 * q;
+                        let t3 = t * t * t;
+                        let m_j = read_mass(j);
+                        rho = rho + m_j * (w_norm * t3 * t * (1.0 + 2.0 * q));
 
-                        // Delta-SPH diffusion using previous-step densities
-                        let grad = wendland_c2_gradient_from_dist_sq(ddx, ddy, ddz, dist_sq, h);
+                        // Delta-SPH diffusion using previous-step densities.
+                        // grad W = dW/dr * r_vec / r, so r_vec . grad W = dW/dr * r.
                         let old_rho_j = density[j];
-                        let v_j = read_mass(j) / max(old_rho_j, 1.0);
-                        let r_dot_grad = ddx * grad.x + ddy * grad.y + ddz * grad.z;
+                        let v_j = m_j / max(old_rho_j, 1.0);
+                        let r_dot_grad = dw_norm * q * t3 * r;
                         // Sign: our r = x_i - x_j, so r·gradW < 0. Use (rho_i - rho_j)
                         // to get correct diffusion sign (paper uses r_ij = x_j - x_i).
                         diff_sum = diff_sum + v_j * (old_rho_i - old_rho_j) * 2.0 * r_dot_grad / (dist_sq + eta_sq);
