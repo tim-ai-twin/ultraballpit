@@ -72,7 +72,10 @@ pub struct GpuBuffers {
     pub cell_counts: wgpu::Buffer,
     pub cell_offsets: wgpu::Buffer,
     pub sorted_indices: wgpu::Buffer,
-    pub write_heads: wgpu::Buffer,
+    /// Per-cell counter for the grid build (zero between builds).
+    pub cell_fill: wgpu::Buffer,
+    /// Particle count per GRID_SCAN_TILE cells (zero between builds).
+    pub scan_tile_sums: wgpu::Buffer,
 
     // Boundary particle grid (built once at init, boundary particles are static)
     pub bnd_cell_counts: wgpu::Buffer,
@@ -103,7 +106,7 @@ pub struct GpuBuffers {
     pub staging_acc_y: wgpu::Buffer,
     pub staging_acc_z: wgpu::Buffer,
 
-    /// Gather sources for sorting particle data into cell order.
+    /// Snapshot sources for sorting particle data into cell order.
     pub sort_tmp: Vec<wgpu::Buffer>,
 
     // PCISPH state buffers (always allocated; unused for WCSPH)
@@ -142,6 +145,10 @@ pub const SORTED_ARRAY_COUNT: usize = 10;
 /// fluid neighbors; overflowing particles fall back to a grid scan.
 pub const MAX_NBR: u64 = 128;
 pub const MAX_BND_NBR: u64 = 64;
+
+/// Cells scanned per `prefix_sum` workgroup. Must match SCAN_TILE in
+/// shaders/neighbor_grid.wgsl.
+pub const GRID_SCAN_TILE: u32 = 1024;
 
 /// Create a storage buffer from f32 slice data. If the slice is empty, creates
 /// a minimal buffer.
@@ -236,8 +243,12 @@ impl GpuBuffers {
         let cell_indices = create_storage_buf_u32(device, "cell_indices", &zeros_n);
         let cell_counts = create_storage_buf_u32(device, "cell_counts", &zeros_cells);
         let cell_offsets = create_storage_buf_u32(device, "cell_offsets", &zeros_cells);
-        let sorted_indices = create_storage_buf_u32(device, "sorted_indices", &zeros_n);
-        let write_heads = create_storage_buf_u32(device, "write_heads", &zeros_cells);
+        // Particle arrays are kept in cell order, so this is the identity.
+        let identity_n: Vec<u32> = (0..n.max(1) as u32).collect();
+        let sorted_indices = create_storage_buf_u32(device, "sorted_indices", &identity_n);
+        let cell_fill = create_storage_buf_u32(device, "cell_fill", &zeros_cells);
+        let n_scan_tiles = total_cells.div_ceil(GRID_SCAN_TILE as usize).max(1);
+        let scan_tile_sums = create_storage_buf_u32(device, "scan_tile_sums", &vec![0u32; n_scan_tiles]);
 
         // Boundary particle grid (built once, boundary particles are static).
         // Boundary arrays are stored in cell order so each grid row is a
@@ -287,7 +298,7 @@ impl GpuBuffers {
         let bnd_nbr_count = gpu_only("bnd_nbr_count", particle_u32_bytes);
         let posm = gpu_only("posm", particle_bytes * 4);
         let velr = gpu_only("velr", particle_bytes * 4);
-        // Scratch copies used as gather sources when sorting particle data
+        // Scratch copies used as scatter sources when sorting particle data
         // into cell order (one per array in SORTED_ARRAYS order).
         let sort_tmp: Vec<wgpu::Buffer> = (0..SORTED_ARRAY_COUNT)
             .map(|_| device.create_buffer(&wgpu::BufferDescriptor {
@@ -337,7 +348,8 @@ impl GpuBuffers {
             cell_counts,
             cell_offsets,
             sorted_indices,
-            write_heads,
+            cell_fill,
+            scan_tile_sums,
             bnd_cell_counts,
             bnd_cell_offsets,
             sort_tmp,

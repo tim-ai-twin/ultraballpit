@@ -1,11 +1,17 @@
 // Neighbor grid construction compute shader
 // Implements uniform-grid spatial hashing for particle neighbor search.
 //
-// Four dispatches are needed:
-// Pass 0 (clear): Zero out cell_counts
-// Pass 1 (count): Hash particles to cells, count particles per cell via atomics
-// Pass 2 (prefix_sum): Compute exclusive prefix sum of cell_counts -> cell_offsets
-// Pass 3 (scatter): Scatter particle indices into sorted order
+// A grid build is three dispatches:
+// 1. count_particles: hash particles to cells; count particles per cell
+//    (cell_fill) and per scan tile of SCAN_TILE consecutive cells (tile_sums).
+// 2. prefix_sum: one workgroup per scan tile. Each workgroup sums the tile
+//    totals before it to get its base offset, then scans its tile's counts
+//    -> cell_counts / cell_offsets.
+// 3. sort_scatter.wgsl `scatter`: move every particle to its slot in cell
+//    order, counting cell_fill back down to zero.
+//
+// No clear pass is needed: cell_fill returns to zero during the scatter and
+// tile_sums is cleared with a buffer fill alongside the pre-build snapshot.
 
 struct SimParams {
     dt: f32,
@@ -40,11 +46,19 @@ struct SimParams {
 @group(0) @binding(3) var<storage, read> pos_z: array<f32>;
 
 // Group 3: Grid data
-@group(3) @binding(0) var<storage, read_write> cell_indices: array<atomic<u32>>;
-@group(3) @binding(1) var<storage, read_write> cell_counts: array<atomic<u32>>;
+@group(3) @binding(0) var<storage, read_write> cell_indices: array<u32>;
+@group(3) @binding(1) var<storage, read_write> cell_counts: array<u32>;
 @group(3) @binding(2) var<storage, read_write> cell_offsets: array<u32>;
 @group(3) @binding(3) var<storage, read_write> sorted_indices: array<u32>;
-@group(3) @binding(4) var<storage, read_write> write_heads: array<atomic<u32>>;
+// Per-cell particle counter: counted up by count_particles, back down to zero
+// by the sort scatter.
+@group(3) @binding(4) var<storage, read_write> cell_fill: array<atomic<u32>>;
+// Particle count per scan tile (cleared before each build).
+@group(3) @binding(5) var<storage, read_write> tile_sums: array<atomic<u32>>;
+
+// Cells per prefix_sum workgroup (256 threads x 4 cells). Must match
+// GRID_SCAN_TILE in gpu/buffers.rs.
+const SCAN_TILE: u32 = 1024u;
 
 fn pos_to_cell(px: f32, py: f32, pz: f32) -> u32 {
     let cx = clamp(
@@ -66,82 +80,52 @@ fn total_cells() -> u32 {
     return params.grid_dim_x * params.grid_dim_y * params.grid_dim_z;
 }
 
-// Pass 0: Clear cell counts
-@compute @workgroup_size(256)
-fn clear_counts(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= total_cells() {
-        return;
-    }
-    atomicStore(&cell_counts[idx], 0u);
-    cell_offsets[idx] = 0u;
-}
+// Pass 1: Count particles per cell and per scan tile.
+//
+// Particles are (nearly) in cell order from the previous build, so a
+// workgroup's particles fall in a few consecutive tiles: tally those in
+// workgroup memory and flush one global atomic per tile, instead of 256
+// contended global atomics on the same counter.
+const WG_TILES: u32 = 4u;
+var<workgroup> wg_tile_counts: array<atomic<u32>, WG_TILES>;
+var<workgroup> wg_first_tile: u32;
 
-// Pass 1: Count particles per cell
 @compute @workgroup_size(256)
-fn count_particles(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn count_particles(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid3: vec3<u32>,
+) {
     let i = gid.x;
-    if i >= params.n_particles {
-        return;
+    let lid = lid3.x;
+    let valid = i < params.n_particles;
+    var tile = 0u;
+    if valid {
+        let cell = pos_to_cell(pos_x[i], pos_y[i], pos_z[i]);
+        cell_indices[i] = cell;
+        atomicAdd(&cell_fill[cell], 1u);
+        tile = cell / SCAN_TILE;
     }
-    let cell = pos_to_cell(pos_x[i], pos_y[i], pos_z[i]);
-    atomicStore(&cell_indices[i], cell);
-    atomicAdd(&cell_counts[cell], 1u);
-}
-
-// Pass 2: Parallel prefix sum using 256 threads with shared memory.
-// Each thread handles a contiguous block of cells. A shared-memory scan
-// of per-block totals propagates offsets across blocks.
-// Handles up to 256 * 256 = 65536 cells in a single workgroup dispatch.
-var<workgroup> block_totals: array<u32, 256>;
-
-@compute @workgroup_size(256)
-fn prefix_sum(@builtin(local_invocation_id) lid: vec3<u32>) {
-    let tid = lid.x;
-    let n_cells = total_cells();
-    let block_size = (n_cells + 255u) / 256u;
-    let start = tid * block_size;
-    let end = min(start + block_size, n_cells);
-
-    // Phase 1: each thread computes local prefix sum for its block
-    var local_sum = 0u;
-    for (var c = start; c < end; c = c + 1u) {
-        let count = atomicLoad(&cell_counts[c]);
-        cell_offsets[c] = local_sum;
-        local_sum = local_sum + count;
+    if lid < WG_TILES {
+        atomicStore(&wg_tile_counts[lid], 0u);
     }
-    block_totals[tid] = local_sum;
-
+    if lid == 0u {
+        wg_first_tile = tile;
+    }
     workgroupBarrier();
-
-    // Phase 2: thread 0 scans the 256 block totals (exclusive prefix sum)
-    if tid == 0u {
-        var running = 0u;
-        for (var i = 0u; i < 256u; i = i + 1u) {
-            let old = block_totals[i];
-            block_totals[i] = running;
-            running = running + old;
+    let first = wg_first_tile;
+    if valid {
+        let d = tile - first; // wraps to a huge value if tile < first
+        if d < WG_TILES {
+            atomicAdd(&wg_tile_counts[d], 1u);
+        } else {
+            atomicAdd(&tile_sums[tile], 1u);
         }
     }
-
     workgroupBarrier();
-
-    // Phase 3: add block offset to local results and initialize write_heads
-    let offset = block_totals[tid];
-    for (var c = start; c < end; c = c + 1u) {
-        cell_offsets[c] = cell_offsets[c] + offset;
-        atomicStore(&write_heads[c], cell_offsets[c]);
+    if lid < WG_TILES {
+        let c = atomicLoad(&wg_tile_counts[lid]);
+        if c > 0u {
+            atomicAdd(&tile_sums[first + lid], c);
+        }
     }
-}
-
-// Pass 3: Scatter particle indices into sorted order
-@compute @workgroup_size(256)
-fn scatter_particles(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if i >= params.n_particles {
-        return;
-    }
-    let cell = atomicLoad(&cell_indices[i]);
-    let pos = atomicAdd(&write_heads[cell], 1u);
-    sorted_indices[pos] = i;
 }

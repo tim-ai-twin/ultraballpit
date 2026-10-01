@@ -5,11 +5,9 @@
 // 2. Monaghan artificial viscosity
 // 3. Gravity
 // 4. Boundary repulsive forces
-// 5. Boundary pressure mirroring (Adami et al. 2012)
 //
-// Two entry points:
-// - update_boundary_pressures: Adami pressure mirroring for boundary particles
-// - compute_forces: all forces on fluid particles
+// Entry point compute_forces: all forces on fluid particles. Boundary
+// pressures are mirrored beforehand by boundary_pressure.wgsl.
 
 const PI: f32 = 3.14159265358979323846;
 const WENDLAND_C2_NORM_3D: f32 = 0.41780189; // 21 / (16 * PI)
@@ -159,65 +157,6 @@ fn bnd_row_range(cell: vec3<i32>, ny: i32, nz: i32) -> vec2<u32> {
     let c0 = cell_hash(u32(x0), u32(ny), u32(nz));
     let c1 = cell_hash(u32(x1), u32(ny), u32(nz));
     return vec2<u32>(bnd_cell_offsets[c0], bnd_cell_offsets[c1] + bnd_cell_counts[c1]);
-}
-
-// Entry point: Update boundary pressures using Adami et al. (2012) mirroring
-@compute @workgroup_size(256)
-fn update_boundary_pressures(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let b = gid.x;
-    if b >= params.n_boundary {
-        return;
-    }
-
-    let h = params.h;
-    let search = i32(params.search_cells);
-    let support_radius = 2.0 * h;
-    let support_radius_sq = support_radius * support_radius;
-
-    let bx = bnd_x[b];
-    let by = bnd_y[b];
-    let bz = bnd_z[b];
-
-    var weighted_pressure = 0.0;
-    var weight_sum = 0.0;
-
-    // Search fluid particles near this boundary particle via neighbor grid
-    let bcell = pos_to_cell_i32(bx, by, bz);
-    for (var dz_off = -search; dz_off <= search; dz_off = dz_off + 1) {
-        let nz = bcell.z + dz_off;
-        if nz < 0 || nz >= i32(params.grid_dim_z) { continue; }
-        for (var dy_off = -search; dy_off <= search; dy_off = dy_off + 1) {
-            let ny = bcell.y + dy_off;
-            if ny < 0 || ny >= i32(params.grid_dim_y) { continue; }
-            {
-                // The row's cells are adjacent in hash order and particles are
-                // stored in cell order, so the whole row is one index range.
-                let f_range = row_range(bcell, ny, nz);
-                for (var f = f_range.x; f < f_range.y; f = f + 1u) {
-                    let dx = bx - pos_x[f];
-                    let dy = by - pos_y[f];
-                    let dz = bz - pos_z[f];
-                    let dist_sq = dx * dx + dy * dy + dz * dz;
-
-                    if dist_sq < support_radius_sq {
-                        let inv_r = inverseSqrt(max(dist_sq, 1.0e-24));
-                        let r = dist_sq * inv_r;
-                        let w = wendland_c2(r, h);
-                        let g_dot_dr = params.gravity_x * dx + params.gravity_y * dy + params.gravity_z * dz;
-                        let p_extrapolated = pressure[f] + density[f] * g_dot_dr;
-                        weighted_pressure = weighted_pressure + w * p_extrapolated;
-                        weight_sum = weight_sum + w;
-                    }
-                }
-            }
-        }
-    }
-
-    if weight_sum > 1.0e-12 {
-        bnd_pressure[b] = max(weighted_pressure / weight_sum, 0.0);
-    } else {
-        bnd_pressure[b] = 0.0;
-    }
 }
 
 // Per-particle state of the particle whose forces are being summed.

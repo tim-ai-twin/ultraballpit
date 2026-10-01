@@ -1,10 +1,12 @@
-// Permute per-particle arrays into cell order after a grid build.
+// Scatter particles into cell order: the last pass of a grid build.
 //
-//   dst_n[k] = src_n[perm[k]]   for each persistent array n
+//   d_n[cell_offsets[c] + slot] = s_n[i]   for each persistent array n
 //
-// `perm` is the grid's sorted_indices; it is reset to the identity so any
-// shader that still indexes through sorted_indices sees the sorted layout.
-// Arrays are copied as raw 32-bit words (f32 and u32 alike).
+// where c = cell_indices[i] and slot is claimed by counting cell_fill[c] back
+// down (which also leaves cell_fill zeroed for the next build). The s_n are
+// snapshots of the arrays taken before the build; arrays are copied as raw
+// 32-bit words (f32 and u32 alike). Order within a cell is arbitrary, as with
+// any atomic scatter.
 
 struct SortParams {
     n_particles: u32,
@@ -14,7 +16,9 @@ struct SortParams {
 };
 
 @group(0) @binding(0) var<uniform> sp: SortParams;
-@group(0) @binding(1) var<storage, read_write> perm: array<u32>;
+@group(0) @binding(1) var<storage, read> cell_indices: array<u32>;
+@group(0) @binding(2) var<storage, read> cell_offsets: array<u32>;
+@group(0) @binding(3) var<storage, read_write> cell_fill: array<atomic<u32>>;
 
 @group(1) @binding(0) var<storage, read> s0: array<u32>;
 @group(1) @binding(1) var<storage, read> s1: array<u32>;
@@ -39,12 +43,13 @@ struct SortParams {
 @group(2) @binding(9) var<storage, read_write> d9: array<u32>;
 
 @compute @workgroup_size(256)
-fn gather(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let k = gid.x;
-    if k >= sp.n_particles {
+fn scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= sp.n_particles {
         return;
     }
-    let i = perm[k];
+    let cell = cell_indices[i];
+    let k = cell_offsets[cell] + atomicSub(&cell_fill[cell], 1u) - 1u;
     d0[k] = s0[i];
     d1[k] = s1[i];
     d2[k] = s2[i];
@@ -55,5 +60,4 @@ fn gather(@builtin(global_invocation_id) gid: vec3<u32>) {
     d7[k] = s7[i];
     d8[k] = s8[i];
     d9[k] = s9[i];
-    perm[k] = k;
 }
