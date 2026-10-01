@@ -13,7 +13,8 @@
 //!   fingerprint fixed step count physics fingerprint
 //!   kernel      kernel-only step() vs step_no_sync() rate
 //!
-//! Scenarios: dam25 dam15 dam10 pillar25 pcisph25 (default: dam25 dam15 dam10 pillar25)
+//! Scenarios: dam25 dam15 dam10 pillar25 pillar15 pcisph25 tank25 (hydrostatic, at rest)
+//!   (default: dam25 dam15 dam10 pillar25)
 //! Env: BENCH_SECS (default 6), BENCH_FRAMES=0 to disable the snapshot thread,
 //!      BENCH_SIMT (quality mode, default 0.4), BENCH_CFL to override cfl_number.
 
@@ -32,12 +33,15 @@ fn scenario(name: &str) -> SimulationConfig {
         "pillar25" => (0.0025, true, "wcsph"),
         "pillar15" => (0.0015, true, "wcsph"),
         "pcisph25" => (0.0025, false, "pcisph"),
+        "tank25" => (0.0025, false, "wcsph"),
         _ => panic!("unknown scenario {name}"),
     };
+    // tank25: hydrostatic tank, fluid fills the whole floor (stays at rest).
+    let fluid_x = if name == "tank25" { 0.12 } else { 0.036 };
     let mut cfg = serde_json::json!({
         "name": name, "fluid_type": "Water",
         "domain": {"min": [0.0,0.0,0.0], "max": [0.12,0.08,0.06]},
-        "fluid_region": {"min": [0.0,0.0,0.0], "max": [0.036,0.06,0.06]},
+        "fluid_region": {"min": [0.0,0.0,0.0], "max": [fluid_x,0.06,0.06]},
         "boundary_conditions": {"x_min":"Wall","x_max":"Wall","y_min":"Wall","y_max":"Outflow","z_min":"Wall","z_max":"Wall"},
         "particle_spacing": spacing, "gravity": [0.0,-9.81,0.0],
         "speed_of_sound": 20.0, "viscosity": 0.001, "cfl_number": 0.4,
@@ -139,7 +143,8 @@ fn quality(name: &str, sim_end: f64) {
     let (mut peak_abs, mut peak_c, mut peak_p99) = (0.0f32, 0.0f32, 0.0f32);
     let (mut sum_c, mut sum_p99, mut sum_dt, mut samples) = (0.0f64, 0.0f64, 0.0f64, 0u32);
     let mut t_front: [Option<f64>; 2] = [None, None];
-    println!("{name}: t[s]    dt         max|dev|  max_comp  p99_comp  front_x[m]");
+    let mut vmax = 0.0f32;
+    println!("{name}: t[s]    dt         max|dev|  max_comp  p99_comp  front_x[m]  vmax[m/s]");
     while runner.sim_time() < sim_end {
         let t = Instant::now();
         runner.step_batch(Duration::from_millis(24));
@@ -150,6 +155,9 @@ fn quality(name: &str, sim_end: f64) {
         let p = runner.particles();
         let (abs, c, p99) = density_stats(&p);
         let front = p.x.iter().copied().fold(0.0f32, f32::max);
+        vmax = (0..p.len())
+            .map(|i| (p.vx[i] * p.vx[i] + p.vy[i] * p.vy[i] + p.vz[i] * p.vz[i]).sqrt())
+            .fold(0.0f32, f32::max);
         let sim_t = runner.sim_time();
         // Surge-front arrival times (resolution: one 24 ms batch).
         if front >= 0.06 && t_front[0].is_none() {
@@ -170,7 +178,7 @@ fn quality(name: &str, sim_end: f64) {
         }
         if sim_t >= next_print {
             println!(
-                "{name}: {sim_t:.4}  {:.3e}  {abs:.4}    {c:.4}    {p99:.4}    {front:.4}",
+                "{name}: {sim_t:.4}  {:.3e}  {abs:.4}    {c:.4}    {p99:.4}    {front:.4}      {vmax:.4}",
                 runner.dt()
             );
             next_print += 0.05;
@@ -181,7 +189,7 @@ fn quality(name: &str, sim_end: f64) {
         "{name} SUMMARY t={:.4} steps={} status={:?} sim_s/stepping_wall_s={:.5} wall={:.1}s \
          mean_dt={:.3e} peak|dev|={peak_abs:.4} peak_comp={peak_c:.4} mean_comp={:.4} \
          peak_p99={peak_p99:.4} mean_p99={:.4} front_x0={x0:.4} t(front>=0.06)={:.4} \
-         t(front>=0.09)={:.4}",
+         t(front>=0.09)={:.4} final_vmax={vmax:.4}",
         runner.sim_time(),
         runner.timestep_count(),
         runner.status(),
