@@ -53,6 +53,19 @@ struct SimParams {
 @group(0) @binding(3) var<storage, read> pos_z: array<f32>;
 @group(0) @binding(4) var<storage, read> mass: array<f32>;
 
+// Group 1: Neighbor lists, written here and reused by the forces pass (same
+// step) and the XSPH pass (next step), which see the same positions. Stored
+// interleaved, list[k * n_particles + i], so reads coalesce across threads.
+// Counts record every neighbor; a count above the cap means the list is
+// incomplete and consumers fall back to a grid scan.
+@group(1) @binding(0) var<storage, read_write> nbr_list: array<u32>;
+@group(1) @binding(1) var<storage, read_write> nbr_count: array<u32>;
+@group(1) @binding(2) var<storage, read_write> bnd_nbr_list: array<u32>;
+@group(1) @binding(3) var<storage, read_write> bnd_nbr_count: array<u32>;
+
+const MAX_NBR: u32 = 128u;
+const MAX_BND_NBR: u32 = 64u;
+
 // Group 2: SPH state + boundary
 @group(2) @binding(0) var<storage, read_write> density: array<f32>;
 @group(2) @binding(1) var<storage, read_write> pressure: array<f32>;
@@ -170,6 +183,9 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Delta-SPH diffusion accumulator
     var diff_sum = 0.0;
 
+    var n_nbr = 0u;
+    var n_bnd_nbr = 0u;
+
     // Fluid neighbor contributions via neighbor grid
     let cell = pos_to_cell_i32(px, py, pz);
 
@@ -192,6 +208,10 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
 
                     if dist_sq <= support_radius_sq {
+                        if n_nbr < MAX_NBR {
+                            nbr_list[n_nbr * params.n_particles + i] = j;
+                        }
+                        n_nbr = n_nbr + 1u;
                         let r = dist_sq * inverseSqrt(max(dist_sq, 1.0e-24));
                         rho = rho + read_mass(j) * wendland_c2(r, h);
 
@@ -228,6 +248,10 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
 
                         if dist_sq < support_radius_sq {
+                            if n_bnd_nbr < MAX_BND_NBR {
+                                bnd_nbr_list[n_bnd_nbr * params.n_particles + i] = b;
+                            }
+                            n_bnd_nbr = n_bnd_nbr + 1u;
                             let r = dist_sq * inverseSqrt(max(dist_sq, 1.0e-24));
                             rho = rho + bnd_mass[b] * wendland_c2(r, h);
                         }
@@ -245,6 +269,8 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     density[i] = rho;
+    nbr_count[i] = n_nbr;
+    bnd_nbr_count[i] = n_bnd_nbr;
 
     if params.pass_index == 0u {
         let ft = fluid_type[i];

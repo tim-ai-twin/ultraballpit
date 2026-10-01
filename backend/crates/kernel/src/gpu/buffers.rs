@@ -81,6 +81,12 @@ pub struct GpuBuffers {
 
     pub staging_mass: wgpu::Buffer,
 
+    /// Neighbor lists built by the density pass (interleaved: [k * n + i]).
+    pub nbr_list: wgpu::Buffer,
+    pub nbr_count: wgpu::Buffer,
+    pub bnd_nbr_list: wgpu::Buffer,
+    pub bnd_nbr_count: wgpu::Buffer,
+
     // Staging buffers for readback
     pub staging_density: wgpu::Buffer,
     pub staging_pos_x: wgpu::Buffer,
@@ -128,6 +134,12 @@ const MIN_BUF_SIZE: u64 = 4;
 /// Number of per-particle arrays permuted into cell order after each grid
 /// build (see `GpuBuffers::sorted_arrays`).
 pub const SORTED_ARRAY_COUNT: usize = 10;
+
+/// Neighbor-list capacity per particle (must match MAX_NBR / MAX_BND_NBR in
+/// density.wgsl, forces.wgsl, xsph.wgsl). A rest lattice at h = 1.3 dx has 80
+/// fluid neighbors; overflowing particles fall back to a grid scan.
+pub const MAX_NBR: u64 = 128;
+pub const MAX_BND_NBR: u64 = 64;
 
 /// Create a storage buffer from f32 slice data. If the slice is empty, creates
 /// a minimal buffer.
@@ -262,6 +274,16 @@ impl GpuBuffers {
 
         // Temp buffer for particle reordering (one array at a time)
         let staging_mass = create_staging_buf(device, "staging_mass", particle_bytes);
+        let gpu_only = |label: &str, size: u64| device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: size.max(MIN_BUF_SIZE),
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let nbr_list = gpu_only("nbr_list", particle_u32_bytes * MAX_NBR);
+        let nbr_count = gpu_only("nbr_count", particle_u32_bytes);
+        let bnd_nbr_list = gpu_only("bnd_nbr_list", particle_u32_bytes * MAX_BND_NBR);
+        let bnd_nbr_count = gpu_only("bnd_nbr_count", particle_u32_bytes);
         // Scratch copies used as gather sources when sorting particle data
         // into cell order (one per array in SORTED_ARRAYS order).
         let sort_tmp: Vec<wgpu::Buffer> = (0..SORTED_ARRAY_COUNT)
@@ -318,6 +340,10 @@ impl GpuBuffers {
             bnd_sorted_indices,
             sort_tmp,
             staging_mass,
+            nbr_list,
+            nbr_count,
+            bnd_nbr_list,
+            bnd_nbr_count,
             pcisph_orig_pos_x,
             pcisph_orig_pos_y,
             pcisph_orig_pos_z,

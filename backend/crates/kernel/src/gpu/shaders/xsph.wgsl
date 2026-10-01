@@ -50,6 +50,11 @@ struct SimParams {
 @group(1) @binding(3) var<storage, read_write> acc_x: array<f32>;
 @group(1) @binding(4) var<storage, read_write> acc_y: array<f32>;
 @group(1) @binding(5) var<storage, read_write> acc_z: array<f32>;
+// Neighbor lists written by the density pass (see density.wgsl).
+@group(1) @binding(6) var<storage, read> nbr_list: array<u32>;
+@group(1) @binding(7) var<storage, read> nbr_count: array<u32>;
+
+const MAX_NBR: u32 = 128u;
 
 // Group 2: density (only density is used, rest are bound but unused)
 @group(2) @binding(0) var<storage, read> density: array<f32>;
@@ -111,6 +116,24 @@ fn row_range(cell: vec3<i32>, ny: i32, nz: i32) -> vec2<u32> {
     return vec2<u32>(cell_offsets[c0], cell_offsets[c1] + cell_counts[c1]);
 }
 
+// Smoothed-velocity contribution of neighbor j (zero outside the support).
+fn xsph_pair(px: f32, py: f32, pz: f32, vi: vec3<f32>, rho_i: f32, j: u32) -> vec3<f32> {
+    let h = params.h;
+    let support_radius_sq = 4.0 * h * h;
+    let ddx = px - pos_x[j];
+    let ddy = py - pos_y[j];
+    let ddz = pz - pos_z[j];
+    let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
+    if dist_sq > support_radius_sq {
+        return vec3<f32>(0.0);
+    }
+    let r = dist_sq * inverseSqrt(max(dist_sq, 1.0e-24));
+    let w = wendland_c2(r, h);
+    let rho_avg = 0.5 * (rho_i + density[j]);
+    let factor = read_mass(j) / max(rho_avg, 1.0) * w;
+    return factor * (vec3<f32>(vel_x[j], vel_y[j], vel_z[j]) - vi);
+}
+
 @compute @workgroup_size(256)
 fn compute_xsph(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -118,60 +141,41 @@ fn compute_xsph(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let h = params.h;
     let search = i32(params.search_cells);
-    let support_radius = 2.0 * h;
-    let support_radius_sq = support_radius * support_radius;
-
     let px = pos_x[i];
     let py = pos_y[i];
     let pz = pos_z[i];
-    let vxi = vel_x[i];
-    let vyi = vel_y[i];
-    let vzi = vel_z[i];
+    let vi = vec3<f32>(vel_x[i], vel_y[i], vel_z[i]);
     let rho_i = density[i];
 
-    var cx = 0.0;
-    var cy = 0.0;
-    var cz = 0.0;
+    var c = vec3<f32>(0.0);
 
-    let cell = pos_to_cell_i32(px, py, pz);
-
-    for (var dz = -search; dz <= search; dz = dz + 1) {
-        let nz = cell.z + dz;
-        if nz < 0 || nz >= i32(params.grid_dim_z) { continue; }
-        for (var dy = -search; dy <= search; dy = dy + 1) {
-            let ny = cell.y + dy;
-            if ny < 0 || ny >= i32(params.grid_dim_y) { continue; }
-            {
-                // The row's cells are adjacent in hash order and particles are
-                // stored in cell order, so the whole row is one index range.
+    // Positions are unchanged since the last density pass, so its neighbor
+    // list is exact here. Fall back to the grid scan if it overflowed.
+    let n_nbr = nbr_count[i];
+    if n_nbr <= MAX_NBR {
+        for (var k = 0u; k < n_nbr; k = k + 1u) {
+            c = c + xsph_pair(px, py, pz, vi, rho_i, nbr_list[k * params.n_particles + i]);
+        }
+    } else {
+        let cell = pos_to_cell_i32(px, py, pz);
+        for (var dz = -search; dz <= search; dz = dz + 1) {
+            let nz = cell.z + dz;
+            if nz < 0 || nz >= i32(params.grid_dim_z) { continue; }
+            for (var dy = -search; dy <= search; dy = dy + 1) {
+                let ny = cell.y + dy;
+                if ny < 0 || ny >= i32(params.grid_dim_y) { continue; }
                 let j_range = row_range(cell, ny, nz);
                 for (var j = j_range.x; j < j_range.y; j = j + 1u) {
                     if j == i { continue; }
-
-                    let ddx = px - pos_x[j];
-                    let ddy = py - pos_y[j];
-                    let ddz = pz - pos_z[j];
-                    let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
-
-                    if dist_sq <= support_radius_sq {
-                        let r = dist_sq * inverseSqrt(max(dist_sq, 1.0e-24));
-                        let w = wendland_c2(r, h);
-                        let rho_avg = 0.5 * (rho_i + density[j]);
-                        let factor = read_mass(j) / max(rho_avg, 1.0) * w;
-
-                        cx = cx + factor * (vel_x[j] - vxi);
-                        cy = cy + factor * (vel_y[j] - vyi);
-                        cz = cz + factor * (vel_z[j] - vzi);
-                    }
+                    c = c + xsph_pair(px, py, pz, vi, rho_i, j);
                 }
             }
         }
     }
 
     // Write XSPH correction to acc buffers (reused as temp storage)
-    acc_x[i] = XSPH_EPSILON * cx;
-    acc_y[i] = XSPH_EPSILON * cy;
-    acc_z[i] = XSPH_EPSILON * cz;
+    acc_x[i] = XSPH_EPSILON * c.x;
+    acc_y[i] = XSPH_EPSILON * c.y;
+    acc_z[i] = XSPH_EPSILON * c.z;
 }

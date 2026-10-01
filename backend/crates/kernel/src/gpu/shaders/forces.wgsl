@@ -57,6 +57,14 @@ struct SimParams {
 @group(1) @binding(3) var<storage, read_write> acc_x: array<f32>;
 @group(1) @binding(4) var<storage, read_write> acc_y: array<f32>;
 @group(1) @binding(5) var<storage, read_write> acc_z: array<f32>;
+// Neighbor lists written by the density pass (see density.wgsl).
+@group(1) @binding(6) var<storage, read> nbr_list: array<u32>;
+@group(1) @binding(7) var<storage, read> nbr_count: array<u32>;
+@group(1) @binding(8) var<storage, read> bnd_nbr_list: array<u32>;
+@group(1) @binding(9) var<storage, read> bnd_nbr_count: array<u32>;
+
+const MAX_NBR: u32 = 128u;
+const MAX_BND_NBR: u32 = 64u;
 
 // Group 2: SPH state + boundary
 @group(2) @binding(0) var<storage, read> density: array<f32>;
@@ -204,6 +212,77 @@ fn update_boundary_pressures(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+// Per-particle state of the particle whose forces are being summed.
+struct ParticleI {
+    pos: vec3<f32>,
+    vel: vec3<f32>,
+    m: f32,
+    rho: f32,
+    p_over_rho2: f32,
+    // Fluid-side pressure clamped to >= 0 for boundary interactions.
+    p_clamped_over_rho2: f32,
+    // Rest density used as the boundary particle density.
+    boundary_rho: f32,
+};
+
+// Pressure + Monaghan viscosity force (times m_i) from fluid neighbor j.
+fn fluid_pair_force(pi: ParticleI, j: u32) -> vec3<f32> {
+    let h = params.h;
+    let support_radius_sq = 4.0 * h * h;
+    let eta_sq = 0.01 * h * h;
+    let d = pi.pos - vec3<f32>(pos_x[j], pos_y[j], pos_z[j]);
+    let dist_sq = dot(d, d);
+    if dist_sq > support_radius_sq {
+        return vec3<f32>(0.0);
+    }
+    let grad = wendland_c2_gradient_from_dist_sq(d.x, d.y, d.z, dist_sq, h);
+    let m_j = read_mass(j);
+    let rho_j = density[j];
+
+    // Pressure forces
+    let pj_over_rho2_j = pressure[j] / (rho_j * rho_j);
+    var factor = -pi.m * m_j * (pi.p_over_rho2 + pj_over_rho2_j);
+
+    // Viscous forces (Monaghan artificial viscosity)
+    let dv = pi.vel - vec3<f32>(vel_x[j], vel_y[j], vel_z[j]);
+    let vr_dot = dot(dv, d);
+    if vr_dot < 0.0 {
+        let mu_ij = h * vr_dot / (dist_sq + eta_sq);
+        let rho_avg = 0.5 * (pi.rho + rho_j);
+        let pi_ij = (-params.viscosity_alpha * params.speed_of_sound * mu_ij
+            + params.viscosity_beta * mu_ij * mu_ij) / rho_avg;
+        // Multiply by m_i so that the final `f / m_i` conversion
+        // to acceleration correctly cancels to -m_j * pi_ij * grad_W.
+        factor = factor - pi.m * m_j * pi_ij;
+    }
+    return factor * grad;
+}
+
+// Pressure + short-range repulsion force (times m_i) from boundary particle b.
+fn boundary_pair_force(pi: ParticleI, b: u32) -> vec3<f32> {
+    let h = params.h;
+    let support_radius_sq = 4.0 * h * h;
+    let r0 = 0.5 * h;
+    let d_repulsive = 10.0 * 9.81 * 0.01;
+    let d = pi.pos - vec3<f32>(bnd_x[b], bnd_y[b], bnd_z[b]);
+    let dist_sq = dot(d, d);
+    if dist_sq >= support_radius_sq {
+        return vec3<f32>(0.0);
+    }
+    let grad = wendland_c2_gradient_from_dist_sq(d.x, d.y, d.z, dist_sq, h);
+    let pb_over_rho2_b = bnd_pressure[b] / (pi.boundary_rho * pi.boundary_rho);
+    var f = (-pi.m * bnd_mass[b] * (pi.p_clamped_over_rho2 + pb_over_rho2_b)) * grad;
+
+    let inv_r_bnd = inverseSqrt(max(dist_sq, 1.0e-24));
+    let r_bnd = dist_sq * inv_r_bnd;
+    if r_bnd < r0 && dist_sq > 1.0e-24 {
+        let s = 1.0 - r_bnd / r0;
+        let force_mag = d_repulsive * s * s / r0;
+        f = f + (force_mag * inv_r_bnd * pi.m) * d;
+    }
+    return f;
+}
+
 // Entry point: Compute all forces on fluid particles
 @compute @workgroup_size(256)
 fn compute_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -212,132 +291,63 @@ fn compute_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let h = params.h;
+    let n = params.n_particles;
     let search = i32(params.search_cells);
-    let support_radius = 2.0 * h;
-    let support_radius_sq = support_radius * support_radius;
-    let alpha = params.viscosity_alpha;
-    let beta = params.viscosity_beta;
-    let eta_sq = 0.01 * h * h;
-
-    let px = pos_x[i];
-    let py = pos_y[i];
-    let pz = pos_z[i];
-    let m_i = read_mass(i);
     let rho_i = density[i];
     let p_i = pressure[i];
-    let ft_i = fluid_type[i];
 
-    let pi_over_rho2_i = p_i / (rho_i * rho_i);
+    var pi: ParticleI;
+    pi.pos = vec3<f32>(pos_x[i], pos_y[i], pos_z[i]);
+    pi.vel = vec3<f32>(vel_x[i], vel_y[i], vel_z[i]);
+    pi.m = read_mass(i);
+    pi.rho = rho_i;
+    pi.p_over_rho2 = p_i / (rho_i * rho_i);
+    pi.p_clamped_over_rho2 = max(p_i, 0.0) / (rho_i * rho_i);
+    pi.boundary_rho = select(AIR_REST_DENSITY, WATER_REST_DENSITY, fluid_type[i] == 0u);
 
-    // For boundary interactions, clamp fluid-side pressure to >= 0
-    let pi_clamped = max(p_i, 0.0);
-    let pi_clamped_over_rho2 = pi_clamped / (rho_i * rho_i);
+    var f = vec3<f32>(0.0);
+    let cell = pos_to_cell_i32(pi.pos.x, pi.pos.y, pi.pos.z);
 
-    // Rest density for boundary denominator
-    var boundary_rho = WATER_REST_DENSITY;
-    if ft_i != 0u {
-        boundary_rho = AIR_REST_DENSITY;
-    }
-
-    var fx = 0.0;
-    var fy = 0.0;
-    var fz = 0.0;
-
-    // Fluid-fluid interactions via neighbor grid
-    let cell = pos_to_cell_i32(px, py, pz);
-
-    for (var dz_off = -search; dz_off <= search; dz_off = dz_off + 1) {
-        let nz = cell.z + dz_off;
-        if nz < 0 || nz >= i32(params.grid_dim_z) { continue; }
-        for (var dy_off = -search; dy_off <= search; dy_off = dy_off + 1) {
-            let ny = cell.y + dy_off;
-            if ny < 0 || ny >= i32(params.grid_dim_y) { continue; }
-            {
-                // The row's cells are adjacent in hash order and particles are
-                // stored in cell order, so the whole row is one index range.
+    // Fluid-fluid interactions: walk the density pass's neighbor list (same
+    // positions, so it is exact); grid scan only if the list overflowed.
+    let n_nbr = nbr_count[i];
+    if n_nbr <= MAX_NBR {
+        for (var k = 0u; k < n_nbr; k = k + 1u) {
+            f = f + fluid_pair_force(pi, nbr_list[k * n + i]);
+        }
+    } else {
+        for (var dz = -search; dz <= search; dz = dz + 1) {
+            let nz = cell.z + dz;
+            if nz < 0 || nz >= i32(params.grid_dim_z) { continue; }
+            for (var dy = -search; dy <= search; dy = dy + 1) {
+                let ny = cell.y + dy;
+                if ny < 0 || ny >= i32(params.grid_dim_y) { continue; }
                 let j_range = row_range(cell, ny, nz);
                 for (var j = j_range.x; j < j_range.y; j = j + 1u) {
                     if j == i { continue; }
-
-                    let ddx = px - pos_x[j];
-                    let ddy = py - pos_y[j];
-                    let ddz = pz - pos_z[j];
-                    let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
-
-                    if dist_sq > support_radius_sq { continue; }
-
-                    let grad = wendland_c2_gradient_from_dist_sq(ddx, ddy, ddz, dist_sq, h);
-
-                    // Pressure forces
-                    let pj_over_rho2_j = pressure[j] / (density[j] * density[j]);
-                    let p_factor = -m_i * read_mass(j) * (pi_over_rho2_i + pj_over_rho2_j);
-                    fx = fx + p_factor * grad.x;
-                    fy = fy + p_factor * grad.y;
-                    fz = fz + p_factor * grad.z;
-
-                    // Viscous forces (Monaghan artificial viscosity)
-                    let dvx = vel_x[i] - vel_x[j];
-                    let dvy = vel_y[i] - vel_y[j];
-                    let dvz = vel_z[i] - vel_z[j];
-                    let vr_dot = dvx * ddx + dvy * ddy + dvz * ddz;
-
-                    if vr_dot < 0.0 {
-                        let r_sq = dist_sq;
-                        let mu_ij = h * vr_dot / (r_sq + eta_sq);
-                        let rho_avg = 0.5 * (rho_i + density[j]);
-                        let pi_ij = (-alpha * params.speed_of_sound * mu_ij + beta * mu_ij * mu_ij) / rho_avg;
-                        // Multiply by m_i so that the final `fx / m_i` conversion
-                        // to acceleration correctly cancels to -m_j * pi_ij * grad_W.
-                        let v_factor = -m_i * read_mass(j) * pi_ij;
-                        fx = fx + v_factor * grad.x;
-                        fy = fy + v_factor * grad.y;
-                        fz = fz + v_factor * grad.z;
-                    }
+                    f = f + fluid_pair_force(pi, j);
                 }
             }
         }
     }
 
     // Boundary particle contributions: pressure forces + repulsive forces
-    // Grid-accelerated lookup replaces O(N_b) linear scan.
-    let r0 = 0.5 * h;
-    let d_repulsive = 10.0 * 9.81 * 0.01;
     if params.n_boundary > 0u {
-        for (var bz_off = -search; bz_off <= search; bz_off = bz_off + 1) {
-            let bnz = cell.z + bz_off;
-            if bnz < 0 || bnz >= i32(params.grid_dim_z) { continue; }
-            for (var by_off = -search; by_off <= search; by_off = by_off + 1) {
-                let bny = cell.y + by_off;
-                if bny < 0 || bny >= i32(params.grid_dim_y) { continue; }
-                {
-                    // The row's cells are adjacent in hash order and particles are
-                    // stored in cell order, so the whole row is one index range.
-                    let b_range = bnd_row_range(cell, bny, bnz);
+        let n_bnd = bnd_nbr_count[i];
+        if n_bnd <= MAX_BND_NBR {
+            for (var k = 0u; k < n_bnd; k = k + 1u) {
+                f = f + boundary_pair_force(pi, bnd_nbr_list[k * n + i]);
+            }
+        } else {
+            for (var dz = -search; dz <= search; dz = dz + 1) {
+                let nz = cell.z + dz;
+                if nz < 0 || nz >= i32(params.grid_dim_z) { continue; }
+                for (var dy = -search; dy <= search; dy = dy + 1) {
+                    let ny = cell.y + dy;
+                    if ny < 0 || ny >= i32(params.grid_dim_y) { continue; }
+                    let b_range = bnd_row_range(cell, ny, nz);
                     for (var b = b_range.x; b < b_range.y; b = b + 1u) {
-                        let ddx = px - bnd_x[b];
-                        let ddy = py - bnd_y[b];
-                        let ddz = pz - bnd_z[b];
-                        let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
-
-                        if dist_sq < support_radius_sq {
-                            let grad = wendland_c2_gradient_from_dist_sq(ddx, ddy, ddz, dist_sq, h);
-                            let pb_over_rho2_b = bnd_pressure[b] / (boundary_rho * boundary_rho);
-                            let factor = -m_i * bnd_mass[b] * (pi_clamped_over_rho2 + pb_over_rho2_b);
-                            fx = fx + factor * grad.x;
-                            fy = fy + factor * grad.y;
-                            fz = fz + factor * grad.z;
-
-                            let inv_r_bnd = inverseSqrt(max(dist_sq, 1.0e-24));
-                            let r_bnd = dist_sq * inv_r_bnd;
-                            if r_bnd < r0 && dist_sq > 1.0e-24 {
-                                let s = 1.0 - r_bnd / r0;
-                                let force_mag = d_repulsive * s * s / r0;
-                                fx = fx + force_mag * ddx * inv_r_bnd * m_i;
-                                fy = fy + force_mag * ddy * inv_r_bnd * m_i;
-                                fz = fz + force_mag * ddz * inv_r_bnd * m_i;
-                            }
-                        }
+                        f = f + boundary_pair_force(pi, b);
                     }
                 }
             }
@@ -345,7 +355,7 @@ fn compute_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // Convert forces to accelerations: a = F / m, plus gravity
-    acc_x[i] = fx / m_i + params.gravity_x;
-    acc_y[i] = fy / m_i + params.gravity_y;
-    acc_z[i] = fz / m_i + params.gravity_z;
+    acc_x[i] = f.x / pi.m + params.gravity_x;
+    acc_y[i] = f.y / pi.m + params.gravity_y;
+    acc_z[i] = f.z / pi.m + params.gravity_z;
 }

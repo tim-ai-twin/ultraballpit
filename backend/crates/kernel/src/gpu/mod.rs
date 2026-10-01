@@ -68,6 +68,7 @@ struct BindGroupCache {
     grid_bg0: wgpu::BindGroup,
     grid_bg3: wgpu::BindGroup,
     density_bg0: wgpu::BindGroup,
+    density_bg1: wgpu::BindGroup,
     density_bg2: wgpu::BindGroup,
     density_forces_bg3: wgpu::BindGroup,
     forces_bg0: wgpu::BindGroup,
@@ -109,6 +110,7 @@ pub struct GpuKernel {
     bgl_grid_g3: wgpu::BindGroupLayout,
     // Density shader: groups 0, 2, 3
     bgl_density_g0: wgpu::BindGroupLayout,
+    bgl_density_g1: wgpu::BindGroupLayout,
     bgl_density_g2: wgpu::BindGroupLayout,
     bgl_density_g3: wgpu::BindGroupLayout,
     // Forces shader: groups 0, 1, 2, 3
@@ -432,6 +434,16 @@ impl GpuKernel {
                 bgl_storage_ro(4), // mass
             ],
         });
+        // Group 1: neighbor lists (written by the density pass)
+        let bgl_density_g1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("density_g1_bgl"),
+            entries: &[
+                bgl_storage_rw(0), // nbr_list
+                bgl_storage_rw(1), // nbr_count
+                bgl_storage_rw(2), // bnd_nbr_list
+                bgl_storage_rw(3), // bnd_nbr_count
+            ],
+        });
         // Group 2: density(rw), pressure(rw), fluid_type(read), bnd(read), bnd_grid(read)
         let bgl_density_g2 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("density_g2_bgl"),
@@ -480,6 +492,10 @@ impl GpuKernel {
                 bgl_storage_rw(3), // acc_x
                 bgl_storage_rw(4), // acc_y
                 bgl_storage_rw(5), // acc_z
+                bgl_storage_ro(6), // nbr_list
+                bgl_storage_ro(7), // nbr_count
+                bgl_storage_ro(8), // bnd_nbr_list
+                bgl_storage_ro(9), // bnd_nbr_count
             ],
         });
         // Group 2: density(read), pressure(read), fluid_type(read), bnd(read), bnd_pressure(rw), bnd_grid(read)
@@ -559,7 +575,7 @@ impl GpuKernel {
         // Density: uses groups 0, 2, 3; empty group at 1
         let pl_layout_density = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("density_pl"),
-            bind_group_layouts: &[&bgl_density_g0, &bgl_empty, &bgl_density_g2, &bgl_density_g3],
+            bind_group_layouts: &[&bgl_density_g0, &bgl_density_g1, &bgl_density_g2, &bgl_density_g3],
             push_constant_ranges: &[],
         });
         // Forces: uses all 4 groups
@@ -931,6 +947,7 @@ impl GpuKernel {
             bgl_grid_g0,
             bgl_grid_g3,
             bgl_density_g0,
+            bgl_density_g1,
             bgl_density_g2,
             bgl_density_g3,
             bgl_forces_g0,
@@ -1013,7 +1030,7 @@ impl GpuKernel {
         // Rebuild affected pipeline layouts
         let pl_layout_density = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("density_pl"),
-            bind_group_layouts: &[&self.bgl_density_g0, &self.bgl_empty, &self.bgl_density_g2, &self.bgl_density_g3],
+            bind_group_layouts: &[&self.bgl_density_g0, &self.bgl_density_g1, &self.bgl_density_g2, &self.bgl_density_g3],
             push_constant_ranges: &[],
         });
         let pl_layout_forces = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1130,7 +1147,6 @@ impl GpuKernel {
         let forces_bg1 = self.create_forces_bg1();
         let forces_bg2 = self.create_forces_bg2();
         let forces_bg3 = self.create_forces_bg3();
-        let empty_bg = self.create_empty_bind_group();
 
         // Density summation + EOS pressure
         {
@@ -1138,7 +1154,7 @@ impl GpuKernel {
                 label: Some("density"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline_density);
-            pass.set_bind_group(0, &density_bg0, &[]); pass.set_bind_group(1, &empty_bg, &[]);
+            pass.set_bind_group(0, &density_bg0, &[]); pass.set_bind_group(1, &self.create_density_bg1(), &[]);
             pass.set_bind_group(2, &density_bg2, &[]); pass.set_bind_group(3, &density_bg3, &[]);
             pass.dispatch_workgroups(wg_particles, 1, 1);
         }
@@ -1351,7 +1367,6 @@ impl GpuKernel {
         let wg_boundary = dispatch_size(n_boundary.max(1), wg);
 
         // Create all bind groups upfront
-        let empty_bg = self.create_empty_bind_group();
         let density_bg0 = self.create_density_bg0();
         let density_bg2 = self.create_density_bg2();
         let density_bg3 = self.create_density_forces_bg3();
@@ -1418,7 +1433,7 @@ impl GpuKernel {
                 }),
             });
             pass.set_pipeline(&self.pipeline_density);
-            pass.set_bind_group(0, &density_bg0, &[]); pass.set_bind_group(1, &empty_bg, &[]);
+            pass.set_bind_group(0, &density_bg0, &[]); pass.set_bind_group(1, &self.create_density_bg1(), &[]);
             pass.set_bind_group(2, &density_bg2, &[]); pass.set_bind_group(3, &density_bg3, &[]);
             pass.dispatch_workgroups(wg_particles, 1, 1);
         }
@@ -1551,6 +1566,7 @@ impl GpuKernel {
             grid_bg0: self.build_grid_bg0(),
             grid_bg3: self.build_grid_bg3(),
             density_bg0: self.build_density_bg0(),
+            density_bg1: self.build_density_bg1(),
             density_bg2: self.build_density_bg2(),
             density_forces_bg3: self.build_density_forces_bg3(),
             forces_bg0: self.build_forces_bg0(),
@@ -1570,6 +1586,7 @@ impl GpuKernel {
     fn create_grid_bg0(&self) -> wgpu::BindGroup { self.bg_cache().grid_bg0.clone() }
     fn create_grid_bg3(&self) -> wgpu::BindGroup { self.bg_cache().grid_bg3.clone() }
     fn create_density_bg0(&self) -> wgpu::BindGroup { self.bg_cache().density_bg0.clone() }
+    fn create_density_bg1(&self) -> wgpu::BindGroup { self.bg_cache().density_bg1.clone() }
     fn create_density_bg2(&self) -> wgpu::BindGroup { self.bg_cache().density_bg2.clone() }
     fn create_density_forces_bg3(&self) -> wgpu::BindGroup { self.bg_cache().density_forces_bg3.clone() }
     fn create_forces_bg0(&self) -> wgpu::BindGroup { self.bg_cache().forces_bg0.clone() }
@@ -1641,6 +1658,13 @@ impl GpuKernel {
     }
 
     /// Density group 2: density(rw), pressure(rw), fluid_type(read), bnd(read), bnd_grid(read)
+    /// Density group 1: neighbor lists (rw)
+    fn build_density_bg1(&self) -> wgpu::BindGroup {
+        bind_buffers(&self.device, "density_bg1", &self.bgl_density_g1, &[
+            &self.bufs.nbr_list, &self.bufs.nbr_count, &self.bufs.bnd_nbr_list, &self.bufs.bnd_nbr_count,
+        ])
+    }
+
     fn build_density_bg2(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("density_bg2"),
@@ -1703,6 +1727,10 @@ impl GpuKernel {
                 wgpu::BindGroupEntry { binding: 3, resource: self.bufs.acc_x.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: self.bufs.acc_y.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: self.bufs.acc_z.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: self.bufs.nbr_list.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: self.bufs.nbr_count.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: self.bufs.bnd_nbr_list.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: self.bufs.bnd_nbr_count.as_entire_binding() },
             ],
         })
     }
@@ -1919,14 +1947,13 @@ impl GpuKernel {
             let density_bg0 = self.create_density_bg0();
             let density_bg2 = self.create_density_bg2();
             let density_bg3 = self.create_density_forces_bg3();
-            let empty_bg = self.create_empty_bind_group();
 
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("pcisph_density"), timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.pipeline_density);
-                pass.set_bind_group(0, &density_bg0, &[]); pass.set_bind_group(1, &empty_bg, &[]);
+                pass.set_bind_group(0, &density_bg0, &[]); pass.set_bind_group(1, &self.create_density_bg1(), &[]);
                 pass.set_bind_group(2, &density_bg2, &[]); pass.set_bind_group(3, &density_bg3, &[]);
                 pass.dispatch_workgroups(wg_particles, 1, 1);
             }
@@ -2018,7 +2045,6 @@ impl GpuKernel {
             let density_bg0 = self.create_density_bg0();
             let density_bg2 = self.create_density_bg2();
             let density_bg3 = self.create_density_forces_bg3();
-            let empty_bg = self.create_empty_bind_group();
 
             // Clear convergence
             {
@@ -2053,7 +2079,7 @@ impl GpuKernel {
                 });
                 pass.set_pipeline(&self.pipeline_density);
                 pass.set_bind_group(0, &density_bg0, &[]);
-                pass.set_bind_group(1, &empty_bg, &[]);
+                pass.set_bind_group(1, &self.create_density_bg1(), &[]);
                 pass.set_bind_group(2, &density_bg2, &[]);
                 pass.set_bind_group(3, &density_bg3, &[]);
                 pass.dispatch_workgroups(wg_particles, 1, 1);

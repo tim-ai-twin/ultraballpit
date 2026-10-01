@@ -326,12 +326,14 @@ fn create_block() -> (ParticleArrays, BoundaryParticles, f32, [f32; 3], [f32; 3]
     (particles, boundary, h, domain_min, domain_max)
 }
 
-/// Index of `q` in `p` by position, robust to any particle reordering.
+/// Index of `q` in `p` by nearest position, robust to any particle reordering.
 fn match_by_position(p: &ParticleArrays, q: &ParticleArrays) -> Vec<usize> {
-    let key = |x: f32, y: f32, z: f32| ((x * 1e5).round() as i64, (y * 1e5).round() as i64, (z * 1e5).round() as i64);
-    let map: std::collections::HashMap<_, _> =
-        (0..p.len()).map(|i| (key(p.x[i], p.y[i], p.z[i]), i)).collect();
-    (0..q.len()).map(|i| *map.get(&key(q.x[i], q.y[i], q.z[i])).expect("unmatched particle")).collect()
+    (0..q.len())
+        .map(|k| {
+            let d2 = |i: usize| (p.x[i] - q.x[k]).powi(2) + (p.y[i] - q.y[k]).powi(2) + (p.z[i] - q.z[k]).powi(2);
+            (0..p.len()).min_by(|&a, &b| d2(a).total_cmp(&d2(b))).unwrap()
+        })
+        .collect()
 }
 
 #[test]
@@ -380,4 +382,55 @@ fn gpu_step_stats_match_cpu_reduction() {
     assert!(close(s.max_speed, r.max_speed) && close(s.max_accel, r.max_accel));
     assert!(close(s.max_density_variation, r.max_density_variation));
     assert_eq!(s.non_finite, r.non_finite);
+}
+
+/// Compressed lattice: ~340 fluid and >64 boundary neighbors per particle,
+/// overflowing the GPU neighbor-list caps so the grid-scan fallback runs.
+#[test]
+fn gpu_cpu_neighbor_list_overflow_fallback() {
+    let nominal = 0.002_f32;
+    let h = 1.3 * nominal;
+    let spacing = 0.6 * nominal;
+    let mass = 1000.0 * nominal * nominal * nominal;
+    let (dmin, dmax) = ([0.0_f32; 3], [0.03_f32; 3]);
+    let mut particles = ParticleArrays::new();
+    for ix in 0..12 {
+        for iy in 0..12 {
+            for iz in 0..12 {
+                particles.push_particle(
+                    0.005 + ix as f32 * spacing, 0.0015 + iy as f32 * spacing, 0.005 + iz as f32 * spacing,
+                    mass, 1000.0, 293.15, FluidType::Water,
+                );
+            }
+        }
+    }
+    let mut boundary = BoundaryParticles::new();
+    for ix in 0..40 {
+        for iz in 0..40 {
+            for layer in 0..2 {
+                boundary.push(ix as f32 * spacing, -(layer as f32) * spacing, iz as f32 * spacing, mass, 0.0, 1.0, 0.0);
+            }
+        }
+    }
+    let g = [0.0, -9.81, 0.0];
+    let mut cpu = CpuKernel::new(particles.clone(), boundary.clone(), h, g, 10.0, 0.4, 0.001, dmin, dmax);
+    let mut gpu = match GpuKernel::new(particles, boundary, h, g, 10.0, 0.4, 0.001, dmin, dmax, SolverType::Wcsph) {
+        Ok(k) => k,
+        Err(e) => { eprintln!("skip: {e}"); return; }
+    };
+    for _ in 0..2 {
+        cpu.step(1e-6);
+        gpu.step(1e-6);
+    }
+    let (c, q) = (cpu.particles(), gpu.particles());
+    let idx = match_by_position(c, q);
+    let (mut rel_rho, mut rel_a) = (0.0f32, 0.0f32);
+    let max_a = (0..c.len()).map(|i| (c.ax[i].powi(2) + c.ay[i].powi(2) + c.az[i].powi(2)).sqrt()).fold(0.0, f32::max);
+    for (k, &i) in idx.iter().enumerate() {
+        rel_rho = rel_rho.max((c.density[i] - q.density[k]).abs() / c.density[i]);
+        let da = ((c.ax[i] - q.ax[k]).powi(2) + (c.ay[i] - q.ay[k]).powi(2) + (c.az[i] - q.az[k]).powi(2)).sqrt();
+        rel_a = rel_a.max(da / max_a);
+    }
+    println!("overflow: max rel drho={rel_rho:.2e} max |da|/max|a|={rel_a:.2e} (max |a|={max_a:.1})");
+    assert!(rel_rho < 1e-3 && rel_a < 1e-2);
 }
