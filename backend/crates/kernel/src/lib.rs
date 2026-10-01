@@ -44,6 +44,54 @@ pub use gpu::{GpuKernel, GpuStepProfile};
 // SimulationKernel trait
 // ---------------------------------------------------------------------------
 
+/// Cheap whole-system maxima used for adaptive timestepping and health checks.
+///
+/// Non-finite values are excluded from the maxima and reported via
+/// `non_finite` instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StepStats {
+    /// Maximum particle speed |v| (m/s).
+    pub max_speed: f32,
+    /// Maximum particle acceleration |a| (m/s^2).
+    pub max_accel: f32,
+    /// Maximum relative density deviation from rest density.
+    pub max_density_variation: f32,
+    /// True if any position or velocity component is NaN or infinite.
+    pub non_finite: bool,
+}
+
+impl StepStats {
+    /// Compute stats from a CPU-side particle snapshot.
+    pub fn from_particles(p: &ParticleArrays) -> Self {
+        let mut s = StepStats::default();
+        for i in 0..p.len() {
+            let v2 = p.vx[i] * p.vx[i] + p.vy[i] * p.vy[i] + p.vz[i] * p.vz[i];
+            let a2 = p.ax[i] * p.ax[i] + p.ay[i] * p.ay[i] + p.az[i] * p.az[i];
+            let rest = match p.fluid_type[i] {
+                FluidType::Water => eos::WATER_REST_DENSITY,
+                FluidType::Air => eos::AIR_REST_DENSITY,
+            };
+            let dev = (p.density[i] - rest).abs() / rest;
+            // `>` is false for NaN, so non-finite entries never win a max.
+            if v2.is_finite() && v2 > s.max_speed {
+                s.max_speed = v2;
+            }
+            if a2.is_finite() && a2 > s.max_accel {
+                s.max_accel = a2;
+            }
+            if dev.is_finite() && dev > s.max_density_variation {
+                s.max_density_variation = dev;
+            }
+            s.non_finite |= ![p.x[i], p.y[i], p.z[i], p.vx[i], p.vy[i], p.vz[i]]
+                .iter()
+                .all(|v| v.is_finite());
+        }
+        s.max_speed = s.max_speed.sqrt();
+        s.max_accel = s.max_accel.sqrt();
+        s
+    }
+}
+
 /// Aggregate error / conservation metrics for a simulation snapshot.
 #[derive(Debug, Clone, Copy)]
 pub struct ErrorMetrics {
@@ -87,6 +135,14 @@ pub trait SimulationKernel {
 
     /// Return the solver type used by this kernel.
     fn solver_type(&self) -> SolverType;
+
+    /// Whole-system maxima for timestep control and health checks.
+    ///
+    /// Backends may override this with something cheaper than a full
+    /// particle readback (the GPU kernel reduces on-device).
+    fn step_stats(&self) -> StepStats {
+        StepStats::from_particles(self.particles())
+    }
 }
 
 // ---------------------------------------------------------------------------

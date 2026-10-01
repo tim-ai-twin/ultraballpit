@@ -23,6 +23,7 @@
 pub mod buffers;
 
 use std::cell::{Cell, UnsafeCell};
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use wgpu::util::DeviceExt;
@@ -30,7 +31,7 @@ use buffers::{GpuBuffers, GpuSimParams};
 use crate::boundary::BoundaryParticles;
 use crate::eos;
 use crate::particle::{FluidType, ParticleArrays};
-use crate::{ErrorMetrics, SimulationKernel, SolverType};
+use crate::{ErrorMetrics, SimulationKernel, SolverType, StepStats};
 
 /// Per-pass wall-clock timing breakdown of a single GPU simulation step.
 #[derive(Debug, Clone, Copy, Default)]
@@ -59,6 +60,26 @@ struct ReorderParams {
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+}
+
+/// Bind groups built once at init (see `GpuKernel::bg_cache`).
+struct BindGroupCache {
+    empty_bind_group: wgpu::BindGroup,
+    grid_bg0: wgpu::BindGroup,
+    grid_bg3: wgpu::BindGroup,
+    density_bg0: wgpu::BindGroup,
+    density_bg2: wgpu::BindGroup,
+    density_forces_bg3: wgpu::BindGroup,
+    forces_bg0: wgpu::BindGroup,
+    forces_bg1: wgpu::BindGroup,
+    forces_bg2: wgpu::BindGroup,
+    forces_bg3: wgpu::BindGroup,
+    integrate_bg0: wgpu::BindGroup,
+    integrate_bg1: wgpu::BindGroup,
+    pcisph_predict_bg0: wgpu::BindGroup,
+    pcisph_predict_bg1: wgpu::BindGroup,
+    pcisph_predict_bg2: wgpu::BindGroup,
+    pcisph_bg3: wgpu::BindGroup,
 }
 
 /// GPU-accelerated SPH simulation kernel using wgpu compute shaders.
@@ -171,7 +192,25 @@ pub struct GpuKernel {
     timestamp_resolve_buf: wgpu::Buffer,
     timestamp_staging_buf: wgpu::Buffer,
     timestamp_period: f32,
+
+    // Cached bind groups (None only during construction).
+    bg_cache: Option<BindGroupCache>,
+
+    // On-device max reduction for step_stats() (16-byte readback instead of
+    // a full particle readback).
+    pipeline_stats: wgpu::ComputePipeline,
+    stats_bg: wgpu::BindGroup,
+    stats_buf: wgpu::Buffer,
+    stats_staging: wgpu::Buffer,
+    stats_cache: Cell<Option<StepStats>>,
+
+    // Submissions not yet known to be complete. `step()` keeps at most
+    // MAX_IN_FLIGHT queued so the CPU can encode ahead without running away.
+    in_flight: VecDeque<wgpu::SubmissionIndex>,
 }
+
+/// Maximum number of step submissions queued ahead of the GPU in `step()`.
+const MAX_IN_FLIGHT: usize = 2;
 
 /// Error returned when GPU initialization fails.
 #[derive(Debug)]
@@ -806,7 +845,64 @@ impl GpuKernel {
         });
         let timestamp_period = queue.get_timestamp_period();
 
-        Ok(Self {
+        // --- Stats reduction resources ---
+        let stats_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("stats"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/stats.wgsl").into()),
+        });
+        let bgl_stats = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("stats_bgl"),
+            entries: &[
+                bgl_uniform(0),
+                bgl_storage_ro(1), bgl_storage_ro(2), bgl_storage_ro(3),
+                bgl_storage_ro(4), bgl_storage_ro(5), bgl_storage_ro(6),
+                bgl_storage_ro(7), bgl_storage_ro(8), bgl_storage_ro(9),
+                bgl_storage_ro(10), bgl_storage_ro(11),
+                bgl_storage_rw(12),
+            ],
+        });
+        let pipeline_stats = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("stats"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("stats_pl"),
+                bind_group_layouts: &[&bgl_stats],
+                push_constant_ranges: &[],
+            })),
+            module: &stats_shader,
+            entry_point: Some("reduce_stats"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let stats_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stats"),
+            size: 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let stats_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stats_staging"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let stats_bg = {
+            let b = &bufs;
+            let res = [
+                &reorder_params_buffer, // {n_particles, pad, pad, pad}
+                &b.pos_x, &b.pos_y, &b.pos_z,
+                &b.vel_x, &b.vel_y, &b.vel_z,
+                &b.acc_x, &b.acc_y, &b.acc_z,
+                &b.density, &b.fluid_type, &stats_buf,
+            ];
+            let entries: Vec<_> = res.iter().enumerate()
+                .map(|(i, buf)| wgpu::BindGroupEntry { binding: i as u32, resource: buf.as_entire_binding() })
+                .collect();
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("stats_bg"), layout: &bgl_stats, entries: &entries,
+            })
+        };
+
+        let mut kernel = Self {
             device,
             queue,
             pipeline_grid_clear,
@@ -870,7 +966,16 @@ impl GpuKernel {
             timestamp_resolve_buf,
             timestamp_staging_buf,
             timestamp_period,
-        })
+            bg_cache: None,
+            pipeline_stats,
+            stats_bg,
+            stats_buf,
+            stats_staging,
+            stats_cache: Cell::new(None),
+            in_flight: VecDeque::new(),
+        };
+        kernel.bg_cache = Some(kernel.build_bg_cache());
+        Ok(kernel)
     }
 
     /// Set workgroup size for density and forces shaders and rebuild pipelines.
@@ -1197,6 +1302,7 @@ impl GpuKernel {
         self.verlet_displacement += self.speed_of_sound * dt;
 
         self.cache_dirty.set(true);
+        self.stats_cache.set(None);
     }
 
     /// Wait for all submitted GPU work to complete.
@@ -1431,6 +1537,7 @@ impl GpuKernel {
         let data = self.bufs.readback_particles(&self.device, &self.queue);
         unsafe { *self.cached_particles.get() = data; }
         self.cache_dirty.set(false);
+        self.stats_cache.set(None);
         let readback_us = t0.elapsed().as_micros() as u64;
 
         let total_us = total_start.elapsed().as_micros() as u64;
@@ -1587,9 +1694,54 @@ impl GpuKernel {
     }
 
     // ---- Bind group creation helpers ----
+    //
+    // Every buffer lives for the kernel's lifetime, so bind groups are built
+    // once and cloned (a refcount bump) instead of recreated on every step.
+
+    fn bg_cache(&self) -> &BindGroupCache {
+        self.bg_cache.as_ref().expect("bind group cache built in new()")
+    }
+
+    fn build_bg_cache(&self) -> BindGroupCache {
+        BindGroupCache {
+            empty_bind_group: self.build_empty_bind_group(),
+            grid_bg0: self.build_grid_bg0(),
+            grid_bg3: self.build_grid_bg3(),
+            density_bg0: self.build_density_bg0(),
+            density_bg2: self.build_density_bg2(),
+            density_forces_bg3: self.build_density_forces_bg3(),
+            forces_bg0: self.build_forces_bg0(),
+            forces_bg1: self.build_forces_bg1(),
+            forces_bg2: self.build_forces_bg2(),
+            forces_bg3: self.build_forces_bg3(),
+            integrate_bg0: self.build_integrate_bg0(),
+            integrate_bg1: self.build_integrate_bg1(),
+            pcisph_predict_bg0: self.build_pcisph_predict_bg0(),
+            pcisph_predict_bg1: self.build_pcisph_predict_bg1(),
+            pcisph_predict_bg2: self.build_pcisph_predict_bg2(),
+            pcisph_bg3: self.build_pcisph_bg3(),
+        }
+    }
+
+    fn create_empty_bind_group(&self) -> wgpu::BindGroup { self.bg_cache().empty_bind_group.clone() }
+    fn create_grid_bg0(&self) -> wgpu::BindGroup { self.bg_cache().grid_bg0.clone() }
+    fn create_grid_bg3(&self) -> wgpu::BindGroup { self.bg_cache().grid_bg3.clone() }
+    fn create_density_bg0(&self) -> wgpu::BindGroup { self.bg_cache().density_bg0.clone() }
+    fn create_density_bg2(&self) -> wgpu::BindGroup { self.bg_cache().density_bg2.clone() }
+    fn create_density_forces_bg3(&self) -> wgpu::BindGroup { self.bg_cache().density_forces_bg3.clone() }
+    fn create_forces_bg0(&self) -> wgpu::BindGroup { self.bg_cache().forces_bg0.clone() }
+    fn create_forces_bg1(&self) -> wgpu::BindGroup { self.bg_cache().forces_bg1.clone() }
+    fn create_forces_bg2(&self) -> wgpu::BindGroup { self.bg_cache().forces_bg2.clone() }
+    fn create_forces_bg3(&self) -> wgpu::BindGroup { self.bg_cache().forces_bg3.clone() }
+    fn create_integrate_bg0(&self) -> wgpu::BindGroup { self.bg_cache().integrate_bg0.clone() }
+    fn create_integrate_bg1(&self) -> wgpu::BindGroup { self.bg_cache().integrate_bg1.clone() }
+    fn create_pcisph_predict_bg0(&self) -> wgpu::BindGroup { self.bg_cache().pcisph_predict_bg0.clone() }
+    fn create_pcisph_predict_bg1(&self) -> wgpu::BindGroup { self.bg_cache().pcisph_predict_bg1.clone() }
+    fn create_pcisph_predict_bg2(&self) -> wgpu::BindGroup { self.bg_cache().pcisph_predict_bg2.clone() }
+    fn create_pcisph_bg3(&self) -> wgpu::BindGroup { self.bg_cache().pcisph_bg3.clone() }
 
     /// Create an empty bind group for unused group slots.
-    fn create_empty_bind_group(&self) -> wgpu::BindGroup {
+    fn build_empty_bind_group(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("empty_bg"),
             layout: &self.bgl_empty,
@@ -1600,7 +1752,7 @@ impl GpuKernel {
     // -- Grid shader bind groups --
 
     /// Grid group 0: params + pos_x/y/z (read)
-    fn create_grid_bg0(&self) -> wgpu::BindGroup {
+    fn build_grid_bg0(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("grid_bg0"),
             layout: &self.bgl_grid_g0,
@@ -1614,7 +1766,7 @@ impl GpuKernel {
     }
 
     /// Grid group 3: cell_indices, cell_counts, cell_offsets, sorted_indices, write_heads (all rw)
-    fn create_grid_bg3(&self) -> wgpu::BindGroup {
+    fn build_grid_bg3(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("grid_bg3"),
             layout: &self.bgl_grid_g3,
@@ -1631,7 +1783,7 @@ impl GpuKernel {
     // -- Density shader bind groups --
 
     /// Density group 0: params + pos_x/y/z (read) + mass (read)
-    fn create_density_bg0(&self) -> wgpu::BindGroup {
+    fn build_density_bg0(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("density_bg0"),
             layout: &self.bgl_density_g0,
@@ -1646,7 +1798,7 @@ impl GpuKernel {
     }
 
     /// Density group 2: density(rw), pressure(rw), fluid_type(read), bnd(read), bnd_grid(read)
-    fn create_density_bg2(&self) -> wgpu::BindGroup {
+    fn build_density_bg2(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("density_bg2"),
             layout: &self.bgl_density_g2,
@@ -1667,7 +1819,7 @@ impl GpuKernel {
 
     /// Density/Forces group 3 (read-only): cell_counts, cell_offsets, sorted_indices
     /// Used by density shader. Bindings at 1, 2, 3 (matching the shader declarations).
-    fn create_density_forces_bg3(&self) -> wgpu::BindGroup {
+    fn build_density_forces_bg3(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("density_forces_bg3"),
             layout: &self.bgl_density_g3,
@@ -1682,7 +1834,7 @@ impl GpuKernel {
     // -- Forces shader bind groups --
 
     /// Forces group 0: params + pos_x/y/z (read) + mass (read)
-    fn create_forces_bg0(&self) -> wgpu::BindGroup {
+    fn build_forces_bg0(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("forces_bg0"),
             layout: &self.bgl_forces_g0,
@@ -1697,7 +1849,7 @@ impl GpuKernel {
     }
 
     /// Forces group 1: vel_x/y/z (read), acc_x/y/z (rw)
-    fn create_forces_bg1(&self) -> wgpu::BindGroup {
+    fn build_forces_bg1(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("forces_bg1"),
             layout: &self.bgl_forces_g1,
@@ -1713,7 +1865,7 @@ impl GpuKernel {
     }
 
     /// Forces group 2: density(read), pressure(read), fluid_type(read), bnd(read), bnd_pressure(rw), bnd_grid(read)
-    fn create_forces_bg2(&self) -> wgpu::BindGroup {
+    fn build_forces_bg2(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("forces_bg2"),
             layout: &self.bgl_forces_g2,
@@ -1734,7 +1886,7 @@ impl GpuKernel {
     }
 
     /// Forces group 3: cell_counts(read), cell_offsets(read), sorted_indices(read) -- bindings 1,2,3
-    fn create_forces_bg3(&self) -> wgpu::BindGroup {
+    fn build_forces_bg3(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("forces_bg3"),
             layout: &self.bgl_forces_g3,
@@ -1749,7 +1901,7 @@ impl GpuKernel {
     // -- Integrate shader bind groups --
 
     /// Integrate group 0: params + pos_x/y/z (rw)
-    fn create_integrate_bg0(&self) -> wgpu::BindGroup {
+    fn build_integrate_bg0(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("integrate_bg0"),
             layout: &self.bgl_integrate_g0,
@@ -1763,7 +1915,7 @@ impl GpuKernel {
     }
 
     /// Integrate group 1: vel_x/y/z (rw), acc_x/y/z (read)
-    fn create_integrate_bg1(&self) -> wgpu::BindGroup {
+    fn build_integrate_bg1(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("integrate_bg1"),
             layout: &self.bgl_integrate_g1,
@@ -1781,7 +1933,7 @@ impl GpuKernel {
     // -- PCISPH predict shader bind groups --
 
     /// PCISPH predict group 0: params + pos_x/y/z (rw) + mass (read)
-    fn create_pcisph_predict_bg0(&self) -> wgpu::BindGroup {
+    fn build_pcisph_predict_bg0(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("pcisph_predict_bg0"),
             layout: &self.bgl_pcisph_predict_g0,
@@ -1796,7 +1948,7 @@ impl GpuKernel {
     }
 
     /// PCISPH predict group 1: vel_x/y/z (rw), acc_x/y/z (rw)
-    fn create_pcisph_predict_bg1(&self) -> wgpu::BindGroup {
+    fn build_pcisph_predict_bg1(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("pcisph_predict_bg1"),
             layout: &self.bgl_pcisph_predict_g1,
@@ -1812,7 +1964,7 @@ impl GpuKernel {
     }
 
     /// PCISPH predict group 2: density(read), pressure(rw), fluid_type(read)
-    fn create_pcisph_predict_bg2(&self) -> wgpu::BindGroup {
+    fn build_pcisph_predict_bg2(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("pcisph_predict_bg2"),
             layout: &self.bgl_pcisph_predict_g2,
@@ -1825,7 +1977,7 @@ impl GpuKernel {
     }
 
     /// PCISPH group 3: PCISPH state buffers (11 bindings)
-    fn create_pcisph_bg3(&self) -> wgpu::BindGroup {
+    fn build_pcisph_bg3(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("pcisph_bg3"),
             layout: &self.bgl_pcisph_g3,
@@ -2155,6 +2307,55 @@ impl GpuKernel {
         }
     }
 
+    /// Record a submission and block until at most MAX_IN_FLIGHT remain queued.
+    fn track_submission(&mut self, idx: wgpu::SubmissionIndex) {
+        self.in_flight.push_back(idx);
+        while self.in_flight.len() > MAX_IN_FLIGHT {
+            let oldest = self.in_flight.pop_front().unwrap();
+            self.device.poll(wgpu::Maintain::WaitForSubmissionIndex(oldest));
+        }
+    }
+
+    /// Reduce max |v|, |a|, density deviation and a non-finite flag on the GPU.
+    fn compute_stats_gpu(&self) -> StepStats {
+        let n = self.bufs.n_particles;
+        if n == 0 {
+            return StepStats::default();
+        }
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("stats"),
+        });
+        encoder.clear_buffer(&self.stats_buf, 0, None);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("stats"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_stats);
+            pass.set_bind_group(0, &self.stats_bg, &[]);
+            pass.dispatch_workgroups(dispatch_size(n, 256), 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&self.stats_buf, 0, &self.stats_staging, 0, 16);
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = self.stats_staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let bits: [u32; 4] = {
+            let data = slice.get_mapped_range();
+            let b: &[u32] = bytemuck::cast_slice(&data);
+            [b[0], b[1], b[2], b[3]]
+        };
+        self.stats_staging.unmap();
+        StepStats {
+            max_speed: f32::from_bits(bits[0]).sqrt(),
+            max_accel: f32::from_bits(bits[1]).sqrt(),
+            max_density_variation: f32::from_bits(bits[2]),
+            non_finite: bits[3] != 0,
+        }
+    }
+
     fn make_params(&self, dt: f32) -> GpuSimParams {
         let cell_size = 2.0 * self.h;
         GpuSimParams {
@@ -2231,8 +2432,11 @@ impl SimulationKernel for GpuKernel {
                 self.encode_integrate(&mut encoder, wg_particles);
                 self.encode_forces(&mut encoder, &params);
                 self.encode_half_kick(&mut encoder, wg_particles);
-                self.queue.submit(std::iter::once(encoder.finish()));
-                self.device.poll(wgpu::Maintain::Wait);
+                // No wait: the CPU encodes the next step while the GPU runs
+                // this one. Readbacks (particles(), step_stats()) wait for
+                // completion themselves.
+                let idx = self.queue.submit(std::iter::once(encoder.finish()));
+                self.track_submission(idx);
             }
             SolverType::Pcisph => {
                 // Grid rebuild if needed (PCISPH manages its own encoders)
@@ -2256,6 +2460,7 @@ impl SimulationKernel for GpuKernel {
 
         // Mark cache as stale; readback deferred until particles() is called
         self.cache_dirty.set(true);
+        self.stats_cache.set(None);
     }
 
     fn particles(&self) -> &ParticleArrays {
@@ -2312,6 +2517,15 @@ impl SimulationKernel for GpuKernel {
 
     fn solver_type(&self) -> SolverType {
         self.solver_type
+    }
+
+    fn step_stats(&self) -> StepStats {
+        if let Some(s) = self.stats_cache.get() {
+            return s;
+        }
+        let s = self.compute_stats_gpu();
+        self.stats_cache.set(Some(s));
+        s
     }
 }
 

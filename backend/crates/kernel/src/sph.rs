@@ -677,25 +677,14 @@ pub fn compute_timestep_advective(
     h: f32,
     cfl_number: f32,
 ) -> f32 {
-    let mut max_v = 0.0_f32;
-    let mut max_accel = 0.0_f32;
+    let stats = crate::StepStats::from_particles(particles);
+    timestep_advective_from_stats(&stats, h, cfl_number)
+}
 
-    for i in 0..particles.len() {
-        let v = (particles.vx[i] * particles.vx[i]
-            + particles.vy[i] * particles.vy[i]
-            + particles.vz[i] * particles.vz[i])
-            .sqrt();
-        if v > max_v {
-            max_v = v;
-        }
-        let a = (particles.ax[i] * particles.ax[i]
-            + particles.ay[i] * particles.ay[i]
-            + particles.az[i] * particles.az[i])
-            .sqrt();
-        if a > max_accel {
-            max_accel = a;
-        }
-    }
+/// [`compute_timestep_advective`] from precomputed [`crate::StepStats`].
+pub fn timestep_advective_from_stats(stats: &crate::StepStats, h: f32, cfl_number: f32) -> f32 {
+    let max_v = stats.max_speed;
+    let max_accel = stats.max_accel;
 
     // Advective CFL: dt = CFL * h / v_max
     // Use a floor for v_max to avoid infinite dt at rest
@@ -855,26 +844,20 @@ pub fn compute_timestep(
     speed_of_sound: f32,
     cfl_number: f32,
 ) -> f32 {
+    let stats = crate::StepStats::from_particles(particles);
+    timestep_from_stats(&stats, h, speed_of_sound, cfl_number)
+}
+
+/// [`compute_timestep`] from precomputed [`crate::StepStats`].
+pub fn timestep_from_stats(
+    stats: &crate::StepStats,
+    h: f32,
+    speed_of_sound: f32,
+    cfl_number: f32,
+) -> f32 {
     // 1. CFL condition based on velocity + speed of sound
-    let mut max_signal = speed_of_sound; // at minimum, c_s
-    let mut max_accel = 0.0_f32;
-    for i in 0..particles.len() {
-        let v = (particles.vx[i] * particles.vx[i]
-            + particles.vy[i] * particles.vy[i]
-            + particles.vz[i] * particles.vz[i])
-            .sqrt();
-        let signal = v + speed_of_sound;
-        if signal > max_signal {
-            max_signal = signal;
-        }
-        let a = (particles.ax[i] * particles.ax[i]
-            + particles.ay[i] * particles.ay[i]
-            + particles.az[i] * particles.az[i])
-            .sqrt();
-        if a > max_accel {
-            max_accel = a;
-        }
-    }
+    let max_signal = stats.max_speed + speed_of_sound;
+    let max_accel = stats.max_accel;
     let dt_cfl = cfl_number * h / max_signal;
 
     // 2. Force-based CFL: dt_force = 0.25 * sqrt(h / max_accel)
