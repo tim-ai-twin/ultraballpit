@@ -1017,67 +1017,63 @@ impl GpuKernel {
         pass.dispatch_workgroups(dispatch_size(self.bufs.n_boundary.max(1), 256), 1, 1);
     }
 
-    /// Encode density + boundary pressure + forces passes into a command encoder.
-    fn encode_density_forces(&self, encoder: &mut wgpu::CommandEncoder, params: &GpuSimParams) {
+    /// Encode density + boundary pressure + forces (and optionally the closing
+    /// half-kick) as consecutive dispatches in ONE compute pass. Dispatches in
+    /// a pass run in order with their writes visible to later ones; separate
+    /// passes each cost ~12-15 us of encoder gap on Metal.
+    fn encode_density_forces(&self, encoder: &mut wgpu::CommandEncoder, params: &GpuSimParams, with_kick: bool) {
         let n_particles = self.bufs.n_particles;
-        let n_boundary = self.bufs.n_boundary;
-        let wg = self.workgroup_size;
-
-        let wg_particles = dispatch_size(n_particles, wg);
+        let wg_particles = dispatch_size(n_particles, self.workgroup_size);
 
         self.bufs.update_params(&self.queue, params);
 
-        let density_bg0 = self.create_density_bg0();
-        let density_bg2 = self.create_density_bg2();
-        let density_bg3 = self.create_density_forces_bg3();
-        let forces_bg0 = self.create_forces_bg0();
-        let forces_bg1 = self.create_forces_bg1();
-        let forces_bg2 = self.create_forces_bg2();
-        let forces_bg3 = self.create_forces_bg3();
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("density_forces"), timestamp_writes: None,
+        });
 
         // Density summation + EOS pressure
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("density"), timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline_density);
-            pass.set_bind_group(0, &density_bg0, &[]); pass.set_bind_group(1, &self.create_density_bg1(), &[]);
-            pass.set_bind_group(2, &density_bg2, &[]); pass.set_bind_group(3, &density_bg3, &[]);
-            pass.dispatch_workgroups(wg_particles, 1, 1);
-        }
+        pass.set_pipeline(&self.pipeline_density);
+        pass.set_bind_group(0, &self.create_density_bg0(), &[]);
+        pass.set_bind_group(1, &self.create_density_bg1(), &[]);
+        pass.set_bind_group(2, &self.create_density_bg2(), &[]);
+        pass.set_bind_group(3, &self.create_density_forces_bg3(), &[]);
+        pass.dispatch_workgroups(wg_particles, 1, 1);
 
         // Boundary pressure mirroring
-        if n_boundary > 0 {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("boundary_pressure"), timestamp_writes: None,
-            });
+        if self.bufs.n_boundary > 0 {
             self.dispatch_boundary_pressure(&mut pass);
         }
 
         // All forces
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("forces"), timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline_forces);
-            pass.set_bind_group(0, &forces_bg0, &[]); pass.set_bind_group(1, &forces_bg1, &[]);
-            pass.set_bind_group(2, &forces_bg2, &[]); pass.set_bind_group(3, &forces_bg3, &[]);
-            pass.dispatch_workgroups(wg_particles, 1, 1);
+        pass.set_pipeline(&self.pipeline_forces);
+        pass.set_bind_group(0, &self.create_forces_bg0(), &[]);
+        pass.set_bind_group(1, &self.create_forces_bg1(), &[]);
+        pass.set_bind_group(2, &self.create_forces_bg2(), &[]);
+        pass.set_bind_group(3, &self.create_forces_bg3(), &[]);
+        pass.dispatch_workgroups(wg_particles, 1, 1);
+
+        // Closing half-kick: v += a * dt/2
+        if with_kick {
+            pass.set_pipeline(&self.pipeline_half_kick);
+            pass.set_bind_group(0, &self.create_integrate_bg0(), &[]);
+            pass.set_bind_group(1, &self.create_integrate_bg1(), &[]);
+            pass.dispatch_workgroups(dispatch_size(n_particles, 256), 1, 1);
         }
     }
 
-    /// Encode the full force computation pipeline into a command encoder:
-    /// [neighbor grid if needed] -> density -> boundary pressure -> forces.
+    /// Encode the force computation pipeline into a command encoder:
+    /// [neighbor grid if needed] -> density -> boundary pressure -> forces
+    /// [-> closing half-kick].
     ///
     /// Uses Verlet neighbor lists to skip grid rebuild when particles
     /// haven't moved more than skin/2 since the last rebuild.
-    fn encode_forces(&mut self, encoder: &mut wgpu::CommandEncoder, params: &GpuSimParams) {
+    fn encode_forces(&mut self, encoder: &mut wgpu::CommandEncoder, params: &GpuSimParams, with_kick: bool) {
         let needs_grid = self.verlet_displacement >= self.verlet_skin * 0.5;
         if needs_grid {
             self.encode_grid(encoder);
             self.verlet_displacement = 0.0;
         }
-        self.encode_density_forces(encoder, params);
+        self.encode_density_forces(encoder, params, with_kick);
     }
 
     /// Submit the force computation pipeline as a standalone operation.
@@ -1088,72 +1084,38 @@ impl GpuKernel {
         });
         // Always build grid on init — force Verlet rebuild
         self.verlet_displacement = f32::MAX;
-        self.encode_forces(&mut encoder, params);
+        self.encode_forces(&mut encoder, params, false);
         self.queue.submit(std::iter::once(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait);
     }
 
-    /// Encode integration passes (half_kick, xsph, drift) into an encoder.
+    /// Encode half_kick, XSPH and drift as consecutive dispatches in one pass.
     fn encode_integrate(&self, encoder: &mut wgpu::CommandEncoder, wg_particles: u32) {
         let bg0 = self.create_integrate_bg0();
         let bg1 = self.create_integrate_bg1();
-
-        // Half-kick: v += a * dt/2
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("half_kick"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline_half_kick);
-            pass.set_bind_group(0, &bg0, &[]);
-            pass.set_bind_group(1, &bg1, &[]);
-            pass.dispatch_workgroups(wg_particles, 1, 1);
-        }
-
-        // XSPH: compute smoothed velocity correction, write to acc buffers.
-        // Uses forces-style bind groups (acc as read_write, grid access).
-        // The previous step's neighbor grid is still valid since positions
-        // haven't changed yet in this step.
-        {
-            let xsph_bg0 = self.create_forces_bg0();
-            let xsph_bg1 = self.create_forces_bg1();
-            let xsph_bg2 = self.create_forces_bg2();
-            let xsph_bg3 = self.create_forces_bg3();
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("xsph"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline_xsph);
-            pass.set_bind_group(0, &xsph_bg0, &[]);
-            pass.set_bind_group(1, &xsph_bg1, &[]);
-            pass.set_bind_group(2, &xsph_bg2, &[]);
-            pass.set_bind_group(3, &xsph_bg3, &[]);
-            pass.dispatch_workgroups(wg_particles, 1, 1);
-        }
-
-        // Drift: x += (v + xsph_correction) * dt + domain clamping
-        // acc buffers now hold XSPH corrections (from XSPH pass above)
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("drift"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline_drift);
-            pass.set_bind_group(0, &bg0, &[]);
-            pass.set_bind_group(1, &bg1, &[]);
-            pass.dispatch_workgroups(wg_particles, 1, 1);
-        }
-    }
-
-    /// Encode the final half-kick pass into an encoder.
-    fn encode_half_kick(&self, encoder: &mut wgpu::CommandEncoder, wg_particles: u32) {
-        let bg0 = self.create_integrate_bg0();
-        let bg1 = self.create_integrate_bg1();
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("half_kick_2"),
+            label: Some("kick_xsph_drift"),
             timestamp_writes: None,
         });
+
+        // Half-kick: v += a * dt/2
         pass.set_pipeline(&self.pipeline_half_kick);
+        pass.set_bind_group(0, &bg0, &[]);
+        pass.set_bind_group(1, &bg1, &[]);
+        pass.dispatch_workgroups(wg_particles, 1, 1);
+
+        // XSPH: smoothed velocity correction written to the acc buffers. Uses
+        // forces-style bind groups and the last density pass's neighbor list
+        // (positions haven't changed since).
+        pass.set_pipeline(&self.pipeline_xsph);
+        pass.set_bind_group(0, &self.create_forces_bg0(), &[]);
+        pass.set_bind_group(1, &self.create_forces_bg1(), &[]);
+        pass.set_bind_group(2, &self.create_forces_bg2(), &[]);
+        pass.set_bind_group(3, &self.create_forces_bg3(), &[]);
+        pass.dispatch_workgroups(dispatch_size(self.bufs.n_particles, self.workgroup_size), 1, 1);
+
+        // Drift: x += (v + xsph_correction) * dt + domain clamping
+        pass.set_pipeline(&self.pipeline_drift);
         pass.set_bind_group(0, &bg0, &[]);
         pass.set_bind_group(1, &bg1, &[]);
         pass.dispatch_workgroups(wg_particles, 1, 1);
@@ -1211,8 +1173,7 @@ impl GpuKernel {
             label: Some("step_nosync"),
         });
         self.encode_integrate(&mut encoder, wg_particles);
-        self.encode_forces(&mut encoder, &params);
-        self.encode_half_kick(&mut encoder, wg_particles);
+        self.encode_forces(&mut encoder, &params, true);
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -1880,8 +1841,7 @@ impl SimulationKernel for GpuKernel {
                 });
                 // WCSPH: Velocity Verlet (KDK) integration
                 self.encode_integrate(&mut encoder, wg_particles);
-                self.encode_forces(&mut encoder, &params);
-                self.encode_half_kick(&mut encoder, wg_particles);
+                self.encode_forces(&mut encoder, &params, true);
                 // No wait: the CPU encodes the next step while the GPU runs
                 // this one. Readbacks (particles(), step_stats()) wait for
                 // completion themselves.
