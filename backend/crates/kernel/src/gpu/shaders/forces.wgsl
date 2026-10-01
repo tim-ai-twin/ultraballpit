@@ -39,7 +39,8 @@ struct SimParams {
     viscosity_alpha: f32,
     viscosity_beta: f32,
     pass_index: u32,
-    _pad1: u32,
+    // Cells searched on each side of a particle's cell (ceil(2h / cell_size)).
+    search_cells: u32,
 };
 
 // Group 0: SimParams + positions + mass
@@ -47,8 +48,7 @@ struct SimParams {
 @group(0) @binding(1) var<storage, read> pos_x: array<f32>;
 @group(0) @binding(2) var<storage, read> pos_y: array<f32>;
 @group(0) @binding(3) var<storage, read> pos_z: array<f32>;
-// Mass stored as f16 pairs packed in u32.
-@group(0) @binding(4) var<storage, read> mass_packed: array<u32>;
+@group(0) @binding(4) var<storage, read> mass: array<f32>;
 
 // Group 1: Velocity + acceleration
 @group(1) @binding(0) var<storage, read> vel_x: array<f32>;
@@ -89,8 +89,7 @@ fn wendland_c2(r: f32, h: f32) -> f32 {
 }
 
 fn read_mass(idx: u32) -> f32 {
-    let pair = unpack2x16float(mass_packed[idx >> 1u]);
-    return pair[idx & 1u];
+    return mass[idx];
 }
 
 fn wendland_c2_gradient_from_dist_sq(dx: f32, dy: f32, dz: f32, dist_sq: f32, h: f32) -> vec3<f32> {
@@ -125,6 +124,27 @@ fn cell_hash(cx: u32, cy: u32, cz: u32) -> u32 {
     return cx + cy * params.grid_dim_x + cz * params.grid_dim_x * params.grid_dim_y;
 }
 
+// Contiguous particle index range covering cells [cell.x - search, cell.x + search]
+// of grid row (ny, nz). Valid because particles are stored in cell order.
+fn row_range(cell: vec3<i32>, ny: i32, nz: i32) -> vec2<u32> {
+    let search = i32(params.search_cells);
+    let x0 = max(cell.x - search, 0);
+    let x1 = min(cell.x + search, i32(params.grid_dim_x) - 1);
+    let c0 = cell_hash(u32(x0), u32(ny), u32(nz));
+    let c1 = cell_hash(u32(x1), u32(ny), u32(nz));
+    return vec2<u32>(cell_offsets[c0], cell_offsets[c1] + cell_counts[c1]);
+}
+
+// Boundary-particle analogue of row_range (boundary arrays are stored in cell order).
+fn bnd_row_range(cell: vec3<i32>, ny: i32, nz: i32) -> vec2<u32> {
+    let search = i32(params.search_cells);
+    let x0 = max(cell.x - search, 0);
+    let x1 = min(cell.x + search, i32(params.grid_dim_x) - 1);
+    let c0 = cell_hash(u32(x0), u32(ny), u32(nz));
+    let c1 = cell_hash(u32(x1), u32(ny), u32(nz));
+    return vec2<u32>(bnd_cell_offsets[c0], bnd_cell_offsets[c1] + bnd_cell_counts[c1]);
+}
+
 // Entry point: Update boundary pressures using Adami et al. (2012) mirroring
 @compute @workgroup_size(256)
 fn update_boundary_pressures(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -134,6 +154,7 @@ fn update_boundary_pressures(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let h = params.h;
+    let search = i32(params.search_cells);
     let support_radius = 2.0 * h;
     let support_radius_sq = support_radius * support_radius;
 
@@ -146,22 +167,17 @@ fn update_boundary_pressures(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Search fluid particles near this boundary particle via neighbor grid
     let bcell = pos_to_cell_i32(bx, by, bz);
-    for (var dz_off = -1; dz_off <= 1; dz_off = dz_off + 1) {
+    for (var dz_off = -search; dz_off <= search; dz_off = dz_off + 1) {
         let nz = bcell.z + dz_off;
         if nz < 0 || nz >= i32(params.grid_dim_z) { continue; }
-        for (var dy_off = -1; dy_off <= 1; dy_off = dy_off + 1) {
+        for (var dy_off = -search; dy_off <= search; dy_off = dy_off + 1) {
             let ny = bcell.y + dy_off;
             if ny < 0 || ny >= i32(params.grid_dim_y) { continue; }
-            for (var dx_off = -1; dx_off <= 1; dx_off = dx_off + 1) {
-                let nx = bcell.x + dx_off;
-                if nx < 0 || nx >= i32(params.grid_dim_x) { continue; }
-
-                let c = cell_hash(u32(nx), u32(ny), u32(nz));
-                let start = cell_offsets[c];
-                let count = cell_counts[c];
-
-                for (var s = start; s < start + count; s = s + 1u) {
-                    let f = sorted_indices[s];
+            {
+                // The row's cells are adjacent in hash order and particles are
+                // stored in cell order, so the whole row is one index range.
+                let f_range = row_range(bcell, ny, nz);
+                for (var f = f_range.x; f < f_range.y; f = f + 1u) {
                     let dx = bx - pos_x[f];
                     let dy = by - pos_y[f];
                     let dz = bz - pos_z[f];
@@ -197,6 +213,7 @@ fn compute_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let h = params.h;
+    let search = i32(params.search_cells);
     let support_radius = 2.0 * h;
     let support_radius_sq = support_radius * support_radius;
     let alpha = params.viscosity_alpha;
@@ -230,22 +247,17 @@ fn compute_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Fluid-fluid interactions via neighbor grid
     let cell = pos_to_cell_i32(px, py, pz);
 
-    for (var dz_off = -1; dz_off <= 1; dz_off = dz_off + 1) {
+    for (var dz_off = -search; dz_off <= search; dz_off = dz_off + 1) {
         let nz = cell.z + dz_off;
         if nz < 0 || nz >= i32(params.grid_dim_z) { continue; }
-        for (var dy_off = -1; dy_off <= 1; dy_off = dy_off + 1) {
+        for (var dy_off = -search; dy_off <= search; dy_off = dy_off + 1) {
             let ny = cell.y + dy_off;
             if ny < 0 || ny >= i32(params.grid_dim_y) { continue; }
-            for (var dx_off = -1; dx_off <= 1; dx_off = dx_off + 1) {
-                let nx = cell.x + dx_off;
-                if nx < 0 || nx >= i32(params.grid_dim_x) { continue; }
-
-                let c = cell_hash(u32(nx), u32(ny), u32(nz));
-                let start = cell_offsets[c];
-                let count = cell_counts[c];
-
-                for (var s = start; s < start + count; s = s + 1u) {
-                    let j = sorted_indices[s];
+            {
+                // The row's cells are adjacent in hash order and particles are
+                // stored in cell order, so the whole row is one index range.
+                let j_range = row_range(cell, ny, nz);
+                for (var j = j_range.x; j < j_range.y; j = j + 1u) {
                     if j == i { continue; }
 
                     let ddx = px - pos_x[j];
@@ -292,22 +304,17 @@ fn compute_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
     let r0 = 0.5 * h;
     let d_repulsive = 10.0 * 9.81 * 0.01;
     if params.n_boundary > 0u {
-        for (var bz_off = -1; bz_off <= 1; bz_off = bz_off + 1) {
+        for (var bz_off = -search; bz_off <= search; bz_off = bz_off + 1) {
             let bnz = cell.z + bz_off;
             if bnz < 0 || bnz >= i32(params.grid_dim_z) { continue; }
-            for (var by_off = -1; by_off <= 1; by_off = by_off + 1) {
+            for (var by_off = -search; by_off <= search; by_off = by_off + 1) {
                 let bny = cell.y + by_off;
                 if bny < 0 || bny >= i32(params.grid_dim_y) { continue; }
-                for (var bx_off = -1; bx_off <= 1; bx_off = bx_off + 1) {
-                    let bnx = cell.x + bx_off;
-                    if bnx < 0 || bnx >= i32(params.grid_dim_x) { continue; }
-
-                    let bc = cell_hash(u32(bnx), u32(bny), u32(bnz));
-                    let b_start = bnd_cell_offsets[bc];
-                    let b_count = bnd_cell_counts[bc];
-
-                    for (var bs = b_start; bs < b_start + b_count; bs = bs + 1u) {
-                        let b = bnd_sorted_indices[bs];
+                {
+                    // The row's cells are adjacent in hash order and particles are
+                    // stored in cell order, so the whole row is one index range.
+                    let b_range = bnd_row_range(cell, bny, bnz);
+                    for (var b = b_range.x; b < b_range.y; b = b + 1u) {
                         let ddx = px - bnd_x[b];
                         let ddy = py - bnd_y[b];
                         let ddz = pz - bnd_z[b];

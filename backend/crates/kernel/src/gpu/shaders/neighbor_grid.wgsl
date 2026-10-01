@@ -30,7 +30,7 @@ struct SimParams {
     viscosity_beta: f32,
     // Pass selector for multi-pass shaders
     pass_index: u32,
-    _pad1: u32,
+    search_cells: u32,
 };
 
 // Group 0: SimParams + positions + mass

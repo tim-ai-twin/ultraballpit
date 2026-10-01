@@ -36,7 +36,8 @@ pub struct GpuSimParams {
     pub viscosity_alpha: f32,
     pub viscosity_beta: f32,
     pub pass_index: u32,
-    pub _pad1: u32,
+    /// Grid cells searched on each side of a particle's cell.
+    pub search_cells: u32,
 }
 
 /// All GPU buffers needed for the SPH simulation.
@@ -78,9 +79,7 @@ pub struct GpuBuffers {
     pub bnd_cell_offsets: wgpu::Buffer,
     pub bnd_sorted_indices: wgpu::Buffer,
 
-    // Original f32 mass data (mass never changes during simulation, so we
-    // store it CPU-side and skip GPU readback).
-    pub mass_f32: Vec<f32>,
+    pub staging_mass: wgpu::Buffer,
 
     // Staging buffers for readback
     pub staging_density: wgpu::Buffer,
@@ -96,8 +95,8 @@ pub struct GpuBuffers {
     pub staging_acc_y: wgpu::Buffer,
     pub staging_acc_z: wgpu::Buffer,
 
-    /// Temporary buffer for particle reordering (single buffer reused for each array).
-    pub reorder_temp: wgpu::Buffer,
+    /// Gather sources for sorting particle data into cell order.
+    pub sort_tmp: Vec<wgpu::Buffer>,
 
     // PCISPH state buffers (always allocated; unused for WCSPH)
     pub pcisph_orig_pos_x: wgpu::Buffer,
@@ -126,50 +125,9 @@ pub struct GpuBuffers {
 /// Minimum buffer size (wgpu requires non-zero buffers).
 const MIN_BUF_SIZE: u64 = 4;
 
-/// Convert f32 to IEEE 754 half-precision (f16) bits.
-fn f32_to_f16_bits(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let sign = (bits >> 31) & 1;
-    let exp = ((bits >> 23) & 0xFF) as i32;
-    let frac = bits & 0x7F_FFFF;
-
-    if exp == 0xFF {
-        // Inf/NaN
-        return ((sign << 15) | 0x7C00 | if frac != 0 { 1 } else { 0 }) as u16;
-    }
-
-    let new_exp = exp - 127 + 15;
-    if new_exp >= 31 {
-        return ((sign << 15) | 0x7C00) as u16; // overflow → Inf
-    }
-    if new_exp <= 0 {
-        if new_exp < -10 {
-            return (sign << 15) as u16; // underflow → zero
-        }
-        let frac_with_implicit = frac | 0x80_0000;
-        let shift = 1 - new_exp;
-        return ((sign << 15) | (frac_with_implicit >> (13 + shift))) as u16;
-    }
-
-    ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
-}
-
-/// Pack a slice of f32 mass values into u32 pairs of f16.
-/// Each u32 holds two f16 values: low bits = even index, high bits = odd index.
-pub fn pack_mass_f16(masses: &[f32]) -> Vec<u32> {
-    let n_packed = (masses.len() + 1) / 2;
-    let mut packed = Vec::with_capacity(n_packed);
-    for i in (0..masses.len()).step_by(2) {
-        let lo = f32_to_f16_bits(masses[i]) as u32;
-        let hi = if i + 1 < masses.len() {
-            f32_to_f16_bits(masses[i + 1]) as u32
-        } else {
-            0u32
-        };
-        packed.push(lo | (hi << 16));
-    }
-    packed
-}
+/// Number of per-particle arrays permuted into cell order after each grid
+/// build (see `GpuBuffers::sorted_arrays`).
+pub const SORTED_ARRAY_COUNT: usize = 10;
 
 /// Create a storage buffer from f32 slice data. If the slice is empty, creates
 /// a minimal buffer.
@@ -251,22 +209,11 @@ impl GpuBuffers {
         let acc_z = create_storage_buf(device, "acc_z", &particles.az);
         let density = create_storage_buf(device, "density", &particles.density);
         let pressure = create_storage_buf(device, "pressure", &particles.pressure);
-        // Pack mass as f16 pairs in u32s to halve memory bandwidth.
-        // Mass is read-only during simulation, so f16 precision (~3 decimal
-        // digits) is more than sufficient.
-        let mass_packed = pack_mass_f16(&particles.mass);
-        let mass = create_storage_buf_u32(device, "mass_packed", &mass_packed);
+        let mass = create_storage_buf(device, "mass", &particles.mass);
 
         // Convert FluidType to u32
         let ft_u32: Vec<u32> = particles.fluid_type.iter().map(|ft| *ft as u32).collect();
         let fluid_type = create_storage_buf_u32(device, "fluid_type", &ft_u32);
-
-        // Boundary particle buffers
-        let bnd_x = create_storage_buf(device, "bnd_x", &boundary.x);
-        let bnd_y = create_storage_buf(device, "bnd_y", &boundary.y);
-        let bnd_z = create_storage_buf(device, "bnd_z", &boundary.z);
-        let bnd_mass = create_storage_buf(device, "bnd_mass", &boundary.mass);
-        let bnd_pressure = create_storage_buf(device, "bnd_pressure", &boundary.pressure);
 
         // Neighbor grid buffers (fluid particles)
         let zeros_n = vec![0u32; n.max(1)];
@@ -278,15 +225,21 @@ impl GpuBuffers {
         let sorted_indices = create_storage_buf_u32(device, "sorted_indices", &zeros_n);
         let write_heads = create_storage_buf_u32(device, "write_heads", &zeros_cells);
 
-        // Boundary particle grid (built once, boundary particles are static)
-        let cell_size = params.cell_size;
-        let (bnd_cell_counts_data, bnd_cell_offsets_data, bnd_sorted_indices_data) =
+        // Boundary particle grid (built once, boundary particles are static).
+        // Boundary arrays are stored in cell order so each grid row is a
+        // contiguous index range; bnd_sorted_indices is then the identity.
+        let (bnd_cell_counts_data, bnd_cell_offsets_data, bnd_order) =
             build_boundary_grid(boundary, params, grid_dims, total_cells);
+        let permute = |v: &[f32]| -> Vec<f32> { bnd_order.iter().map(|&i| v[i as usize]).collect() };
+        let bnd_x = create_storage_buf(device, "bnd_x", &permute(&boundary.x));
+        let bnd_y = create_storage_buf(device, "bnd_y", &permute(&boundary.y));
+        let bnd_z = create_storage_buf(device, "bnd_z", &permute(&boundary.z));
+        let bnd_mass = create_storage_buf(device, "bnd_mass", &permute(&boundary.mass));
+        let bnd_pressure = create_storage_buf(device, "bnd_pressure", &permute(&boundary.pressure));
+        let bnd_identity: Vec<u32> = (0..n_bnd.max(1) as u32).collect();
         let bnd_cell_counts = create_storage_buf_u32(device, "bnd_cell_counts", &bnd_cell_counts_data);
         let bnd_cell_offsets = create_storage_buf_u32(device, "bnd_cell_offsets", &bnd_cell_offsets_data);
-        let bnd_sorted_indices = create_storage_buf_u32(device, "bnd_sorted_indices",
-            if bnd_sorted_indices_data.is_empty() { &[0u32] } else { &bnd_sorted_indices_data });
-        let _ = cell_size; // used above via params
+        let bnd_sorted_indices = create_storage_buf_u32(device, "bnd_sorted_indices", &bnd_identity);
 
         // Staging buffers for readback
         let f32_size = std::mem::size_of::<f32>() as u64;
@@ -308,12 +261,17 @@ impl GpuBuffers {
         let staging_acc_z = create_staging_buf(device, "staging_acc_z", particle_bytes);
 
         // Temp buffer for particle reordering (one array at a time)
-        let reorder_temp = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("reorder_temp"),
-            size: particle_bytes.max(particle_u32_bytes).max(MIN_BUF_SIZE),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let staging_mass = create_staging_buf(device, "staging_mass", particle_bytes);
+        // Scratch copies used as gather sources when sorting particle data
+        // into cell order (one per array in SORTED_ARRAYS order).
+        let sort_tmp: Vec<wgpu::Buffer> = (0..SORTED_ARRAY_COUNT)
+            .map(|_| device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sort_tmp"),
+                size: particle_bytes.max(MIN_BUF_SIZE),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }))
+            .collect();
 
         // PCISPH state buffers (allocated for all solver types; small overhead)
         let zeros_f32_n = vec![0.0f32; n.max(1)];
@@ -358,8 +316,8 @@ impl GpuBuffers {
             bnd_cell_counts,
             bnd_cell_offsets,
             bnd_sorted_indices,
-            mass_f32: particles.mass.clone(),
-            reorder_temp,
+            sort_tmp,
+            staging_mass,
             pcisph_orig_pos_x,
             pcisph_orig_pos_y,
             pcisph_orig_pos_z,
@@ -418,8 +376,7 @@ impl GpuBuffers {
             label: Some("readback"),
         });
 
-        // Note: mass is not copied — it's stored as f16-packed on GPU and
-        // never changes during simulation, so we use self.mass_f32 instead.
+        encoder.copy_buffer_to_buffer(&self.mass, 0, &self.staging_mass, 0, byte_len);
         encoder.copy_buffer_to_buffer(&self.pos_x, 0, &self.staging_pos_x, 0, byte_len);
         encoder.copy_buffer_to_buffer(&self.pos_y, 0, &self.staging_pos_y, 0, byte_len);
         encoder.copy_buffer_to_buffer(&self.pos_z, 0, &self.staging_pos_z, 0, byte_len);
@@ -442,6 +399,7 @@ impl GpuBuffers {
             &self.staging_vel_x, &self.staging_vel_y, &self.staging_vel_z,
             &self.staging_acc_x, &self.staging_acc_y, &self.staging_acc_z,
             &self.staging_density, &self.staging_pressure, &self.staging_fluid_type,
+            &self.staging_mass,
         ];
 
         let senders: Vec<_> = staging_bufs.iter().map(|buf| {
@@ -489,6 +447,7 @@ impl GpuBuffers {
         let density_vec = read_f32(&self.staging_density);
         let pressure_vec = read_f32(&self.staging_pressure);
         let ft_u32 = read_u32(&self.staging_fluid_type);
+        let mass = read_f32(&self.staging_mass);
 
         let fluid_type: Vec<crate::particle::FluidType> = ft_u32
             .iter()
@@ -513,10 +472,21 @@ impl GpuBuffers {
             az,
             density: density_vec,
             pressure: pressure_vec,
-            mass: self.mass_f32.clone(),
+            mass,
             temperature: vec![293.15; n],
             fluid_type,
         }
+    }
+
+    /// Per-particle arrays that persist across steps and must be permuted
+    /// together when particles are sorted into cell order. Arrays recomputed
+    /// every step before use (acc, pressure, PCISPH scratch) are omitted.
+    pub fn sorted_arrays(&self) -> [&wgpu::Buffer; SORTED_ARRAY_COUNT] {
+        [
+            &self.pos_x, &self.pos_y, &self.pos_z,
+            &self.vel_x, &self.vel_y, &self.vel_z,
+            &self.density, &self.mass, &self.fluid_type, &self.pcisph_delta,
+        ]
     }
 
     /// Read back the PCISPH convergence counters (2 × u32) from GPU.

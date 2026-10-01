@@ -38,7 +38,7 @@ struct SimParams {
     viscosity_alpha: f32,
     viscosity_beta: f32,
     pass_index: u32,
-    _pad1: u32,
+    search_cells: u32,
 };
 
 // Group 0: SimParams + positions (read_write) + mass
@@ -46,7 +46,7 @@ struct SimParams {
 @group(0) @binding(1) var<storage, read_write> pos_x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> pos_y: array<f32>;
 @group(0) @binding(3) var<storage, read_write> pos_z: array<f32>;
-@group(0) @binding(4) var<storage, read> mass_packed: array<u32>;
+@group(0) @binding(4) var<storage, read> mass: array<f32>;
 
 // Group 1: Velocity (read_write for final integration) + acceleration (read_write)
 @group(1) @binding(0) var<storage, read_write> vel_x: array<f32>;
@@ -75,8 +75,7 @@ struct SimParams {
 @group(3) @binding(10) var<storage, read_write> convergence: array<atomic<u32>>;
 
 fn read_mass(idx: u32) -> f32 {
-    let pair = unpack2x16float(mass_packed[idx >> 1u]);
-    return pair[idx & 1u];
+    return mass[idx];
 }
 
 const RESTITUTION: f32 = 0.2;

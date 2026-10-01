@@ -29,7 +29,7 @@ struct SimParams {
     viscosity_alpha: f32,
     viscosity_beta: f32,
     pass_index: u32,
-    _pad1: u32,
+    search_cells: u32,
 };
 
 // Group 0: SimParams + positions (read-write for integrate)
