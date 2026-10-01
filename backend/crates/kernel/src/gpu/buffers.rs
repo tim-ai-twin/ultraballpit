@@ -280,7 +280,8 @@ impl GpuBuffers {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
-        let nbr_list = gpu_only("nbr_list", particle_u32_bytes * MAX_NBR);
+        // Two 16-bit neighbor offsets per u32 word.
+        let nbr_list = gpu_only("nbr_list", particle_u32_bytes * MAX_NBR / 2);
         let nbr_count = gpu_only("nbr_count", particle_u32_bytes);
         let bnd_nbr_list = gpu_only("bnd_nbr_list", particle_u32_bytes * MAX_BND_NBR);
         let bnd_nbr_count = gpu_only("bnd_nbr_count", particle_u32_bytes);

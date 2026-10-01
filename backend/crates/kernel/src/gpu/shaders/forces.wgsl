@@ -67,6 +67,13 @@ struct SimParams {
 @group(1) @binding(11) var<storage, read> velr: array<vec4<f32>>;
 
 const MAX_NBR: u32 = 128u;
+
+// Decode neighbor k of particle i from the packed 16-bit offset list.
+fn nbr_at(i: u32, k: u32) -> u32 {
+    let word = nbr_list[(k >> 1u) * params.n_particles + i];
+    let off = (word >> ((k & 1u) * 16u)) & 0xffffu;
+    return u32(i32(i) + i32(off) - 32768);
+}
 const MAX_BND_NBR: u32 = 64u;
 
 // Group 2: SPH state + boundary
@@ -316,7 +323,7 @@ fn compute_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_nbr = nbr_count[i];
     if n_nbr <= MAX_NBR {
         for (var k = 0u; k < n_nbr; k = k + 1u) {
-            f = f + fluid_pair_force(pi, nbr_list[k * n + i]);
+            f = f + fluid_pair_force(pi, nbr_at(i, k));
         }
     } else {
         for (var dz = -search; dz <= search; dz = dz + 1) {

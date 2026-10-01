@@ -59,6 +59,13 @@ struct SimParams {
 
 const MAX_NBR: u32 = 128u;
 
+// Decode neighbor k of particle i from the packed 16-bit offset list.
+fn nbr_at(i: u32, k: u32) -> u32 {
+    let word = nbr_list[(k >> 1u) * params.n_particles + i];
+    let off = (word >> ((k & 1u) * 16u)) & 0xffffu;
+    return u32(i32(i) + i32(off) - 32768);
+}
+
 // Group 2: density (only density is used, rest are bound but unused)
 @group(2) @binding(0) var<storage, read> density: array<f32>;
 @group(2) @binding(1) var<storage, read> pressure: array<f32>;
@@ -156,7 +163,7 @@ fn compute_xsph(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_nbr = nbr_count[i];
     if n_nbr <= MAX_NBR {
         for (var k = 0u; k < n_nbr; k = k + 1u) {
-            c = c + xsph_pair(px, py, pz, vi, rho_i, nbr_list[k * params.n_particles + i]);
+            c = c + xsph_pair(px, py, pz, vi, rho_i, nbr_at(i, k));
         }
     } else {
         let cell = pos_to_cell_i32(px, py, pz);

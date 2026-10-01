@@ -72,6 +72,11 @@ struct SimParams {
 @group(1) @binding(8) var<storage, read_write> velr: array<vec4<f32>>;
 
 const MAX_NBR: u32 = 128u;
+// Fluid neighbors are stored as 16-bit offsets (j - i + 32768), two per u32
+// word: word k/2, low half for even k. Cell-sorted neighbors sit close to i
+// in index; an offset that doesn't fit marks the list overflowed.
+const NBR_OFFSET_BIAS: i32 = 32768;
+const NBR_LIST_OVERFLOW: u32 = 0xffffffffu;
 const MAX_BND_NBR: u32 = 64u;
 
 // Group 2: SPH state + boundary
@@ -238,6 +243,8 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
     var diff_sum = 0.0;
 
     var n_nbr = 0u;
+    var nbr_pending = 0u;
+    var nbr_offset_overflow = false;
     var n_bnd_nbr = 0u;
 
     // Fluid neighbor contributions via neighbor grid
@@ -263,7 +270,14 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
 
                     if dist_sq <= support_radius_sq {
                         if n_nbr < MAX_NBR {
-                            nbr_list[n_nbr * params.n_particles + i] = j;
+                            let off = i32(j) - i32(i) + NBR_OFFSET_BIAS;
+                            if off < 0 || off > 0xffff {
+                                nbr_offset_overflow = true;
+                            } else if (n_nbr & 1u) == 0u {
+                                nbr_pending = u32(off);
+                            } else {
+                                nbr_list[(n_nbr >> 1u) * params.n_particles + i] = nbr_pending | (u32(off) << 16u);
+                            }
                         }
                         n_nbr = n_nbr + 1u;
                         // Wendland C2 value and radial derivative from shared terms.
@@ -330,7 +344,10 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
     density[i] = rho;
     posm[i] = vec4<f32>(px, py, pz, read_mass(i));
     velr[i] = vec4<f32>(vel_x[i], vel_y[i], vel_z[i], rho);
-    nbr_count[i] = n_nbr;
+    if n_nbr <= MAX_NBR && (n_nbr & 1u) == 1u {
+        nbr_list[(n_nbr >> 1u) * params.n_particles + i] = nbr_pending;
+    }
+    nbr_count[i] = select(n_nbr, NBR_LIST_OVERFLOW, nbr_offset_overflow);
     bnd_nbr_count[i] = n_bnd_nbr;
 
     if params.pass_index == 0u {
