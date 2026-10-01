@@ -360,10 +360,8 @@ impl GpuKernel {
         let boundary_pressure_shader =
             create_bounded_loop_shader(&device, "boundary_pressure", include_str!("shaders/boundary_pressure.wgsl"));
 
-        let grid_scan_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("grid_scan"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/grid_scan.wgsl").into()),
-        });
+        let grid_scan_shader =
+            create_bounded_loop_shader(&device, "grid_scan", include_str!("shaders/grid_scan.wgsl"));
 
         let density_src: String = include_str!("shaders/density.wgsl")
             .replace("@workgroup_size(256)", &wg_str);
