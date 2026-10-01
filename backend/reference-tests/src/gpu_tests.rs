@@ -31,10 +31,14 @@ fn create_gpu_kernel_from_config(
 
     let config_file_path = Path::new(config_path);
     let config_dir = config_file_path.parent().expect("Invalid config path");
-    let geometry_path = config_dir.join(&config.geometry_file);
-    let mesh = geometry::load_stl(geometry_path.to_str().expect("Invalid geometry path"))
-        .expect("Failed to load STL");
-    let sdf = geometry::mesh_to_sdf(&mesh, &config.domain, 0.5 * config.particle_spacing);
+    let triangles =
+        geometry::resolve_geometry(&config, config_dir).expect("Failed to resolve geometry");
+    let sdf = geometry::generate_sdf(
+        &triangles,
+        config.domain.min,
+        config.domain.max,
+        0.5 * config.particle_spacing,
+    );
 
     let (fluid_particles, boundary_data) = domain::setup_domain(&config, &sdf);
     let mut boundary_particles = BoundaryParticles::new();
@@ -134,10 +138,14 @@ fn gpu_matches_cpu_water_box() {
 
     let config_file_path = Path::new(&config_path);
     let config_dir = config_file_path.parent().expect("Invalid config path");
-    let geometry_path = config_dir.join(&config.geometry_file);
-    let mesh = geometry::load_stl(geometry_path.to_str().expect("Invalid geometry path"))
-        .expect("Failed to load STL");
-    let sdf = geometry::mesh_to_sdf(&mesh, &config.domain, 0.5 * config.particle_spacing);
+    let triangles =
+        geometry::resolve_geometry(&config, config_dir).expect("Failed to resolve geometry");
+    let sdf = geometry::generate_sdf(
+        &triangles,
+        config.domain.min,
+        config.domain.max,
+        0.5 * config.particle_spacing,
+    );
 
     let (fluid_particles, boundary_data) = domain::setup_domain(&config, &sdf);
     let mut boundary_particles = BoundaryParticles::new();
