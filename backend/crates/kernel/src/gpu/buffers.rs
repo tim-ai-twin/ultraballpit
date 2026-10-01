@@ -98,16 +98,26 @@ pub struct GpuBuffers {
     /// Gather sources for sorting particle data into cell order.
     pub sort_tmp: Vec<wgpu::Buffer>,
 
-    // PCISPH state buffers (always allocated; unused for WCSPH)
-    pub pcisph_orig_pos_x: wgpu::Buffer,
-    pub pcisph_orig_pos_y: wgpu::Buffer,
-    pub pcisph_orig_pos_z: wgpu::Buffer,
-    pub pcisph_pred_vel_x: wgpu::Buffer,
-    pub pcisph_pred_vel_y: wgpu::Buffer,
-    pub pcisph_pred_vel_z: wgpu::Buffer,
-    pub pcisph_np_acc_x: wgpu::Buffer,
-    pub pcisph_np_acc_y: wgpu::Buffer,
-    pub pcisph_np_acc_z: wgpu::Buffer,
+    // PCISPH state buffers (always allocated; unused for WCSPH).
+    // Packed per-particle step state, see pcisph_predict.wgsl / pcisph_solve.wgsl:
+    /// Step-start (x, y, z, mass).
+    pub pcisph_orig4: wgpu::Buffer,
+    /// Step-start velocity (x, y, z, 0).
+    pub pcisph_vel4: wgpu::Buffer,
+    /// Non-pressure acceleration (x, y, z, 0).
+    pub pcisph_np4: wgpu::Buffer,
+    /// Pressure acceleration of the latest correction iteration (x, y, z, 0).
+    pub pcisph_pacc4: wgpu::Buffer,
+    /// Current predicted position + mass (x, y, z, m): one 16-byte gather per
+    /// neighbor candidate in the correction loop.
+    pub pcisph_pos4: wgpu::Buffer,
+    /// pressure / density² per particle, written with the pressure correction.
+    pub pcisph_p_rho2: wgpu::Buffer,
+    /// Per-step neighbor-list counts: fluid particles, then boundary particles.
+    pub pcisph_counts: wgpu::Buffer,
+    /// Per-step neighbor lists (layout in pcisph_solve.wgsl).
+    pub pcisph_lists: wgpu::Buffer,
+    /// Per-particle PCISPH pressure scaling factor (dt-independent base).
     pub pcisph_delta: wgpu::Buffer,
     /// Convergence state: [0]=sum of density errors (fixed-point),
     /// [1]=count of over-compressed, [2]=correction iterations run this step.
@@ -115,7 +125,7 @@ pub struct GpuBuffers {
     /// Staging buffer for convergence readback (4 × u32)
     pub staging_convergence: wgpu::Buffer,
     /// Indirect dispatch args for the PCISPH correction loop, 3 × (x, y, z):
-    /// [particles, boundary particles, single workgroup]. Reset to full
+    /// [particles, boundary particles, pcisph_solve neighbor sums]. Reset to full
     /// counts every step and zeroed on-device once the solve converges, so
     /// the remaining iterations dispatch nothing.
     pub pcisph_args: wgpu::Buffer,
@@ -130,6 +140,14 @@ pub struct GpuBuffers {
 
 /// Minimum buffer size (wgpu requires non-zero buffers).
 const MIN_BUF_SIZE: u64 = 4;
+
+/// PCISPH neighbor-list capacities (entries within 2.5h; ~145 fluid
+/// neighbors at rest density): fluid and boundary neighbors of a fluid
+/// particle, fluid neighbors of a boundary particle. Overflowing particles
+/// fall back to the grid.
+pub const PCISPH_LIST_CAP_FLUID: u32 = 192;
+pub const PCISPH_LIST_CAP_BOUNDARY: u32 = 128;
+pub const PCISPH_LIST_CAP_BND_FLUID: u32 = 128;
 
 /// Size of `GpuBuffers::pcisph_args`: three (x, y, z) indirect dispatches.
 pub const PCISPH_ARGS_BYTES: u64 = 3 * 3 * 4;
@@ -188,12 +206,16 @@ fn create_staging_buf(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Bu
 
 impl GpuBuffers {
     /// Create all GPU buffers from initial particle and boundary data.
+    ///
+    /// The PCISPH step-state and neighbor-list buffers (~1.3 KB per particle)
+    /// are only sized for the particles when `pcisph` is set.
     pub fn new(
         device: &wgpu::Device,
         particles: &ParticleArrays,
         boundary: &BoundaryParticles,
         grid_dims: [u32; 3],
         params: &GpuSimParams,
+        pcisph: bool,
     ) -> Self {
         let n = particles.len();
         let n_bnd = boundary.len();
@@ -284,15 +306,6 @@ impl GpuBuffers {
 
         // PCISPH state buffers (allocated for all solver types; small overhead)
         let zeros_f32_n = vec![0.0f32; n.max(1)];
-        let pcisph_orig_pos_x = create_storage_buf(device, "pcisph_orig_pos_x", &zeros_f32_n);
-        let pcisph_orig_pos_y = create_storage_buf(device, "pcisph_orig_pos_y", &zeros_f32_n);
-        let pcisph_orig_pos_z = create_storage_buf(device, "pcisph_orig_pos_z", &zeros_f32_n);
-        let pcisph_pred_vel_x = create_storage_buf(device, "pcisph_pred_vel_x", &zeros_f32_n);
-        let pcisph_pred_vel_y = create_storage_buf(device, "pcisph_pred_vel_y", &zeros_f32_n);
-        let pcisph_pred_vel_z = create_storage_buf(device, "pcisph_pred_vel_z", &zeros_f32_n);
-        let pcisph_np_acc_x = create_storage_buf(device, "pcisph_np_acc_x", &zeros_f32_n);
-        let pcisph_np_acc_y = create_storage_buf(device, "pcisph_np_acc_y", &zeros_f32_n);
-        let pcisph_np_acc_z = create_storage_buf(device, "pcisph_np_acc_z", &zeros_f32_n);
         let pcisph_delta = create_storage_buf(device, "pcisph_delta", &zeros_f32_n);
         let pcisph_convergence = create_storage_buf_u32(device, "pcisph_convergence", &[0u32; 4]);
         let staging_convergence = create_staging_buf(device, "staging_convergence", 16); // 4 × u32
@@ -304,6 +317,29 @@ impl GpuBuffers {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Placeholders (one vec4) when the solver is not PCISPH.
+        let pcisph_buf = |label: &str, words: usize| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: if pcisph { (words * 4) as u64 } else { 0 }.max(16),
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            })
+        };
+        let n1 = n.max(1);
+        let pcisph_orig4 = pcisph_buf("pcisph_orig4", 4 * n1);
+        let pcisph_vel4 = pcisph_buf("pcisph_vel4", 4 * n1);
+        let pcisph_np4 = pcisph_buf("pcisph_np4", 4 * n1);
+        let pcisph_pacc4 = pcisph_buf("pcisph_pacc4", 4 * n1);
+        let pcisph_pos4 = pcisph_buf("pcisph_pos4", 4 * n1);
+        let pcisph_p_rho2 = pcisph_buf("pcisph_p_rho2", n1);
+        let pcisph_counts = pcisph_buf("pcisph_counts", n + n_bnd + 1);
+        let pcisph_lists = pcisph_buf(
+            "pcisph_lists",
+            (PCISPH_LIST_CAP_FLUID + PCISPH_LIST_CAP_BOUNDARY) as usize * n
+                + PCISPH_LIST_CAP_BND_FLUID as usize * n_bnd
+                + 1,
+        );
 
         Self {
             params_buffer,
@@ -335,15 +371,14 @@ impl GpuBuffers {
             bnd_sorted_indices,
             sort_tmp,
             staging_mass,
-            pcisph_orig_pos_x,
-            pcisph_orig_pos_y,
-            pcisph_orig_pos_z,
-            pcisph_pred_vel_x,
-            pcisph_pred_vel_y,
-            pcisph_pred_vel_z,
-            pcisph_np_acc_x,
-            pcisph_np_acc_y,
-            pcisph_np_acc_z,
+            pcisph_orig4,
+            pcisph_vel4,
+            pcisph_np4,
+            pcisph_pacc4,
+            pcisph_pos4,
+            pcisph_p_rho2,
+            pcisph_counts,
+            pcisph_lists,
             pcisph_delta,
             pcisph_convergence,
             staging_convergence,

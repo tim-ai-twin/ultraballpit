@@ -7,9 +7,10 @@
 // preserving the CPU loop's semantics: break after the first iteration (at or
 // past the minimum) whose mean over-compression is below the tolerance.
 //
-// The pass that does not converge leaves the args untouched. Once zeroed they
-// stay zero: the following clear_convergence/correct_pressure passes are
-// skipped, so the counters keep the converged iteration's values.
+// A check that does not converge leaves the args untouched. Once zeroed they
+// stay zero: the following predict_positions (which resets the counters) and
+// density_correct passes are skipped, so the counters keep the converged
+// iteration's values.
 
 const TOLERANCE_FIXED: f32 = 10000.0; // 0.01 mean relative error × 1e6 fixed point
 

@@ -143,6 +143,34 @@ pub trait SimulationKernel {
     fn step_stats(&self) -> StepStats {
         StepStats::from_particles(self.particles())
     }
+
+    /// Advance one step whose dt is chosen by `policy` from the current state
+    /// on the device itself, so a pipelined backend need not stall for a
+    /// stats readback before every step. `prev_dt` seeds the policy for the
+    /// first such step after [`take_adaptive_progress`](Self::take_adaptive_progress);
+    /// later steps chain from the device's own previous dt.
+    ///
+    /// Returns false (and does nothing) when unsupported: use `step`.
+    fn step_adaptive(&mut self, _policy: &sph::AdvectiveDtPolicy, _prev_dt: f32) -> bool {
+        false
+    }
+
+    /// Steps taken, simulated time and last dt of the `step_adaptive` calls
+    /// since the previous call (waits for them to finish).
+    fn take_adaptive_progress(&mut self) -> AdaptiveProgress {
+        AdaptiveProgress::default()
+    }
+}
+
+/// Progress of [`SimulationKernel::step_adaptive`] calls.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AdaptiveProgress {
+    /// Steps taken.
+    pub steps: u32,
+    /// Sum of their timesteps (s).
+    pub sim_time: f64,
+    /// The last timestep (s); 0 if no steps were taken.
+    pub last_dt: f32,
 }
 
 // ---------------------------------------------------------------------------

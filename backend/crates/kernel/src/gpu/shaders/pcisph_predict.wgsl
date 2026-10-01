@@ -1,20 +1,21 @@
-// PCISPH prediction and correction compute shader
+// PCISPH step setup and final integration
 //
 // Predictive-Corrective Incompressible SPH (Solenthaler & Pajarola 2009).
-// Iteratively corrects pressure to enforce density constraints.
+// The correction loop itself (prediction, density, pressure correction,
+// pressure forces) lives in pcisph_solve.wgsl; this module brackets it.
+//
+// PCISPH state is packed per particle (vec4) so the correction loop's single
+// bind group stays within the storage-buffer limit:
+//   orig4  = step-start (x, y, z, mass)     (written by build_neighbors)
+//   vel4   = step-start velocity
+//   np4    = non-pressure acceleration (viscosity + gravity + boundary repulsion)
+//   pacc4  = pressure acceleration from the latest correction iteration
+// The predicted velocity is always vel4 + (np4 + pacc4) * dt.
 //
 // Entry points:
-// - save_and_init_pcisph:      save original state, initialize prediction
-// - predict_positions_pcisph:  predict positions from predicted velocities
-// - correct_pressure_pcisph:   correct pressure from density error
-// - update_pred_vel_pcisph:    update predicted velocity with pressure acceleration
-// - final_integrate_pcisph:    commit final velocity/position with domain clamping
-// - clear_convergence:         zero out convergence counters, count the iteration
-
-const PI: f32 = 3.14159265358979323846;
-const WENDLAND_C2_NORM_3D: f32 = 0.41780189; // 21 / (16 * PI)
-const WATER_REST_DENSITY: f32 = 1000.0;
-const AIR_REST_DENSITY: f32 = 1.204;
+// - save_and_init_pcisph:   save velocity / non-pressure acceleration, zero
+//                           the pressure acceleration, warm-start pressure
+// - final_integrate_pcisph: commit final velocity/position with domain clamping
 
 struct SimParams {
     dt: f32,
@@ -41,14 +42,13 @@ struct SimParams {
     search_cells: u32,
 };
 
-// Group 0: SimParams + positions (read_write) + mass
+// Group 0: SimParams + positions (read_write)
 @group(0) @binding(0) var<uniform> params: SimParams;
 @group(0) @binding(1) var<storage, read_write> pos_x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> pos_y: array<f32>;
 @group(0) @binding(3) var<storage, read_write> pos_z: array<f32>;
-@group(0) @binding(4) var<storage, read> mass: array<f32>;
 
-// Group 1: Velocity (read_write for final integration) + acceleration (read_write)
+// Group 1: Velocity + acceleration (read_write)
 @group(1) @binding(0) var<storage, read_write> vel_x: array<f32>;
 @group(1) @binding(1) var<storage, read_write> vel_y: array<f32>;
 @group(1) @binding(2) var<storage, read_write> vel_z: array<f32>;
@@ -56,32 +56,20 @@ struct SimParams {
 @group(1) @binding(4) var<storage, read_write> acc_y: array<f32>;
 @group(1) @binding(5) var<storage, read_write> acc_z: array<f32>;
 
-// Group 2: SPH state (PCISPH-specific: fewer bindings than WCSPH)
-@group(2) @binding(0) var<storage, read> density: array<f32>;
-@group(2) @binding(1) var<storage, read_write> pressure: array<f32>;
-@group(2) @binding(2) var<storage, read> fluid_type: array<u32>;
+// Group 2: pressure (warm start)
+@group(2) @binding(0) var<storage, read_write> pressure: array<f32>;
 
-// Group 3: PCISPH state buffers
-@group(3) @binding(0) var<storage, read_write> orig_pos_x: array<f32>;
-@group(3) @binding(1) var<storage, read_write> orig_pos_y: array<f32>;
-@group(3) @binding(2) var<storage, read_write> orig_pos_z: array<f32>;
-@group(3) @binding(3) var<storage, read_write> pred_vel_x: array<f32>;
-@group(3) @binding(4) var<storage, read_write> pred_vel_y: array<f32>;
-@group(3) @binding(5) var<storage, read_write> pred_vel_z: array<f32>;
-@group(3) @binding(6) var<storage, read_write> np_acc_x: array<f32>;
-@group(3) @binding(7) var<storage, read_write> np_acc_y: array<f32>;
-@group(3) @binding(8) var<storage, read_write> np_acc_z: array<f32>;
-@group(3) @binding(9) var<storage, read_write> pcisph_delta: array<f32>;
-@group(3) @binding(10) var<storage, read_write> convergence: array<atomic<u32>>;
-
-fn read_mass(idx: u32) -> f32 {
-    return mass[idx];
-}
+// Group 3: packed PCISPH state + convergence counters
+@group(3) @binding(0) var<storage, read_write> orig4: array<vec4<f32>>;
+@group(3) @binding(1) var<storage, read_write> vel4: array<vec4<f32>>;
+@group(3) @binding(2) var<storage, read_write> np4: array<vec4<f32>>;
+@group(3) @binding(3) var<storage, read_write> pacc4: array<vec4<f32>>;
+@group(3) @binding(4) var<storage, read_write> convergence: array<atomic<u32>>;
 
 const RESTITUTION: f32 = 0.2;
 
 // ---------------------------------------------------------------------------
-// Entry point: Save original state and initialize PCISPH prediction
+// Entry point: Save step-start state and initialize the prediction
 // ---------------------------------------------------------------------------
 @compute @workgroup_size(256)
 fn save_and_init_pcisph(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -90,22 +78,14 @@ fn save_and_init_pcisph(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let dt = params.dt;
+    // (orig4 was written by build_neighbors from the same positions.)
+    vel4[i] = vec4<f32>(vel_x[i], vel_y[i], vel_z[i], 0.0);
 
-    // Save original positions
-    orig_pos_x[i] = pos_x[i];
-    orig_pos_y[i] = pos_y[i];
-    orig_pos_z[i] = pos_z[i];
+    // Non-pressure accelerations (viscosity + gravity + boundary repulsion)
+    np4[i] = vec4<f32>(acc_x[i], acc_y[i], acc_z[i], 0.0);
 
-    // Store non-pressure accelerations (viscosity + gravity + boundary repulsion)
-    np_acc_x[i] = acc_x[i];
-    np_acc_y[i] = acc_y[i];
-    np_acc_z[i] = acc_z[i];
-
-    // Initialize predicted velocity: v* = v + a_np * dt
-    pred_vel_x[i] = vel_x[i] + acc_x[i] * dt;
-    pred_vel_y[i] = vel_y[i] + acc_y[i] * dt;
-    pred_vel_z[i] = vel_z[i] + acc_z[i] * dt;
+    // No pressure acceleration yet: the first prediction uses v + a_np * dt.
+    pacc4[i] = vec4<f32>(0.0);
 
     // Warm-start pressure: retain 50% from previous step
     pressure[i] = pressure[i] * 0.5;
@@ -114,78 +94,6 @@ fn save_and_init_pcisph(@builtin(global_invocation_id) gid: vec3<u32>) {
     if i == 0u {
         atomicStore(&convergence[2], 0u);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Entry point: Predict positions from predicted velocities
-// ---------------------------------------------------------------------------
-@compute @workgroup_size(256)
-fn predict_positions_pcisph(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if i >= params.n_particles {
-        return;
-    }
-
-    let dt = params.dt;
-
-    pos_x[i] = orig_pos_x[i] + pred_vel_x[i] * dt;
-    pos_y[i] = orig_pos_y[i] + pred_vel_y[i] * dt;
-    pos_z[i] = orig_pos_z[i] + pred_vel_z[i] * dt;
-}
-
-// ---------------------------------------------------------------------------
-// Entry point: Correct pressure from predicted density error
-// ---------------------------------------------------------------------------
-@compute @workgroup_size(256)
-fn correct_pressure_pcisph(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if i >= params.n_particles {
-        return;
-    }
-
-    // Determine rest density from fluid type
-    let ft = fluid_type[i];
-    var rho0 = WATER_REST_DENSITY;
-    if ft != 0u {
-        rho0 = AIR_REST_DENSITY;
-    }
-
-    // Compute relative density error
-    let density_error = (density[i] - rho0) / rho0;
-
-    // Pressure correction: only correct over-compression (clamp error >= 0).
-    // pcisph_delta stores the dt-independent base; divide by dt² for actual scaling.
-    let dt = params.dt;
-    let effective_delta = pcisph_delta[i] / (dt * dt);
-    let correction = effective_delta * max(density_error, 0.0);
-    pressure[i] = max(pressure[i] + correction, 0.0);
-
-    // Accumulate convergence info for over-compressed particles
-    if density_error > 0.0 {
-        // Fixed-point: multiply by 1e6 and cast to u32 for atomic add
-        atomicAdd(&convergence[0], u32(density_error * 1000000.0));
-        // Count of over-compressed particles
-        atomicAdd(&convergence[1], 1u);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Entry point: Update predicted velocity with pressure acceleration
-// ---------------------------------------------------------------------------
-@compute @workgroup_size(256)
-fn update_pred_vel_pcisph(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if i >= params.n_particles {
-        return;
-    }
-
-    let dt = params.dt;
-
-    // acc_x/y/z hold pressure acceleration at this point
-    // Predicted velocity = initial velocity + (non-pressure + pressure) acceleration * dt
-    pred_vel_x[i] = vel_x[i] + (np_acc_x[i] + acc_x[i]) * dt;
-    pred_vel_y[i] = vel_y[i] + (np_acc_y[i] + acc_y[i]) * dt;
-    pred_vel_z[i] = vel_z[i] + (np_acc_z[i] + acc_z[i]) * dt;
 }
 
 // ---------------------------------------------------------------------------
@@ -199,79 +107,61 @@ fn final_integrate_pcisph(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let dt = params.dt;
+    let v0 = vel4[i];
+    let a_np = np4[i];
+    let a_p = pacc4[i];
+    let o = orig4[i];
 
-    // Total acceleration = non-pressure + pressure (acc currently holds pressure acc)
-    let total_ax = np_acc_x[i] + acc_x[i];
-    let total_ay = np_acc_y[i] + acc_y[i];
-    let total_az = np_acc_z[i] + acc_z[i];
+    // Total acceleration = non-pressure + pressure
+    let total_ax = a_np.x + a_p.x;
+    let total_ay = a_np.y + a_p.y;
+    let total_az = a_np.z + a_p.z;
 
-    // Commit final velocity from prediction
-    vel_x[i] = pred_vel_x[i];
-    vel_y[i] = pred_vel_y[i];
-    vel_z[i] = pred_vel_z[i];
+    // Commit the final predicted velocity
+    var vx = v0.x + total_ax * dt;
+    var vy = v0.y + total_ay * dt;
+    var vz = v0.z + total_az * dt;
 
     // Final position from original + final velocity * dt
-    pos_x[i] = orig_pos_x[i] + vel_x[i] * dt;
-    pos_y[i] = orig_pos_y[i] + vel_y[i] * dt;
-    pos_z[i] = orig_pos_z[i] + vel_z[i] * dt;
+    var px = o.x + vx * dt;
+    var py = o.y + vy * dt;
+    var pz = o.z + vz * dt;
+
+    // Domain clamping with velocity reflection
+    if px < params.domain_min_x {
+        px = params.domain_min_x;
+        if vx < 0.0 { vx = -RESTITUTION * vx; }
+    }
+    if px > params.domain_max_x {
+        px = params.domain_max_x;
+        if vx > 0.0 { vx = -RESTITUTION * vx; }
+    }
+    if py < params.domain_min_y {
+        py = params.domain_min_y;
+        if vy < 0.0 { vy = -RESTITUTION * vy; }
+    }
+    if py > params.domain_max_y {
+        py = params.domain_max_y;
+        if vy > 0.0 { vy = -RESTITUTION * vy; }
+    }
+    if pz < params.domain_min_z {
+        pz = params.domain_min_z;
+        if vz < 0.0 { vz = -RESTITUTION * vz; }
+    }
+    if pz > params.domain_max_z {
+        pz = params.domain_max_z;
+        if vz > 0.0 { vz = -RESTITUTION * vz; }
+    }
+
+    pos_x[i] = px;
+    pos_y[i] = py;
+    pos_z[i] = pz;
+    vel_x[i] = vx;
+    vel_y[i] = vy;
+    vel_z[i] = vz;
 
     // Store total acceleration for adaptive timestep computation
     acc_x[i] = total_ax;
     acc_y[i] = total_ay;
     acc_z[i] = total_az;
-
-    // Domain clamping with velocity reflection
-    // X-min
-    if pos_x[i] < params.domain_min_x {
-        pos_x[i] = params.domain_min_x;
-        if vel_x[i] < 0.0 {
-            vel_x[i] = -RESTITUTION * vel_x[i];
-        }
-    }
-    // X-max
-    if pos_x[i] > params.domain_max_x {
-        pos_x[i] = params.domain_max_x;
-        if vel_x[i] > 0.0 {
-            vel_x[i] = -RESTITUTION * vel_x[i];
-        }
-    }
-    // Y-min
-    if pos_y[i] < params.domain_min_y {
-        pos_y[i] = params.domain_min_y;
-        if vel_y[i] < 0.0 {
-            vel_y[i] = -RESTITUTION * vel_y[i];
-        }
-    }
-    // Y-max
-    if pos_y[i] > params.domain_max_y {
-        pos_y[i] = params.domain_max_y;
-        if vel_y[i] > 0.0 {
-            vel_y[i] = -RESTITUTION * vel_y[i];
-        }
-    }
-    // Z-min
-    if pos_z[i] < params.domain_min_z {
-        pos_z[i] = params.domain_min_z;
-        if vel_z[i] < 0.0 {
-            vel_z[i] = -RESTITUTION * vel_z[i];
-        }
-    }
-    // Z-max
-    if pos_z[i] > params.domain_max_z {
-        pos_z[i] = params.domain_max_z;
-        if vel_z[i] > 0.0 {
-            vel_z[i] = -RESTITUTION * vel_z[i];
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Entry point: Clear convergence counters at the start of a correction
-// iteration and count the iteration (dispatch with 1 thread)
-// ---------------------------------------------------------------------------
-@compute @workgroup_size(1)
-fn clear_convergence(@builtin(global_invocation_id) gid: vec3<u32>) {
-    atomicStore(&convergence[0], 0u);
-    atomicStore(&convergence[1], 0u);
-    atomicAdd(&convergence[2], 1u);
 }

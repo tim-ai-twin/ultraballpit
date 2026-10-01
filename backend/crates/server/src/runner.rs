@@ -38,15 +38,21 @@ pub fn dt_recompute_interval(solver: kernel::SolverType) -> u32 {
     }
 }
 
+/// PCISPH timestep policy: advective CFL recomputed every step (see
+/// [`kernel::sph::AdvectiveDtPolicy`] for the hold-window and growth guards).
+pub fn pcisph_dt_policy(h: f32, cfl_number: f32) -> kernel::sph::AdvectiveDtPolicy {
+    kernel::sph::AdvectiveDtPolicy {
+        h,
+        cfl_number,
+        safety: 0.85,
+        max_growth: 2.0,
+        hold_steps: dt_recompute_interval(kernel::SolverType::Pcisph) as f32,
+    }
+}
+
 /// Next adaptive timestep from on-device step stats, held for
 /// [`dt_recompute_interval`] steps. A 0.85 safety factor covers drift
-/// between recomputes.
-///
-/// PCISPH uses the advective CFL, which depends on the flow state, so:
-/// - the CFL velocity is the one reachable by the end of the hold window
-///   (`v_max + a_max * window * dt_prev`), not the current one;
-/// - dt grows at most 2x per recompute. Stats taken before any forces exist
-///   (first step: a = v = 0) would otherwise yield the 10 ms cap.
+/// between recomputes. PCISPH uses [`pcisph_dt_policy`].
 pub fn adaptive_dt(
     solver: kernel::SolverType,
     stats: &kernel::StepStats,
@@ -59,13 +65,7 @@ pub fn adaptive_dt(
         kernel::SolverType::Wcsph => {
             0.85 * kernel::sph::timestep_from_stats(stats, h, speed_of_sound, cfl_number)
         }
-        kernel::SolverType::Pcisph => {
-            let window = dt_recompute_interval(solver) as f32 * prev_dt;
-            let mut reach = *stats;
-            reach.max_speed += stats.max_accel * window;
-            let dt = 0.85 * kernel::sph::timestep_advective_from_stats(&reach, h, cfl_number);
-            dt.min(2.0 * prev_dt)
-        }
+        kernel::SolverType::Pcisph => pcisph_dt_policy(h, cfl_number).next_dt(stats, prev_dt),
     }
 }
 
@@ -244,25 +244,33 @@ impl SimulationRunner {
         let mut dt = *self.dt.lock().unwrap();
         let mut batch_sim_time = 0.0_f64;
         let dt_interval = dt_recompute_interval(kernel.solver_type());
+        // PCISPH recomputes dt every step; kernels that can do that on the
+        // device (GPU) avoid a stats round trip per step.
+        let device_dt = (kernel.solver_type() == kernel::SolverType::Pcisph)
+            .then(|| pcisph_dt_policy(self.h, self.cfl_number));
+        let mut stepped_on_device = false;
 
         loop {
-            // Recompute the adaptive CFL timestep every few steps (see
-            // dt_recompute_interval); on the GPU each stats query is a sync.
-            if steps % dt_interval == 0 {
-                let stats = kernel.step_stats();
-                dt = adaptive_dt(
-                    kernel.solver_type(),
-                    &stats,
-                    dt,
-                    self.h,
-                    self.speed_of_sound,
-                    self.cfl_number,
-                );
+            if device_dt.as_ref().is_some_and(|policy| kernel.step_adaptive(policy, dt)) {
+                stepped_on_device = true;
+            } else {
+                // Recompute the adaptive CFL timestep every few steps (see
+                // dt_recompute_interval); on the GPU each stats query is a sync.
+                if steps % dt_interval == 0 {
+                    let stats = kernel.step_stats();
+                    dt = adaptive_dt(
+                        kernel.solver_type(),
+                        &stats,
+                        dt,
+                        self.h,
+                        self.speed_of_sound,
+                        self.cfl_number,
+                    );
+                }
+                kernel.step(dt);
+                batch_sim_time += dt as f64;
             }
-
-            kernel.step(dt);
             steps += 1;
-            batch_sim_time += dt as f64;
 
             if start.elapsed() >= budget {
                 break;
@@ -270,6 +278,14 @@ impl SimulationRunner {
             // Respect external pause requests mid-batch
             if steps % 16 == 0 && *self.status.lock().unwrap() != SimStatus::Running {
                 break;
+            }
+        }
+
+        if stepped_on_device {
+            let progress = kernel.take_adaptive_progress();
+            batch_sim_time += progress.sim_time;
+            if progress.steps > 0 {
+                dt = progress.last_dt;
             }
         }
 

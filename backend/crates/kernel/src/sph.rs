@@ -576,9 +576,11 @@ pub fn auto_tune_speed_of_sound(
 // ---------------------------------------------------------------------------
 
 /// Minimum allowed timestep (seconds).
-const MIN_DT: f32 = 1.0e-8;
+pub(crate) const MIN_DT: f32 = 1.0e-8;
 /// Maximum allowed timestep (seconds).
-const MAX_DT: f32 = 0.01;
+pub(crate) const MAX_DT: f32 = 0.01;
+/// Velocity floor of the advective CFL (m/s), so dt stays finite at rest.
+pub(crate) const ADVECTIVE_V_FLOOR: f32 = 0.1;
 
 // ---------------------------------------------------------------------------
 // PCISPH: Predictive-Corrective Incompressible SPH (Solenthaler & Pajarola 2009)
@@ -688,8 +690,7 @@ pub fn timestep_advective_from_stats(stats: &crate::StepStats, h: f32, cfl_numbe
 
     // Advective CFL: dt = CFL * h / v_max
     // Use a floor for v_max to avoid infinite dt at rest
-    let v_floor = 0.1_f32; // 0.1 m/s floor
-    let dt_cfl = cfl_number * h / max_v.max(v_floor);
+    let dt_cfl = cfl_number * h / max_v.max(ADVECTIVE_V_FLOOR);
 
     // Force-based CFL: dt_force = 0.25 * sqrt(h / max_accel)
     let dt_force = if max_accel > 1.0e-12 {
@@ -700,6 +701,42 @@ pub fn timestep_advective_from_stats(stats: &crate::StepStats, h: f32, cfl_numbe
 
     let dt = dt_cfl.min(dt_force);
     dt.clamp(MIN_DT, MAX_DT)
+}
+
+/// Adaptive timestep policy for PCISPH: the advective + force CFL of
+/// [`timestep_advective_from_stats`], recomputed from fresh step stats and
+/// held for `hold_steps` steps.
+///
+/// The advective CFL depends on the flow state, so on top of the plain CFL:
+/// - the CFL velocity is the one reachable by the end of the hold
+///   (`v_max + a_max * hold_steps * prev_dt`), not the current one;
+/// - dt grows at most `max_growth`x per recompute. Stats taken before any
+///   forces exist (first step: a = v = 0) would otherwise yield the 10 ms cap.
+///
+/// The GPU kernel evaluates the same policy on-device (pcisph_dt.wgsl) for
+/// [`crate::SimulationKernel::step_adaptive`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdvectiveDtPolicy {
+    /// Smoothing length (m).
+    pub h: f32,
+    /// CFL number.
+    pub cfl_number: f32,
+    /// Multiplier on the CFL timestep (headroom for drift while held).
+    pub safety: f32,
+    /// Maximum ratio of consecutive timesteps.
+    pub max_growth: f32,
+    /// Steps each timestep is held for.
+    pub hold_steps: f32,
+}
+
+impl AdvectiveDtPolicy {
+    /// The timestep to use after `prev_dt`, given stats of the current state.
+    pub fn next_dt(&self, stats: &crate::StepStats, prev_dt: f32) -> f32 {
+        let mut reach = *stats;
+        reach.max_speed += stats.max_accel * self.hold_steps * prev_dt;
+        let dt = self.safety * timestep_advective_from_stats(&reach, self.h, self.cfl_number);
+        dt.min(self.max_growth * prev_dt)
+    }
 }
 
 /// Compute fluid-only density summation (excluding boundary particles).

@@ -141,23 +141,35 @@ fn fingerprint(name: &str, steps: usize) {
     let trace: usize = std::env::var("FP_TRACE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let mut dt = config.cfl_number * h / config.speed_of_sound; // runner's initial dt
     let mut t = 0.0f64;
+    // Same dt policy as the server runner (on-device for GPU PCISPH).
+    let device_dt = (k.solver_type() == kernel::SolverType::Pcisph)
+        .then(|| server::runner::pcisph_dt_policy(h, config.cfl_number));
+    let take_progress = |k: &mut Box<dyn kernel::SimulationKernel + Send>, t: &mut f64, dt: &mut f32| {
+        let progress = k.take_adaptive_progress();
+        *t += progress.sim_time;
+        if progress.steps > 0 {
+            *dt = progress.last_dt;
+        }
+    };
     let start = Instant::now();
     for s in 0..steps {
-        if s % server::runner::dt_recompute_interval(k.solver_type()) as usize == 0 {
-            // Same dt policy as the server runner.
-            let stats = k.step_stats();
-            dt = server::runner::adaptive_dt(
-                k.solver_type(),
-                &stats,
-                dt,
-                h,
-                config.speed_of_sound,
-                config.cfl_number,
-            );
+        if !device_dt.as_ref().is_some_and(|policy| k.step_adaptive(policy, dt)) {
+            if s % server::runner::dt_recompute_interval(k.solver_type()) as usize == 0 {
+                let stats = k.step_stats();
+                dt = server::runner::adaptive_dt(
+                    k.solver_type(),
+                    &stats,
+                    dt,
+                    h,
+                    config.speed_of_sound,
+                    config.cfl_number,
+                );
+            }
+            k.step(dt);
+            t += dt as f64;
         }
-        k.step(dt);
-        t += dt as f64;
         if trace > 0 && (s + 1) % trace == 0 {
+            take_progress(&mut k, &mut t, &mut dt);
             let p = k.particles();
             let bad = (0..p.len())
                 .filter(|&i| !(p.x[i].is_finite() && p.vx[i].is_finite() && p.density[i].is_finite()))
@@ -169,6 +181,7 @@ fn fingerprint(name: &str, steps: usize) {
             );
         }
     }
+    take_progress(&mut k, &mut t, &mut dt);
     let wall = start.elapsed().as_secs_f64();
     let p = k.particles();
     let n = p.len() as f64;
