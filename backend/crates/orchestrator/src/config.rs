@@ -126,7 +126,8 @@ pub struct SimulationConfig {
     /// Gravity vector (m/s^2)
     #[serde(default = "default_gravity")]
     pub gravity: [f32; 3],
-    /// WCSPH speed of sound parameter
+    /// WCSPH speed of sound upper bound (auto-tuned down; see
+    /// [`SimulationConfig::effective_speed_of_sound`])
     #[serde(default = "default_speed_of_sound")]
     pub speed_of_sound: f32,
     /// Kinematic viscosity (m^2/s)
@@ -390,6 +391,21 @@ impl SimulationConfig {
     /// Calculate smoothing length from particle spacing
     pub fn smoothing_length(&self) -> f32 {
         1.3 * self.particle_spacing
+    }
+
+    /// Speed of sound the simulation actually runs with.
+    ///
+    /// The configured `speed_of_sound` is an upper bound: it is auto-tuned
+    /// down to `10 * v_max` estimated from domain height and gravity (see
+    /// [`kernel::sph::auto_tune_speed_of_sound`]). The kernel's EOS and the
+    /// acoustic CFL timestep must both use this value.
+    pub fn effective_speed_of_sound(&self) -> f32 {
+        kernel::sph::auto_tune_speed_of_sound(
+            self.gravity,
+            self.domain.min,
+            self.domain.max,
+            self.speed_of_sound,
+        )
     }
 }
 
