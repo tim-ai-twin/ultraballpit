@@ -45,7 +45,8 @@ pub struct SimulationRunner {
     steps_per_sec: Arc<Mutex<f32>>,
     /// Smoothing length for adaptive timestep computation
     h: f32,
-    /// Speed of sound for adaptive timestep computation
+    /// Speed of sound for adaptive timestep computation (the auto-tuned value
+    /// the kernel's EOS uses, not the raw config value)
     speed_of_sound: f32,
     /// CFL number for adaptive timestep computation
     cfl_number: f32,
@@ -97,6 +98,8 @@ impl SimulationRunner {
         // Calculate smoothing length
         let h = config.smoothing_length();
         let solver_type = config.solver.to_kernel_solver_type();
+        // The kernel's EOS stiffness; the acoustic CFL must use the same value.
+        let speed_of_sound = config.effective_speed_of_sound();
 
         // Create kernel honoring the config's backend (cpu/gpu/auto) and solver
         let kernel = orchestrator::create_kernel(
@@ -105,7 +108,7 @@ impl SimulationRunner {
             boundary_particles,
             h,
             config.gravity,
-            config.speed_of_sound,
+            speed_of_sound,
             config.cfl_number,
             config.viscosity,
             config.domain.min,
@@ -114,7 +117,7 @@ impl SimulationRunner {
         );
 
         // Initial timestep estimate via CFL condition (will be adaptively updated)
-        let initial_dt = config.cfl_number * h / config.speed_of_sound;
+        let initial_dt = config.cfl_number * h / speed_of_sound;
 
         let fluid_type = match config.fluid_type {
             orchestrator::config::ConfigFluidType::Water => 0,
@@ -134,7 +137,7 @@ impl SimulationRunner {
             dt: Arc::new(Mutex::new(initial_dt)),
             steps_per_sec: Arc::new(Mutex::new(0.0)),
             h,
-            speed_of_sound: config.speed_of_sound,
+            speed_of_sound,
             cfl_number: config.cfl_number,
             max_time: config.max_time,
             max_timesteps: config.max_timesteps,
