@@ -67,12 +67,10 @@ struct SimParams {
 @group(2) @binding(7) var<storage, read_write> bnd_pressure: array<f32>;
 @group(2) @binding(8) var<storage, read> bnd_cell_counts: array<u32>;
 @group(2) @binding(9) var<storage, read> bnd_cell_offsets: array<u32>;
-@group(2) @binding(10) var<storage, read> bnd_sorted_indices: array<u32>;
 
 // Group 3: Grid data (read-only)
 @group(3) @binding(2) var<storage, read> cell_offsets: array<u32>;
 @group(3) @binding(1) var<storage, read> cell_counts: array<u32>;
-@group(3) @binding(3) var<storage, read> sorted_indices: array<u32>;
 
 fn read_mass(idx: u32) -> f32 {
     return mass[idx];

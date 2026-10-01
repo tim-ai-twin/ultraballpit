@@ -442,6 +442,11 @@ impl GpuKernel {
                 bgl_storage_rw(1), // nbr_count
                 bgl_storage_rw(2), // bnd_nbr_list
                 bgl_storage_rw(3), // bnd_nbr_count
+                bgl_storage_ro(4), // vel_x
+                bgl_storage_ro(5), // vel_y
+                bgl_storage_ro(6), // vel_z
+                bgl_storage_rw(7), // posm
+                bgl_storage_rw(8), // velr
             ],
         });
         // Group 2: density(rw), pressure(rw), fluid_type(read), bnd(read), bnd_grid(read)
@@ -457,16 +462,14 @@ impl GpuKernel {
                 bgl_storage_ro(6), // bnd_mass
                 bgl_storage_ro(7), // bnd_cell_counts
                 bgl_storage_ro(8), // bnd_cell_offsets
-                bgl_storage_ro(9), // bnd_sorted_indices
             ],
         });
-        // Group 3: cell_counts(read), cell_offsets(read), sorted_indices(read) -- bindings 1,2,3
+        // Group 3: cell_counts(read), cell_offsets(read) -- bindings 1,2
         let bgl_density_g3 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("density_g3_bgl"),
             entries: &[
                 bgl_storage_ro(1), // cell_counts
                 bgl_storage_ro(2), // cell_offsets
-                bgl_storage_ro(3), // sorted_indices
             ],
         });
 
@@ -496,6 +499,8 @@ impl GpuKernel {
                 bgl_storage_ro(7), // nbr_count
                 bgl_storage_ro(8), // bnd_nbr_list
                 bgl_storage_ro(9), // bnd_nbr_count
+                bgl_storage_ro(10), // posm
+                bgl_storage_ro(11), // velr
             ],
         });
         // Group 2: density(read), pressure(read), fluid_type(read), bnd(read), bnd_pressure(rw), bnd_grid(read)
@@ -512,16 +517,14 @@ impl GpuKernel {
                 bgl_storage_rw(7),  // bnd_pressure
                 bgl_storage_ro(8),  // bnd_cell_counts
                 bgl_storage_ro(9),  // bnd_cell_offsets
-                bgl_storage_ro(10), // bnd_sorted_indices
             ],
         });
-        // Group 3: same as density group 3 (cell_counts, cell_offsets, sorted_indices read)
+        // Group 3: same as density group 3 (cell_counts, cell_offsets read)
         let bgl_forces_g3 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("forces_g3_bgl"),
             entries: &[
                 bgl_storage_ro(1), // cell_counts
                 bgl_storage_ro(2), // cell_offsets
-                bgl_storage_ro(3), // sorted_indices
             ],
         });
 
@@ -546,6 +549,8 @@ impl GpuKernel {
                 bgl_storage_ro(3), // acc_x
                 bgl_storage_ro(4), // acc_y
                 bgl_storage_ro(5), // acc_z
+                bgl_storage_ro(6), // density
+                bgl_storage_rw(7), // velr (packed cache)
             ],
         });
 
@@ -1662,6 +1667,7 @@ impl GpuKernel {
     fn build_density_bg1(&self) -> wgpu::BindGroup {
         bind_buffers(&self.device, "density_bg1", &self.bgl_density_g1, &[
             &self.bufs.nbr_list, &self.bufs.nbr_count, &self.bufs.bnd_nbr_list, &self.bufs.bnd_nbr_count,
+            &self.bufs.vel_x, &self.bufs.vel_y, &self.bufs.vel_z, &self.bufs.posm, &self.bufs.velr,
         ])
     }
 
@@ -1679,12 +1685,11 @@ impl GpuKernel {
                 wgpu::BindGroupEntry { binding: 6, resource: self.bufs.bnd_mass.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: self.bufs.bnd_cell_counts.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: self.bufs.bnd_cell_offsets.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: self.bufs.bnd_sorted_indices.as_entire_binding() },
             ],
         })
     }
 
-    /// Density/Forces group 3 (read-only): cell_counts, cell_offsets, sorted_indices
+    /// Density/Forces group 3 (read-only): cell_counts, cell_offsets
     /// Used by density shader. Bindings at 1, 2, 3 (matching the shader declarations).
     fn build_density_forces_bg3(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1693,7 +1698,6 @@ impl GpuKernel {
             entries: &[
                 wgpu::BindGroupEntry { binding: 1, resource: self.bufs.cell_counts.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.bufs.cell_offsets.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.bufs.sorted_indices.as_entire_binding() },
             ],
         })
     }
@@ -1731,6 +1735,8 @@ impl GpuKernel {
                 wgpu::BindGroupEntry { binding: 7, resource: self.bufs.nbr_count.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: self.bufs.bnd_nbr_list.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: self.bufs.bnd_nbr_count.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: self.bufs.posm.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: self.bufs.velr.as_entire_binding() },
             ],
         })
     }
@@ -1751,12 +1757,11 @@ impl GpuKernel {
                 wgpu::BindGroupEntry { binding: 7, resource: self.bufs.bnd_pressure.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: self.bufs.bnd_cell_counts.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: self.bufs.bnd_cell_offsets.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: self.bufs.bnd_sorted_indices.as_entire_binding() },
             ],
         })
     }
 
-    /// Forces group 3: cell_counts(read), cell_offsets(read), sorted_indices(read) -- bindings 1,2,3
+    /// Forces group 3: cell_counts(read), cell_offsets(read) -- bindings 1,2
     fn build_forces_bg3(&self) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("forces_bg3"),
@@ -1764,7 +1769,6 @@ impl GpuKernel {
             entries: &[
                 wgpu::BindGroupEntry { binding: 1, resource: self.bufs.cell_counts.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.bufs.cell_offsets.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.bufs.sorted_indices.as_entire_binding() },
             ],
         })
     }
@@ -1797,6 +1801,8 @@ impl GpuKernel {
                 wgpu::BindGroupEntry { binding: 3, resource: self.bufs.acc_x.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: self.bufs.acc_y.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: self.bufs.acc_z.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: self.bufs.density.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: self.bufs.velr.as_entire_binding() },
             ],
         })
     }

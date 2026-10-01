@@ -62,6 +62,9 @@ struct SimParams {
 @group(1) @binding(7) var<storage, read> nbr_count: array<u32>;
 @group(1) @binding(8) var<storage, read> bnd_nbr_list: array<u32>;
 @group(1) @binding(9) var<storage, read> bnd_nbr_count: array<u32>;
+// Packed caches written by the density pass: (x, y, z, mass), (v, density).
+@group(1) @binding(10) var<storage, read> posm: array<vec4<f32>>;
+@group(1) @binding(11) var<storage, read> velr: array<vec4<f32>>;
 
 const MAX_NBR: u32 = 128u;
 const MAX_BND_NBR: u32 = 64u;
@@ -77,12 +80,10 @@ const MAX_BND_NBR: u32 = 64u;
 @group(2) @binding(7) var<storage, read_write> bnd_pressure: array<f32>;
 @group(2) @binding(8) var<storage, read> bnd_cell_counts: array<u32>;
 @group(2) @binding(9) var<storage, read> bnd_cell_offsets: array<u32>;
-@group(2) @binding(10) var<storage, read> bnd_sorted_indices: array<u32>;
 
 // Group 3: Grid data (read-only for forces)
 @group(3) @binding(2) var<storage, read> cell_offsets: array<u32>;
 @group(3) @binding(1) var<storage, read> cell_counts: array<u32>;
-@group(3) @binding(3) var<storage, read> sorted_indices: array<u32>;
 
 fn wendland_c2(r: f32, h: f32) -> f32 {
     let q = r / h;
@@ -230,21 +231,23 @@ fn fluid_pair_force(pi: ParticleI, j: u32) -> vec3<f32> {
     let h = params.h;
     let support_radius_sq = 4.0 * h * h;
     let eta_sq = 0.01 * h * h;
-    let d = pi.pos - vec3<f32>(pos_x[j], pos_y[j], pos_z[j]);
+    let pm = posm[j];
+    let d = pi.pos - pm.xyz;
     let dist_sq = dot(d, d);
     if dist_sq > support_radius_sq {
         return vec3<f32>(0.0);
     }
+    let vr = velr[j];
     let grad = wendland_c2_gradient_from_dist_sq(d.x, d.y, d.z, dist_sq, h);
-    let m_j = read_mass(j);
-    let rho_j = density[j];
+    let m_j = pm.w;
+    let rho_j = vr.w;
 
     // Pressure forces
     let pj_over_rho2_j = pressure[j] / (rho_j * rho_j);
     var factor = -pi.m * m_j * (pi.p_over_rho2 + pj_over_rho2_j);
 
     // Viscous forces (Monaghan artificial viscosity)
-    let dv = pi.vel - vec3<f32>(vel_x[j], vel_y[j], vel_z[j]);
+    let dv = pi.vel - vr.xyz;
     let vr_dot = dot(dv, d);
     if vr_dot < 0.0 {
         let mu_ij = h * vr_dot / (dist_sq + eta_sq);

@@ -77,7 +77,6 @@ pub struct GpuBuffers {
     // Boundary particle grid (built once at init, boundary particles are static)
     pub bnd_cell_counts: wgpu::Buffer,
     pub bnd_cell_offsets: wgpu::Buffer,
-    pub bnd_sorted_indices: wgpu::Buffer,
 
     pub staging_mass: wgpu::Buffer,
 
@@ -86,6 +85,9 @@ pub struct GpuBuffers {
     pub nbr_count: wgpu::Buffer,
     pub bnd_nbr_list: wgpu::Buffer,
     pub bnd_nbr_count: wgpu::Buffer,
+    /// Packed (x, y, z, mass) and (vx, vy, vz, density) caches for neighbor gathers.
+    pub posm: wgpu::Buffer,
+    pub velr: wgpu::Buffer,
 
     // Staging buffers for readback
     pub staging_density: wgpu::Buffer,
@@ -239,7 +241,7 @@ impl GpuBuffers {
 
         // Boundary particle grid (built once, boundary particles are static).
         // Boundary arrays are stored in cell order so each grid row is a
-        // contiguous index range; bnd_sorted_indices is then the identity.
+        // contiguous index range.
         let (bnd_cell_counts_data, bnd_cell_offsets_data, bnd_order) =
             build_boundary_grid(boundary, params, grid_dims, total_cells);
         let permute = |v: &[f32]| -> Vec<f32> { bnd_order.iter().map(|&i| v[i as usize]).collect() };
@@ -248,10 +250,8 @@ impl GpuBuffers {
         let bnd_z = create_storage_buf(device, "bnd_z", &permute(&boundary.z));
         let bnd_mass = create_storage_buf(device, "bnd_mass", &permute(&boundary.mass));
         let bnd_pressure = create_storage_buf(device, "bnd_pressure", &permute(&boundary.pressure));
-        let bnd_identity: Vec<u32> = (0..n_bnd.max(1) as u32).collect();
         let bnd_cell_counts = create_storage_buf_u32(device, "bnd_cell_counts", &bnd_cell_counts_data);
         let bnd_cell_offsets = create_storage_buf_u32(device, "bnd_cell_offsets", &bnd_cell_offsets_data);
-        let bnd_sorted_indices = create_storage_buf_u32(device, "bnd_sorted_indices", &bnd_identity);
 
         // Staging buffers for readback
         let f32_size = std::mem::size_of::<f32>() as u64;
@@ -284,6 +284,8 @@ impl GpuBuffers {
         let nbr_count = gpu_only("nbr_count", particle_u32_bytes);
         let bnd_nbr_list = gpu_only("bnd_nbr_list", particle_u32_bytes * MAX_BND_NBR);
         let bnd_nbr_count = gpu_only("bnd_nbr_count", particle_u32_bytes);
+        let posm = gpu_only("posm", particle_bytes * 4);
+        let velr = gpu_only("velr", particle_bytes * 4);
         // Scratch copies used as gather sources when sorting particle data
         // into cell order (one per array in SORTED_ARRAYS order).
         let sort_tmp: Vec<wgpu::Buffer> = (0..SORTED_ARRAY_COUNT)
@@ -337,13 +339,14 @@ impl GpuBuffers {
             write_heads,
             bnd_cell_counts,
             bnd_cell_offsets,
-            bnd_sorted_indices,
             sort_tmp,
             staging_mass,
             nbr_list,
             nbr_count,
             bnd_nbr_list,
             bnd_nbr_count,
+            posm,
+            velr,
             pcisph_orig_pos_x,
             pcisph_orig_pos_y,
             pcisph_orig_pos_z,

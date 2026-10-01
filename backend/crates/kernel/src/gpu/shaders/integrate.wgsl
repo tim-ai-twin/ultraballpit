@@ -45,6 +45,9 @@ struct SimParams {
 @group(1) @binding(3) var<storage, read> acc_x: array<f32>;
 @group(1) @binding(4) var<storage, read> acc_y: array<f32>;
 @group(1) @binding(5) var<storage, read> acc_z: array<f32>;
+// Packed (vx, vy, vz, density) cache read by the XSPH pass (see density.wgsl).
+@group(1) @binding(6) var<storage, read> density: array<f32>;
+@group(1) @binding(7) var<storage, read_write> velr: array<vec4<f32>>;
 
 const RESTITUTION: f32 = 0.2;
 
@@ -57,9 +60,15 @@ fn half_kick(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let half_dt = 0.5 * params.dt;
-    vel_x[i] = vel_x[i] + acc_x[i] * half_dt;
-    vel_y[i] = vel_y[i] + acc_y[i] * half_dt;
-    vel_z[i] = vel_z[i] + acc_z[i] * half_dt;
+    let v = vec3<f32>(
+        vel_x[i] + acc_x[i] * half_dt,
+        vel_y[i] + acc_y[i] * half_dt,
+        vel_z[i] + acc_z[i] * half_dt,
+    );
+    vel_x[i] = v.x;
+    vel_y[i] = v.y;
+    vel_z[i] = v.z;
+    velr[i] = vec4<f32>(v, density[i]);
 }
 
 // Entry point: Drift with XSPH correction (x += (v + dv_xsph) * dt) + domain clamping.

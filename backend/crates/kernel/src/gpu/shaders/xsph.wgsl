@@ -53,6 +53,9 @@ struct SimParams {
 // Neighbor lists written by the density pass (see density.wgsl).
 @group(1) @binding(6) var<storage, read> nbr_list: array<u32>;
 @group(1) @binding(7) var<storage, read> nbr_count: array<u32>;
+// Packed caches: posm from the density pass, velr refreshed by the half-kick.
+@group(1) @binding(10) var<storage, read> posm: array<vec4<f32>>;
+@group(1) @binding(11) var<storage, read> velr: array<vec4<f32>>;
 
 const MAX_NBR: u32 = 128u;
 
@@ -67,12 +70,10 @@ const MAX_NBR: u32 = 128u;
 @group(2) @binding(7) var<storage, read_write> bnd_pressure: array<f32>;
 @group(2) @binding(8) var<storage, read> bnd_cell_counts: array<u32>;
 @group(2) @binding(9) var<storage, read> bnd_cell_offsets: array<u32>;
-@group(2) @binding(10) var<storage, read> bnd_sorted_indices: array<u32>;
 
 // Group 3: Grid data
 @group(3) @binding(2) var<storage, read> cell_offsets: array<u32>;
 @group(3) @binding(1) var<storage, read> cell_counts: array<u32>;
-@group(3) @binding(3) var<storage, read> sorted_indices: array<u32>;
 
 fn read_mass(idx: u32) -> f32 {
     return mass[idx];
@@ -120,18 +121,18 @@ fn row_range(cell: vec3<i32>, ny: i32, nz: i32) -> vec2<u32> {
 fn xsph_pair(px: f32, py: f32, pz: f32, vi: vec3<f32>, rho_i: f32, j: u32) -> vec3<f32> {
     let h = params.h;
     let support_radius_sq = 4.0 * h * h;
-    let ddx = px - pos_x[j];
-    let ddy = py - pos_y[j];
-    let ddz = pz - pos_z[j];
-    let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
+    let pm = posm[j];
+    let d = vec3<f32>(px, py, pz) - pm.xyz;
+    let dist_sq = dot(d, d);
     if dist_sq > support_radius_sq {
         return vec3<f32>(0.0);
     }
+    let vr = velr[j];
     let r = dist_sq * inverseSqrt(max(dist_sq, 1.0e-24));
     let w = wendland_c2(r, h);
-    let rho_avg = 0.5 * (rho_i + density[j]);
-    let factor = read_mass(j) / max(rho_avg, 1.0) * w;
-    return factor * (vec3<f32>(vel_x[j], vel_y[j], vel_z[j]) - vi);
+    let rho_avg = 0.5 * (rho_i + vr.w);
+    let factor = pm.w / max(rho_avg, 1.0) * w;
+    return factor * (vr.xyz - vi);
 }
 
 @compute @workgroup_size(256)

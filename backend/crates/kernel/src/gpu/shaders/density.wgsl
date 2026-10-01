@@ -62,6 +62,14 @@ struct SimParams {
 @group(1) @binding(1) var<storage, read_write> nbr_count: array<u32>;
 @group(1) @binding(2) var<storage, read_write> bnd_nbr_list: array<u32>;
 @group(1) @binding(3) var<storage, read_write> bnd_nbr_count: array<u32>;
+// Packed per-particle caches for the neighbor-list passes (forces, XSPH):
+// one 16-byte gather per neighbor instead of four scattered scalar loads.
+// posm = (x, y, z, mass), velr = (vx, vy, vz, density).
+@group(1) @binding(4) var<storage, read> vel_x: array<f32>;
+@group(1) @binding(5) var<storage, read> vel_y: array<f32>;
+@group(1) @binding(6) var<storage, read> vel_z: array<f32>;
+@group(1) @binding(7) var<storage, read_write> posm: array<vec4<f32>>;
+@group(1) @binding(8) var<storage, read_write> velr: array<vec4<f32>>;
 
 const MAX_NBR: u32 = 128u;
 const MAX_BND_NBR: u32 = 64u;
@@ -76,12 +84,10 @@ const MAX_BND_NBR: u32 = 64u;
 @group(2) @binding(6) var<storage, read> bnd_mass: array<f32>;
 @group(2) @binding(7) var<storage, read> bnd_cell_counts: array<u32>;
 @group(2) @binding(8) var<storage, read> bnd_cell_offsets: array<u32>;
-@group(2) @binding(9) var<storage, read> bnd_sorted_indices: array<u32>;
 
 // Group 3: Grid data (read-only for density)
 @group(3) @binding(2) var<storage, read> cell_offsets: array<u32>;
 @group(3) @binding(1) var<storage, read> cell_counts: array<u32>;
-@group(3) @binding(3) var<storage, read> sorted_indices: array<u32>;
 
 fn read_mass(idx: u32) -> f32 {
     return mass[idx];
@@ -311,6 +317,8 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     density[i] = rho;
+    posm[i] = vec4<f32>(px, py, pz, read_mass(i));
+    velr[i] = vec4<f32>(vel_x[i], vel_y[i], vel_z[i], rho);
     nbr_count[i] = n_nbr;
     bnd_nbr_count[i] = n_bnd_nbr;
 
