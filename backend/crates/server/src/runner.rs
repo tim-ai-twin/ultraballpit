@@ -24,6 +24,51 @@ pub struct ForceRecord {
     pub net_moment: [f32; 3],
 }
 
+/// Steps between adaptive-timestep recomputes in [`SimulationRunner::step_batch`].
+///
+/// WCSPH is bound by the acoustic CFL (speed of sound), which barely depends
+/// on the flow state, so dt is held for 16 steps (each GPU stats query is a
+/// device sync). PCISPH's advective/force CFL tracks the flow closely: a dt
+/// held across an acceleration spike (wall impact) blows the solve up, so it
+/// is recomputed every step.
+pub fn dt_recompute_interval(solver: kernel::SolverType) -> u32 {
+    match solver {
+        kernel::SolverType::Wcsph => 16,
+        kernel::SolverType::Pcisph => 1,
+    }
+}
+
+/// Next adaptive timestep from on-device step stats, held for
+/// [`dt_recompute_interval`] steps. A 0.85 safety factor covers drift
+/// between recomputes.
+///
+/// PCISPH uses the advective CFL, which depends on the flow state, so:
+/// - the CFL velocity is the one reachable by the end of the hold window
+///   (`v_max + a_max * window * dt_prev`), not the current one;
+/// - dt grows at most 2x per recompute. Stats taken before any forces exist
+///   (first step: a = v = 0) would otherwise yield the 10 ms cap.
+pub fn adaptive_dt(
+    solver: kernel::SolverType,
+    stats: &kernel::StepStats,
+    prev_dt: f32,
+    h: f32,
+    speed_of_sound: f32,
+    cfl_number: f32,
+) -> f32 {
+    match solver {
+        kernel::SolverType::Wcsph => {
+            0.85 * kernel::sph::timestep_from_stats(stats, h, speed_of_sound, cfl_number)
+        }
+        kernel::SolverType::Pcisph => {
+            let window = dt_recompute_interval(solver) as f32 * prev_dt;
+            let mut reach = *stats;
+            reach.max_speed += stats.max_accel * window;
+            let dt = 0.85 * kernel::sph::timestep_advective_from_stats(&reach, h, cfl_number);
+            dt.min(2.0 * prev_dt)
+        }
+    }
+}
+
 /// Thread-safe simulation runner.
 ///
 /// All mutable state is behind `Arc`s, so the runner is cheaply cloneable;
@@ -198,31 +243,21 @@ impl SimulationRunner {
         let mut kernel = self.kernel.lock().unwrap();
         let mut dt = *self.dt.lock().unwrap();
         let mut batch_sim_time = 0.0_f64;
+        let dt_interval = dt_recompute_interval(kernel.solver_type());
 
         loop {
-            // Recompute the adaptive CFL timestep every few steps. Velocities
-            // change little across a handful of steps, and on the GPU backend
-            // each stats query is a device sync. A 0.85 safety factor covers
-            // velocity growth between recomputes.
-            //
-            // WCSPH is bound by the acoustic CFL (speed of sound); PCISPH's
-            // iterative pressure solve allows the much larger advective CFL.
-            if steps % 16 == 0 {
+            // Recompute the adaptive CFL timestep every few steps (see
+            // dt_recompute_interval); on the GPU each stats query is a sync.
+            if steps % dt_interval == 0 {
                 let stats = kernel.step_stats();
-                dt = 0.85
-                    * match kernel.solver_type() {
-                        kernel::SolverType::Pcisph => kernel::sph::timestep_advective_from_stats(
-                            &stats,
-                            self.h,
-                            self.cfl_number,
-                        ),
-                        kernel::SolverType::Wcsph => kernel::sph::timestep_from_stats(
-                            &stats,
-                            self.h,
-                            self.speed_of_sound,
-                            self.cfl_number,
-                        ),
-                    };
+                dt = adaptive_dt(
+                    kernel.solver_type(),
+                    &stats,
+                    dt,
+                    self.h,
+                    self.speed_of_sound,
+                    self.cfl_number,
+                );
             }
 
             kernel.step(dt);
