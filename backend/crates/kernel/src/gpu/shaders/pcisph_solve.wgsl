@@ -526,8 +526,9 @@ fn density_correct(
     if slice == 0u && i < params.n_particles {
         density[i] = total;
 
-        // Pressure correction from the predicted density error
-        // (as the former correct_pressure_pcisph).
+        // Pressure correction p += delta * (rho* - rho0), as in the CPU
+        // solver: delta is in Pa per kg/m^3, so it takes the absolute error.
+        // Convergence is tracked on the relative error.
         var rho0 = WATER_REST_DENSITY;
         if fluid_type[i] != 0u {
             rho0 = AIR_REST_DENSITY;
@@ -535,7 +536,7 @@ fn density_correct(
         let density_error = (total - rho0) / rho0;
         let dt = params.dt;
         let effective_delta = pcisph_delta[i] / (dt * dt);
-        let correction = effective_delta * max(density_error, 0.0);
+        let correction = effective_delta * max(total - rho0, 0.0);
         let p_new = max(pressure[i] + correction, 0.0);
         pressure[i] = p_new;
         p_rho2[i] = p_new / (total * total);
