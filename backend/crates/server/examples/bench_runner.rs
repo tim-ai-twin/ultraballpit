@@ -17,7 +17,9 @@
 //!   or a path to a config JSON file (throughput/quality modes)
 //!   (default: dam25 dam15 dam10 pillar25)
 //! Env: BENCH_SECS (default 6), BENCH_FRAMES=0 to disable the snapshot thread,
-//!      BENCH_SIMT (quality mode, default 0.4), BENCH_CFL to override cfl_number.
+//!      BENCH_SIMT (quality mode, default 0.4), BENCH_CFL to override cfl_number,
+//!      FP_STEPS (fingerprint step count, default 3000), FP_TRACE=N (print health
+//!      every N fingerprint steps), BENCH_BACKEND=cpu (default gpu).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -46,7 +48,8 @@ fn scenario(name: &str) -> SimulationConfig {
         "boundary_conditions": {"x_min":"Wall","x_max":"Wall","y_min":"Wall","y_max":"Outflow","z_min":"Wall","z_max":"Wall"},
         "particle_spacing": spacing, "gravity": [0.0,-9.81,0.0],
         "speed_of_sound": 20.0, "viscosity": 0.001, "cfl_number": 0.4,
-        "backend": "gpu", "solver": solver
+        "backend": std::env::var("BENCH_BACKEND").unwrap_or_else(|_| "gpu".into()),
+        "solver": solver
     });
     if let Some(cfl) = std::env::var("BENCH_CFL").ok().and_then(|s| s.parse::<f64>().ok()) {
         cfg["cfl_number"] = serde_json::json!(cfl);
@@ -114,12 +117,22 @@ fn throughput(name: &str, secs: f64, frames: bool) {
     stop.store(true, Ordering::Relaxed);
     let nframes = snap.map(|h| h.join().unwrap()).unwrap_or(0);
 
+    // Health of the end state, so a throughput number from an exploded run is
+    // recognisable as such.
+    let p = runner.particles();
+    let bad = (0..p.len())
+        .filter(|&i| !(p.x[i].is_finite() && p.vx[i].is_finite()))
+        .count();
+    let st = kernel::StepStats::from_particles(&p);
     println!(
-        "{name:<10} n={n:>7}  steps/s={:>8.1}  sim_s/wall_s={:.5}  dt={:.3e}  frames={nframes} status={:?}",
+        "{name:<10} n={n:>7}  steps/s={:>8.1}  sim_s/wall_s={:.5}  dt={:.3e}  frames={nframes} status={:?} sim_t={:.3} nonfinite={bad} vmax={:.3} max_rho_var={:.4}",
         steps as f64 / wall,
         sim / wall,
         runner.dt(),
         runner.status(),
+        runner.sim_time(),
+        st.max_speed,
+        st.max_density_variation,
     );
 }
 
@@ -217,8 +230,8 @@ fn quality(name: &str, sim_end: f64) {
     );
 }
 
-/// Deterministic-ish physics fingerprint: fixed step count, dt recomputed every
-/// 16 steps like the runner. Compare before/after a change for sanity.
+/// Deterministic-ish physics fingerprint: fixed step count, dt recomputed with
+/// the runner's policy. Compare before/after a change for sanity.
 fn fingerprint(name: &str, steps: usize) {
     let config = scenario(name);
     let triangles =
@@ -249,22 +262,50 @@ fn fingerprint(name: &str, steps: usize) {
         config.domain.max,
         config.solver.to_kernel_solver_type(),
     );
-    let mut dt = 0.0;
+    let trace: usize = std::env::var("FP_TRACE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let mut dt = config.cfl_number * h / config.speed_of_sound; // runner's initial dt
     let mut t = 0.0f64;
+    // Same dt policy as the server runner (on-device for GPU PCISPH).
+    let device_dt = (k.solver_type() == kernel::SolverType::Pcisph)
+        .then(|| server::runner::pcisph_dt_policy(h, config.cfl_number));
+    let take_progress = |k: &mut Box<dyn kernel::SimulationKernel + Send>, t: &mut f64, dt: &mut f32| {
+        let progress = k.take_adaptive_progress();
+        *t += progress.sim_time;
+        if progress.steps > 0 {
+            *dt = progress.last_dt;
+        }
+    };
     let start = Instant::now();
     for s in 0..steps {
-        if s % 16 == 0 {
-            dt = 0.85
-                * kernel::sph::compute_timestep(
-                    k.particles(),
+        if !device_dt.as_ref().is_some_and(|policy| k.step_adaptive(policy, dt)) {
+            if s % server::runner::dt_recompute_interval(k.solver_type()) as usize == 0 {
+                let stats = k.step_stats();
+                dt = server::runner::adaptive_dt(
+                    k.solver_type(),
+                    &stats,
+                    dt,
                     h,
                     cs,
                     config.cfl_number,
                 );
+            }
+            k.step(dt);
+            t += dt as f64;
         }
-        k.step(dt);
-        t += dt as f64;
+        if trace > 0 && (s + 1) % trace == 0 {
+            take_progress(&mut k, &mut t, &mut dt);
+            let p = k.particles();
+            let bad = (0..p.len())
+                .filter(|&i| !(p.x[i].is_finite() && p.vx[i].is_finite() && p.density[i].is_finite()))
+                .count();
+            let st = kernel::StepStats::from_particles(p);
+            println!(
+                "  step {:>5} t={t:.4} dt={dt:.3e} nonfinite={bad} vmax={:.3} amax={:.1} max_rho_var={:.4}",
+                s + 1, st.max_speed, st.max_accel, st.max_density_variation
+            );
+        }
     }
+    take_progress(&mut k, &mut t, &mut dt);
     let wall = start.elapsed().as_secs_f64();
     let p = k.particles();
     let n = p.len() as f64;
@@ -279,9 +320,18 @@ fn fingerprint(name: &str, steps: usize) {
         .map(|i| (p.vx[i] * p.vx[i] + p.vy[i] * p.vy[i] + p.vz[i] * p.vz[i]).sqrt())
         .fold(0.0f32, f32::max);
     let m = k.error_metrics();
+    // Over-compression (what PCISPH's pressure solve corrects), water rest density.
+    let comp: Vec<f64> = p
+        .density
+        .iter()
+        .map(|&r| (r as f64 - 1000.0) / 1000.0)
+        .filter(|&e| e > 0.0)
+        .collect();
+    let comp_mean = comp.iter().sum::<f64>() / comp.len().max(1) as f64;
+    let comp_max = comp.iter().cloned().fold(0.0f64, f64::max);
     println!(
-        "{name:<10} steps={steps} t={t:.5}s wall={wall:.2}s  mean_pos=({:.6},{:.6},{:.6}) KE={ke:.6e} vmax={vmax:.4} rho_mean={:.3} max_rho_var={:.4}",
-        mean(&p.x), mean(&p.y), mean(&p.z), mean(&p.density), m.max_density_variation,
+        "{name:<10} steps={steps} t={t:.5}s wall={wall:.2}s  mean_pos=({:.6},{:.6},{:.6}) KE={ke:.6e} vmax={vmax:.4} rho_mean={:.3} max_rho_var={:.4} compressed={} comp_mean={comp_mean:.5} comp_max={comp_max:.4}",
+        mean(&p.x), mean(&p.y), mean(&p.z), mean(&p.density), m.max_density_variation, comp.len(),
     );
 }
 
@@ -317,7 +367,9 @@ fn kernel_only(name: &str) {
         config.solver.to_kernel_solver_type(),
     )
     .unwrap();
-    let dt = 0.85 * config.cfl_number * h / config.speed_of_sound;
+    let pcisph = config.solver.to_kernel_solver_type() == kernel::SolverType::Pcisph;
+    // PCISPH: a typical dam-break dt (iteration counts depend on dt).
+    let dt = if pcisph { 4.0e-4 } else { 0.85 * config.cfl_number * h / config.speed_of_sound };
     for _ in 0..100 {
         k.step(dt);
     }
@@ -333,8 +385,9 @@ fn kernel_only(name: &str) {
     }
     k.sync();
     let async_sps = n as f64 / t.elapsed().as_secs_f64();
-    let _ = k.particles();
-    println!("{name:<10} n={:>7} kernel step(): {sync_sps:>8.1} steps/s   step_no_sync(): {async_sps:>8.1} steps/s", k.particle_count());
+    let p = k.particles();
+    let bad = (0..p.len()).filter(|&i| !p.x[i].is_finite()).count();
+    println!("{name:<10} n={:>7} kernel step(): {sync_sps:>8.1} steps/s   step_no_sync(): {async_sps:>8.1} steps/s  nonfinite={bad}", k.particle_count());
 }
 
 fn main() {
@@ -355,10 +408,14 @@ fn main() {
     let frames = std::env::var("BENCH_FRAMES")
         .map(|v| v != "0")
         .unwrap_or(true);
+    let fp_steps: usize = std::env::var("FP_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3000);
     for name in &names {
         match mode.as_str() {
             "throughput" => throughput(name, secs, frames),
-            "fingerprint" => fingerprint(name, 3000),
+            "fingerprint" => fingerprint(name, fp_steps),
             "kernel" => kernel_only(name),
             "quality" => quality(
                 name,

@@ -361,3 +361,18 @@ fn compute_density(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 }
+
+// For callers that run compute_forces without this pass (PCISPH phase A):
+// fill the packed caches from the canonical arrays and mark both neighbor
+// lists overflowed, so the forces pass falls back to its grid scan.
+@compute @workgroup_size(256)
+fn prepare_forces_fallback(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= params.n_particles {
+        return;
+    }
+    posm[i] = vec4<f32>(pos_x[i], pos_y[i], pos_z[i], read_mass(i));
+    velr[i] = vec4<f32>(vel_x[i], vel_y[i], vel_z[i], density[i]);
+    nbr_count[i] = NBR_LIST_OVERFLOW;
+    bnd_nbr_count[i] = NBR_LIST_OVERFLOW;
+}
