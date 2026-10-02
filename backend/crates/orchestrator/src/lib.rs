@@ -95,13 +95,14 @@ pub fn create_simulation(config_path: &str) -> Result<SimulationRunner, Box<dyn 
     // 6. Create kernel based on backend config
     let h = config.smoothing_length();
     let solver_type = config.solver.to_kernel_solver_type();
+    let speed_of_sound = config.effective_speed_of_sound();
     let kernel: Box<dyn SimulationKernel + Send> = create_kernel(
         &config.backend,
         fluid_particles,
         boundary_particles,
         h,
         config.gravity,
-        config.speed_of_sound,
+        speed_of_sound,
         config.cfl_number,
         config.viscosity,
         config.domain.min,
@@ -114,7 +115,7 @@ pub fn create_simulation(config_path: &str) -> Result<SimulationRunner, Box<dyn 
     let runner = SimulationRunner::new(
         kernel,
         h,
-        config.speed_of_sound,
+        speed_of_sound,
         config.cfl_number,
         config.max_timesteps,
         config.max_time,
@@ -133,6 +134,10 @@ pub fn create_simulation(config_path: &str) -> Result<SimulationRunner, Box<dyn 
 /// For `Auto`, attempts GPU first and falls back to CPU if unavailable.
 /// For `Gpu`, returns a GPU kernel or panics if GPU is unavailable.
 /// For `Cpu`, always returns a CPU kernel.
+///
+/// `speed_of_sound` is used as-is; pass
+/// [`SimulationConfig::effective_speed_of_sound`] so the timestep controller
+/// sees the same value as the kernel's EOS.
 #[allow(clippy::too_many_arguments)]
 pub fn create_kernel(
     backend: &config::BackendType,
@@ -147,13 +152,6 @@ pub fn create_kernel(
     domain_max: [f32; 3],
     solver_type: kernel::SolverType,
 ) -> Box<dyn kernel::SimulationKernel + Send> {
-    // Auto-tune speed of sound based on domain geometry and gravity.
-    // This typically reduces c_s from the (overly conservative) default of 50 m/s
-    // to a physically appropriate value, enabling 2-5x larger timesteps.
-    let speed_of_sound = kernel::sph::auto_tune_speed_of_sound(
-        gravity, domain_min, domain_max, speed_of_sound,
-    );
-
     // GPU air support is broken: the shaders carry air EOS constants but
     // produce NaN positions within a few steps (no GPU test coverage for
     // air). Until that's fixed, air/mixed simulations run on CPU.

@@ -576,9 +576,11 @@ pub fn auto_tune_speed_of_sound(
 // ---------------------------------------------------------------------------
 
 /// Minimum allowed timestep (seconds).
-const MIN_DT: f32 = 1.0e-8;
+pub(crate) const MIN_DT: f32 = 1.0e-8;
 /// Maximum allowed timestep (seconds).
-const MAX_DT: f32 = 0.01;
+pub(crate) const MAX_DT: f32 = 0.01;
+/// Velocity floor of the advective CFL (m/s), so dt stays finite at rest.
+pub(crate) const ADVECTIVE_V_FLOOR: f32 = 0.1;
 
 // ---------------------------------------------------------------------------
 // PCISPH: Predictive-Corrective Incompressible SPH (Solenthaler & Pajarola 2009)
@@ -591,76 +593,54 @@ pub const PCISPH_MIN_ITERATIONS: u32 = 3;
 /// Maximum PCISPH correction iterations (safety cap).
 pub const PCISPH_MAX_ITERATIONS: u32 = 20;
 
-/// Compute per-particle PCISPH scaling factors (delta_i).
-///
-/// Each particle gets its own delta based on its actual neighborhood:
+/// PCISPH pressure-correction scaling factor `delta` (Solenthaler & Pajarola
+/// 2009), evaluated for a prototype particle with a filled rest-lattice
+/// neighborhood:
 /// ```text
-/// denom_i = -(|sum_j grad_W_ij|^2 + sum_j |grad_W_ij|^2)
-/// beta = dt^2 * m^2 * 2 / rho_0^2
-/// delta_i = -1 / (beta * denom_i)
+/// delta = -1 / (beta * -(|sum_j grad W_ij|^2 + sum_j |grad W_ij|^2))
+/// beta  = dt^2 * m^2 * 2 / rho_0^2
 /// ```
-///
-/// Surface particles with fewer neighbors get weaker corrections,
-/// preventing the over-correction artifacts of global delta.
-pub fn compute_pcisph_per_particle_delta(
-    particles: &ParticleArrays,
-    grid: &NeighborGrid,
-    h: f32,
-    dt: f32,
-) -> Vec<f32> {
-    let n = particles.len();
-    let support_radius = 2.0 * h;
-    let mass = if n > 0 { particles.mass[0] } else { return Vec::new() };
-    let rest_density = if n > 0 {
-        match particles.fluid_type[0] {
-            FluidType::Water => WATER_REST_DENSITY,
-            FluidType::Air => AIR_REST_DENSITY,
-        }
-    } else {
-        return Vec::new();
-    };
+/// The lattice spacing follows from the particle mass and rest density, so
+/// the factor adapts to any fluid. Using the prototype rather than each
+/// particle's actual neighborhood is what keeps the correction stable: a
+/// particle with a deficient neighborhood (free surface, or next to boundary
+/// particles, which add density but don't appear in the sums) gets a
+/// several-fold larger delta and over-corrects. The per-particle variant
+/// diverged on the thin-slab 2D dam break on both the CPU and GPU solvers.
+pub fn compute_pcisph_prototype_delta(mass: f32, rest_density: f32, h: f32, dt: f32) -> f32 {
+    let mass = mass as f64;
+    let rest_density = rest_density as f64;
+    let spacing = (mass / rest_density).cbrt();
+    let support = 2.0 * h as f64;
+    let reach = (support / spacing).ceil() as i32;
 
-    let beta = (dt as f64) * (dt as f64) * (mass as f64) * (mass as f64) * 2.0
-        / ((rest_density as f64) * (rest_density as f64));
-
-    let mut deltas = vec![0.0f32; n];
-
-    for i in 0..n {
-        let mut sum_grad_x = 0.0_f64;
-        let mut sum_grad_y = 0.0_f64;
-        let mut sum_grad_z = 0.0_f64;
-        let mut sum_dot = 0.0_f64;
-
-        grid.for_each_neighbor(
-            i,
-            &particles.x,
-            &particles.y,
-            &particles.z,
-            support_radius,
-            |j| {
-                let dx = particles.x[i] - particles.x[j];
-                let dy = particles.y[i] - particles.y[j];
-                let dz = particles.z[i] - particles.z[j];
-                let r = (dx * dx + dy * dy + dz * dz).sqrt();
-                let (gx, gy, gz) = wendland_c2_gradient(dx, dy, dz, r, h);
-                sum_grad_x += gx as f64;
-                sum_grad_y += gy as f64;
-                sum_grad_z += gz as f64;
-                sum_dot += (gx * gx + gy * gy + gz * gz) as f64;
-            },
-        );
-
-        let sum_grad_sq = sum_grad_x * sum_grad_x
-            + sum_grad_y * sum_grad_y
-            + sum_grad_z * sum_grad_z;
-        let denom = -(sum_grad_sq + sum_dot);
-
-        if denom.abs() > 1.0e-30 && beta.abs() > 1.0e-30 {
-            deltas[i] = (-1.0 / (beta * denom)) as f32;
+    let (mut sum_grad, mut sum_dot) = ([0.0_f64; 3], 0.0_f64);
+    for ix in -reach..=reach {
+        for iy in -reach..=reach {
+            for iz in -reach..=reach {
+                let d = [ix as f64 * spacing, iy as f64 * spacing, iz as f64 * spacing];
+                let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                if r == 0.0 || r >= support {
+                    continue;
+                }
+                let (gx, gy, gz) =
+                    wendland_c2_gradient(d[0] as f32, d[1] as f32, d[2] as f32, r as f32, h);
+                let g = [gx as f64, gy as f64, gz as f64];
+                for k in 0..3 {
+                    sum_grad[k] += g[k];
+                }
+                sum_dot += g[0] * g[0] + g[1] * g[1] + g[2] * g[2];
+            }
         }
     }
-
-    deltas
+    let sum_grad_sq = sum_grad.iter().map(|v| v * v).sum::<f64>();
+    let denom = -(sum_grad_sq + sum_dot);
+    let beta = (dt as f64) * (dt as f64) * mass * mass * 2.0 / (rest_density * rest_density);
+    if denom.abs() > 1.0e-30 && beta.abs() > 1.0e-30 {
+        (-1.0 / (beta * denom)) as f32
+    } else {
+        0.0
+    }
 }
 
 /// Compute an adaptive timestep using the advective CFL condition (PCISPH).
@@ -677,30 +657,18 @@ pub fn compute_timestep_advective(
     h: f32,
     cfl_number: f32,
 ) -> f32 {
-    let mut max_v = 0.0_f32;
-    let mut max_accel = 0.0_f32;
+    let stats = crate::StepStats::from_particles(particles);
+    timestep_advective_from_stats(&stats, h, cfl_number)
+}
 
-    for i in 0..particles.len() {
-        let v = (particles.vx[i] * particles.vx[i]
-            + particles.vy[i] * particles.vy[i]
-            + particles.vz[i] * particles.vz[i])
-            .sqrt();
-        if v > max_v {
-            max_v = v;
-        }
-        let a = (particles.ax[i] * particles.ax[i]
-            + particles.ay[i] * particles.ay[i]
-            + particles.az[i] * particles.az[i])
-            .sqrt();
-        if a > max_accel {
-            max_accel = a;
-        }
-    }
+/// [`compute_timestep_advective`] from precomputed [`crate::StepStats`].
+pub fn timestep_advective_from_stats(stats: &crate::StepStats, h: f32, cfl_number: f32) -> f32 {
+    let max_v = stats.max_speed;
+    let max_accel = stats.max_accel;
 
     // Advective CFL: dt = CFL * h / v_max
     // Use a floor for v_max to avoid infinite dt at rest
-    let v_floor = 0.1_f32; // 0.1 m/s floor
-    let dt_cfl = cfl_number * h / max_v.max(v_floor);
+    let dt_cfl = cfl_number * h / max_v.max(ADVECTIVE_V_FLOOR);
 
     // Force-based CFL: dt_force = 0.25 * sqrt(h / max_accel)
     let dt_force = if max_accel > 1.0e-12 {
@@ -711,6 +679,42 @@ pub fn compute_timestep_advective(
 
     let dt = dt_cfl.min(dt_force);
     dt.clamp(MIN_DT, MAX_DT)
+}
+
+/// Adaptive timestep policy for PCISPH: the advective + force CFL of
+/// [`timestep_advective_from_stats`], recomputed from fresh step stats and
+/// held for `hold_steps` steps.
+///
+/// The advective CFL depends on the flow state, so on top of the plain CFL:
+/// - the CFL velocity is the one reachable by the end of the hold
+///   (`v_max + a_max * hold_steps * prev_dt`), not the current one;
+/// - dt grows at most `max_growth`x per recompute. Stats taken before any
+///   forces exist (first step: a = v = 0) would otherwise yield the 10 ms cap.
+///
+/// The GPU kernel evaluates the same policy on-device (pcisph_dt.wgsl) for
+/// [`crate::SimulationKernel::step_adaptive`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdvectiveDtPolicy {
+    /// Smoothing length (m).
+    pub h: f32,
+    /// CFL number.
+    pub cfl_number: f32,
+    /// Multiplier on the CFL timestep (headroom for drift while held).
+    pub safety: f32,
+    /// Maximum ratio of consecutive timesteps.
+    pub max_growth: f32,
+    /// Steps each timestep is held for.
+    pub hold_steps: f32,
+}
+
+impl AdvectiveDtPolicy {
+    /// The timestep to use after `prev_dt`, given stats of the current state.
+    pub fn next_dt(&self, stats: &crate::StepStats, prev_dt: f32) -> f32 {
+        let mut reach = *stats;
+        reach.max_speed += stats.max_accel * self.hold_steps * prev_dt;
+        let dt = self.safety * timestep_advective_from_stats(&reach, self.h, self.cfl_number);
+        dt.min(self.max_growth * prev_dt)
+    }
 }
 
 /// Compute fluid-only density summation (excluding boundary particles).
@@ -855,26 +859,20 @@ pub fn compute_timestep(
     speed_of_sound: f32,
     cfl_number: f32,
 ) -> f32 {
+    let stats = crate::StepStats::from_particles(particles);
+    timestep_from_stats(&stats, h, speed_of_sound, cfl_number)
+}
+
+/// [`compute_timestep`] from precomputed [`crate::StepStats`].
+pub fn timestep_from_stats(
+    stats: &crate::StepStats,
+    h: f32,
+    speed_of_sound: f32,
+    cfl_number: f32,
+) -> f32 {
     // 1. CFL condition based on velocity + speed of sound
-    let mut max_signal = speed_of_sound; // at minimum, c_s
-    let mut max_accel = 0.0_f32;
-    for i in 0..particles.len() {
-        let v = (particles.vx[i] * particles.vx[i]
-            + particles.vy[i] * particles.vy[i]
-            + particles.vz[i] * particles.vz[i])
-            .sqrt();
-        let signal = v + speed_of_sound;
-        if signal > max_signal {
-            max_signal = signal;
-        }
-        let a = (particles.ax[i] * particles.ax[i]
-            + particles.ay[i] * particles.ay[i]
-            + particles.az[i] * particles.az[i])
-            .sqrt();
-        if a > max_accel {
-            max_accel = a;
-        }
-    }
+    let max_signal = stats.max_speed + speed_of_sound;
+    let max_accel = stats.max_accel;
     let dt_cfl = cfl_number * h / max_signal;
 
     // 2. Force-based CFL: dt_force = 0.25 * sqrt(h / max_accel)

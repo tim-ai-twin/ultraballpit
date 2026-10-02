@@ -2,7 +2,7 @@
 
 ## Status
 
-**Accepted** -- Rounds 1 and 2 implemented and verified.
+**Accepted** -- Rounds 1, 2 and 3 implemented and verified.
 
 ## Context
 
@@ -223,6 +223,75 @@ with `epsilon = 0.5`.
 **Files**: `backend/crates/kernel/src/lib.rs` (trait + CpuKernel checkpoint), `backend/crates/orchestrator/src/runner.rs` (optimistic loop)
 
 ---
+
+### Round 3: M1 Profiling-Driven Rework (2026-10)
+
+Measured end to end through `SimulationRunner::step_batch` (the WebSocket
+stepper) with `backend/crates/server/examples/bench_runner.rs`, and per pass
+with Metal System Trace (`xctrace`). Baseline and final builds were run
+back-to-back in alternating order on AC power with nominal thermal state.
+
+| Scene (server loop, 30 fps frames) | Steps/s | Sim s / wall s |
+|---|---|---|
+| Dam break 8K (default preset) | 122 -> 1119 | 0.0066 -> 0.0945 (14x) |
+| Dam break 38K | 77 -> 365 | 0.0025 -> 0.0181 (7x) |
+| Dam break 130K | 18.9 -> 122 | 0.00042 -> 0.0042 (10x) |
+| Dam break + pillar 8K | 118 -> 873 | 0.0064 -> 0.0727 (11x) |
+| PCISPH dam break 8K | 10 -> 152 | 0.0058 -> 0.078 (13x) |
+
+Kept, roughly in order of impact:
+
+- **Per-step CPU/GPU overhead:** `step()` no longer waits on the GPU (two
+  submissions in flight); bind groups are cached; the runner gets dt and
+  health checks from an on-device max reduction (`step_stats`, 16 bytes)
+  instead of a full readback at the start of every 24 ms batch.
+- **Runner c_s mismatch:** the runner's acoustic CFL used the config c_s
+  while the kernel's EOS used the auto-tuned one (1.4-10x smaller dt than
+  needed). Both now use `SimulationConfig::effective_speed_of_sound()`.
+- **naga loop bounding:** wgpu 24 wraps every WGSL loop in a `volatile bool`
+  guard on Metal (a stack store/load per iteration). All shaders are built
+  with `create_shader_module_trusted(.., force_loop_bounding: false)`; every
+  loop is a bounded counted loop. Cut neighbor passes 25-50%.
+- **Cell-ordered particles:** all persistent arrays are scattered into cell
+  order at every grid build (replaces the every-50-steps reorder), boundary
+  arrays are stored in cell order, cells are h wide, and each (dy, dz) row is
+  one contiguous index range (sphere-culled in the density pass).
+- **Neighbor lists:** the density pass records neighbors (fluid as packed
+  16-bit index offsets, boundary as u32); forces (same step) and XSPH (next
+  step) see identical positions and walk the list. Overflow falls back to a
+  grid scan. Packed `posm`/`velr` vec4 caches serve the gathers.
+- **Grid build:** multi-workgroup prefix sum fused with count/scatter
+  (~260 -> 29 us at 8K); boundary pressure in its own sphere-culled shader.
+- **Fewer compute passes:** each Metal compute pass costs ~12-15 us of gap;
+  a WCSPH step is now two passes plus the grid build.
+- **PCISPH:** whole step in one submission with GPU-side convergence and
+  on-device dt (previously a submit + wait + readback per iteration).
+- **f32 mass:** f16 packing truncated mass (biased low; up to ~6% at 1 mm).
+
+Tried and rejected (no gain or slower): workgroup sizes 32-256; 3 cells per
+support radius; a per-particle contiguous list layout; packed positions for
+the density candidate scan; per-cell "boundary nearby" skip flags (SIMD
+divergence); splitting density across two threads per particle.
+
+Gotchas: Metal's 31 buffer slots include the uniform and a slot wgpu
+reserves for array sizes (forces hit "Not enough memory left" at 30 storage
+buffers). PCISPH reuses the WCSPH forces pass, which consumes the density
+pass's lists and caches; PCISPH runs `prepare_forces_fallback` first.
+
+Open issues:
+- ~~GPU PCISPH never converged~~ (fixed). The GPU solver differed from the
+  CPU one in five ways: it corrected with the relative density error (1000x
+  too weak for water), ignored negative errors, froze each particle's delta
+  at init, lost the 0.5x pressure warm start to a buffer clear, and capped at
+  10 iterations instead of 20. With those aligned, both solvers diverged on
+  the thin-slab 2D PCISPH preset: per-particle delta (fluid neighbors only)
+  over-corrects particles with deficient neighborhoods, e.g. next to walls.
+  Both now use the original paper's prototype delta (filled rest lattice,
+  `sph::compute_pcisph_prototype_delta`). 3D dam break: mean
+  over-compression ~15% -> 0.3%, 0.078 -> 0.165 sim s / wall s; the 2D
+  preset is stable (mean compression 1.1%).
+- Surface-force recording reads back all particles every batch when an
+  obstacle is present (~20% of the pillar scene's throughput).
 
 ## Cumulative Impact
 

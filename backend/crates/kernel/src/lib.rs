@@ -44,6 +44,54 @@ pub use gpu::{GpuKernel, GpuStepProfile};
 // SimulationKernel trait
 // ---------------------------------------------------------------------------
 
+/// Cheap whole-system maxima used for adaptive timestepping and health checks.
+///
+/// Non-finite values are excluded from the maxima and reported via
+/// `non_finite` instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StepStats {
+    /// Maximum particle speed |v| (m/s).
+    pub max_speed: f32,
+    /// Maximum particle acceleration |a| (m/s^2).
+    pub max_accel: f32,
+    /// Maximum relative density deviation from rest density.
+    pub max_density_variation: f32,
+    /// True if any position or velocity component is NaN or infinite.
+    pub non_finite: bool,
+}
+
+impl StepStats {
+    /// Compute stats from a CPU-side particle snapshot.
+    pub fn from_particles(p: &ParticleArrays) -> Self {
+        let mut s = StepStats::default();
+        for i in 0..p.len() {
+            let v2 = p.vx[i] * p.vx[i] + p.vy[i] * p.vy[i] + p.vz[i] * p.vz[i];
+            let a2 = p.ax[i] * p.ax[i] + p.ay[i] * p.ay[i] + p.az[i] * p.az[i];
+            let rest = match p.fluid_type[i] {
+                FluidType::Water => eos::WATER_REST_DENSITY,
+                FluidType::Air => eos::AIR_REST_DENSITY,
+            };
+            let dev = (p.density[i] - rest).abs() / rest;
+            // `>` is false for NaN, so non-finite entries never win a max.
+            if v2.is_finite() && v2 > s.max_speed {
+                s.max_speed = v2;
+            }
+            if a2.is_finite() && a2 > s.max_accel {
+                s.max_accel = a2;
+            }
+            if dev.is_finite() && dev > s.max_density_variation {
+                s.max_density_variation = dev;
+            }
+            s.non_finite |= ![p.x[i], p.y[i], p.z[i], p.vx[i], p.vy[i], p.vz[i]]
+                .iter()
+                .all(|v| v.is_finite());
+        }
+        s.max_speed = s.max_speed.sqrt();
+        s.max_accel = s.max_accel.sqrt();
+        s
+    }
+}
+
 /// Aggregate error / conservation metrics for a simulation snapshot.
 #[derive(Debug, Clone, Copy)]
 pub struct ErrorMetrics {
@@ -87,6 +135,42 @@ pub trait SimulationKernel {
 
     /// Return the solver type used by this kernel.
     fn solver_type(&self) -> SolverType;
+
+    /// Whole-system maxima for timestep control and health checks.
+    ///
+    /// Backends may override this with something cheaper than a full
+    /// particle readback (the GPU kernel reduces on-device).
+    fn step_stats(&self) -> StepStats {
+        StepStats::from_particles(self.particles())
+    }
+
+    /// Advance one step whose dt is chosen by `policy` from the current state
+    /// on the device itself, so a pipelined backend need not stall for a
+    /// stats readback before every step. `prev_dt` seeds the policy for the
+    /// first such step after [`take_adaptive_progress`](Self::take_adaptive_progress);
+    /// later steps chain from the device's own previous dt.
+    ///
+    /// Returns false (and does nothing) when unsupported: use `step`.
+    fn step_adaptive(&mut self, _policy: &sph::AdvectiveDtPolicy, _prev_dt: f32) -> bool {
+        false
+    }
+
+    /// Steps taken, simulated time and last dt of the `step_adaptive` calls
+    /// since the previous call (waits for them to finish).
+    fn take_adaptive_progress(&mut self) -> AdaptiveProgress {
+        AdaptiveProgress::default()
+    }
+}
+
+/// Progress of [`SimulationKernel::step_adaptive`] calls.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AdaptiveProgress {
+    /// Steps taken.
+    pub steps: u32,
+    /// Sum of their timesteps (s).
+    pub sim_time: f64,
+    /// The last timestep (s); 0 if no steps were taken.
+    pub last_dt: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -389,11 +473,14 @@ impl CpuKernel {
             self.particles.pressure[i] *= 0.5;
         }
 
-        // Compute per-particle PCISPH scaling factors (delta_i) for this timestep.
-        // Per-particle delta ensures surface particles (fewer neighbors) get
-        // appropriately weaker corrections than interior particles.
-        let delta_per_particle = sph::compute_pcisph_per_particle_delta(
-            &self.particles, &self.grid, self.h, dt,
+        // PCISPH scaling factor from a prototype (filled) neighborhood; see
+        // sph::compute_pcisph_prototype_delta for why not per particle.
+        let rest_density0 = match self.particles.fluid_type[0] {
+            FluidType::Water => eos::WATER_REST_DENSITY,
+            FluidType::Air => eos::AIR_REST_DENSITY,
+        };
+        let delta = sph::compute_pcisph_prototype_delta(
+            self.particles.mass[0], rest_density0, self.h, dt,
         );
         // Save original positions for prediction
         let orig_x: Vec<f32> = self.particles.x.clone();
@@ -442,10 +529,10 @@ impl CpuKernel {
                 };
                 let rho_err = self.particles.density[i] - rest_density;
 
-                // Update pressure: p += delta_i * rho_err
+                // Update pressure: p += delta * rho_err
                 // Clamp pressure >= 0 (no tension)
                 self.particles.pressure[i] =
-                    (self.particles.pressure[i] + delta_per_particle[i] * rho_err).max(0.0);
+                    (self.particles.pressure[i] + delta * rho_err).max(0.0);
 
                 // Track convergence using over-compression only
                 if rho_err > 0.0 {

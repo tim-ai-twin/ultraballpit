@@ -24,6 +24,51 @@ pub struct ForceRecord {
     pub net_moment: [f32; 3],
 }
 
+/// Steps between adaptive-timestep recomputes in [`SimulationRunner::step_batch`].
+///
+/// WCSPH is bound by the acoustic CFL (speed of sound), which barely depends
+/// on the flow state, so dt is held for 16 steps (each GPU stats query is a
+/// device sync). PCISPH's advective/force CFL tracks the flow closely: a dt
+/// held across an acceleration spike (wall impact) blows the solve up, so it
+/// is recomputed every step.
+pub fn dt_recompute_interval(solver: kernel::SolverType) -> u32 {
+    match solver {
+        kernel::SolverType::Wcsph => 16,
+        kernel::SolverType::Pcisph => 1,
+    }
+}
+
+/// PCISPH timestep policy: advective CFL recomputed every step (see
+/// [`kernel::sph::AdvectiveDtPolicy`] for the hold-window and growth guards).
+pub fn pcisph_dt_policy(h: f32, cfl_number: f32) -> kernel::sph::AdvectiveDtPolicy {
+    kernel::sph::AdvectiveDtPolicy {
+        h,
+        cfl_number,
+        safety: 0.85,
+        max_growth: 2.0,
+        hold_steps: dt_recompute_interval(kernel::SolverType::Pcisph) as f32,
+    }
+}
+
+/// Next adaptive timestep from on-device step stats, held for
+/// [`dt_recompute_interval`] steps. A 0.85 safety factor covers drift
+/// between recomputes. PCISPH uses [`pcisph_dt_policy`].
+pub fn adaptive_dt(
+    solver: kernel::SolverType,
+    stats: &kernel::StepStats,
+    prev_dt: f32,
+    h: f32,
+    speed_of_sound: f32,
+    cfl_number: f32,
+) -> f32 {
+    match solver {
+        kernel::SolverType::Wcsph => {
+            0.85 * kernel::sph::timestep_from_stats(stats, h, speed_of_sound, cfl_number)
+        }
+        kernel::SolverType::Pcisph => pcisph_dt_policy(h, cfl_number).next_dt(stats, prev_dt),
+    }
+}
+
 /// Thread-safe simulation runner.
 ///
 /// All mutable state is behind `Arc`s, so the runner is cheaply cloneable;
@@ -45,7 +90,8 @@ pub struct SimulationRunner {
     steps_per_sec: Arc<Mutex<f32>>,
     /// Smoothing length for adaptive timestep computation
     h: f32,
-    /// Speed of sound for adaptive timestep computation
+    /// Speed of sound for adaptive timestep computation (the auto-tuned value
+    /// the kernel's EOS uses, not the raw config value)
     speed_of_sound: f32,
     /// CFL number for adaptive timestep computation
     cfl_number: f32,
@@ -97,6 +143,8 @@ impl SimulationRunner {
         // Calculate smoothing length
         let h = config.smoothing_length();
         let solver_type = config.solver.to_kernel_solver_type();
+        // The kernel's EOS stiffness; the acoustic CFL must use the same value.
+        let speed_of_sound = config.effective_speed_of_sound();
 
         // Create kernel honoring the config's backend (cpu/gpu/auto) and solver
         let kernel = orchestrator::create_kernel(
@@ -105,7 +153,7 @@ impl SimulationRunner {
             boundary_particles,
             h,
             config.gravity,
-            config.speed_of_sound,
+            speed_of_sound,
             config.cfl_number,
             config.viscosity,
             config.domain.min,
@@ -114,7 +162,7 @@ impl SimulationRunner {
         );
 
         // Initial timestep estimate via CFL condition (will be adaptively updated)
-        let initial_dt = config.cfl_number * h / config.speed_of_sound;
+        let initial_dt = config.cfl_number * h / speed_of_sound;
 
         let fluid_type = match config.fluid_type {
             orchestrator::config::ConfigFluidType::Water => 0,
@@ -134,7 +182,7 @@ impl SimulationRunner {
             dt: Arc::new(Mutex::new(initial_dt)),
             steps_per_sec: Arc::new(Mutex::new(0.0)),
             h,
-            speed_of_sound: config.speed_of_sound,
+            speed_of_sound,
             cfl_number: config.cfl_number,
             max_time: config.max_time,
             max_timesteps: config.max_timesteps,
@@ -198,36 +246,34 @@ impl SimulationRunner {
         let mut kernel = self.kernel.lock().unwrap();
         let mut dt = *self.dt.lock().unwrap();
         let mut batch_sim_time = 0.0_f64;
+        let dt_interval = dt_recompute_interval(kernel.solver_type());
+        // PCISPH recomputes dt every step; kernels that can do that on the
+        // device (GPU) avoid a stats round trip per step.
+        let device_dt = (kernel.solver_type() == kernel::SolverType::Pcisph)
+            .then(|| pcisph_dt_policy(self.h, self.cfl_number));
+        let mut stepped_on_device = false;
 
         loop {
-            // Recompute the adaptive CFL timestep every few steps. Velocities
-            // change little across a handful of steps, and on the GPU backend
-            // each `particles()` call costs a device readback. A 0.9 safety
-            // factor covers velocity growth between recomputes.
-            //
-            // WCSPH is bound by the acoustic CFL (speed of sound); PCISPH's
-            // iterative pressure solve allows the much larger advective CFL.
-            if steps % 16 == 0 {
-                let particles = kernel.particles();
-                dt = 0.85
-                    * match kernel.solver_type() {
-                        kernel::SolverType::Pcisph => kernel::sph::compute_timestep_advective(
-                            particles,
-                            self.h,
-                            self.cfl_number,
-                        ),
-                        kernel::SolverType::Wcsph => kernel::sph::compute_timestep(
-                            particles,
-                            self.h,
-                            self.speed_of_sound,
-                            self.cfl_number,
-                        ),
-                    };
+            if device_dt.as_ref().is_some_and(|policy| kernel.step_adaptive(policy, dt)) {
+                stepped_on_device = true;
+            } else {
+                // Recompute the adaptive CFL timestep every few steps (see
+                // dt_recompute_interval); on the GPU each stats query is a sync.
+                if steps % dt_interval == 0 {
+                    let stats = kernel.step_stats();
+                    dt = adaptive_dt(
+                        kernel.solver_type(),
+                        &stats,
+                        dt,
+                        self.h,
+                        self.speed_of_sound,
+                        self.cfl_number,
+                    );
+                }
+                kernel.step(dt);
+                batch_sim_time += dt as f64;
             }
-
-            kernel.step(dt);
             steps += 1;
-            batch_sim_time += dt as f64;
 
             if start.elapsed() >= budget {
                 break;
@@ -235,6 +281,14 @@ impl SimulationRunner {
             // Respect external pause requests mid-batch
             if steps % 16 == 0 && *self.status.lock().unwrap() != SimStatus::Running {
                 break;
+            }
+        }
+
+        if stepped_on_device {
+            let progress = kernel.take_adaptive_progress();
+            batch_sim_time += progress.sim_time;
+            if progress.steps > 0 {
+                dt = progress.last_dt;
             }
         }
 
@@ -258,30 +312,19 @@ impl SimulationRunner {
             *self.steps_per_sec.lock().unwrap() = steps as f32 / elapsed;
         }
 
-        // Per-batch health checks + force recording on a single borrowed snapshot
-        let metrics = kernel.error_metrics();
-        let particles = kernel.particles();
+        // Per-batch health checks from on-device maxima (no full readback).
+        let stats = kernel.step_stats();
 
-        if metrics.max_density_variation > 100.0 {
+        if stats.max_density_variation > 100.0 {
             tracing::error!(
                 "Simulation instability detected: density variation = {:.2}x (> 100x threshold). Auto-pausing simulation.",
-                metrics.max_density_variation
+                stats.max_density_variation
             );
             *self.status.lock().unwrap() = SimStatus::Paused;
             return steps;
         }
 
-        let has_nan_inf = particles
-            .x
-            .iter()
-            .chain(particles.y.iter())
-            .chain(particles.z.iter())
-            .chain(particles.vx.iter())
-            .chain(particles.vy.iter())
-            .chain(particles.vz.iter())
-            .any(|&v| !v.is_finite());
-
-        if has_nan_inf {
+        if stats.non_finite {
             tracing::error!(
                 "Simulation instability detected: NaN or Inf values in particle data. Auto-pausing simulation."
             );
@@ -289,8 +332,13 @@ impl SimulationRunner {
             return steps;
         }
 
-        // Record surface forces once per batch
-        let surface_force = force::compute_surface_forces(particles, &self.sdf, self.h);
+        // Record surface forces once per batch. Without an obstacle there is
+        // no surface, so skip the particle readback and record zero.
+        let surface_force = if self.triangles.is_empty() {
+            force::SurfaceForce { net_force: [0.0; 3], net_moment: [0.0; 3] }
+        } else {
+            force::compute_surface_forces(kernel.particles(), &self.sdf, self.h)
+        };
         self.force_history.lock().unwrap().push(ForceRecord {
             timestep: new_timestep,
             sim_time: new_sim_time,
